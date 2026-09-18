@@ -1,7 +1,7 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
-import { ThunkImplementation } from '../../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { Logger, LogCategory, LogLevel } from '../../../core/logger';
@@ -12,6 +12,7 @@ import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { THUNKED_DLL_PSEUDO_BASE } from '../../../core/hle-system-catalog';
 import { getProcAddressRegistry } from '../../../core/diagnostics/get-proc-address-registry';
+import { loadLibraryRegistry } from '../../../core/diagnostics/load-library-registry';
 
 export const exports: Record<string, ThunkImplementation> = {};
 
@@ -59,7 +60,11 @@ function ensureProcessLocalCaches(): void {
     getProcAddressPointerCache.clear();
     loggedUnknownModuleHandles.clear();
     getProcAddressRegistry.clear();
+    loadLibraryRegistry.clear();
 }
+
+// Why the in-flight LoadLibrary* request returned NULL; consumed by the diagnostics wrapper.
+let loadLibraryFailureNote = "";
 
 /**
  * Some legacy binaries query CRT/SmartHeap symbols from the main EXE handle (0x400000)
@@ -504,10 +509,8 @@ function tryBlockThunkedDllLoad(
         findDisabledDllRule(`${thunkedModuleName}.dll`);
     if (!matchedRule) return null;
 
-    const system = System.getInstance();
-    if (system.process) {
-        system.process.lastError = 126; // ERROR_MOD_NOT_FOUND
-    }
+    System.getInstance().scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
+    loadLibraryFailureNote = `blocked by manifest.disabledDlls rule "${matchedRule}"`;
     Logger.log(
         LogCategory.KERNEL32,
         `${apiName}("${requestedDllName}") -> BLOCKED THUNKED MODULE "${thunkedModuleName}" by manifest.disabledDlls rule "${matchedRule}"${callerInfo}`
@@ -572,7 +575,7 @@ function initModuleFunctions(): void {
         }
 
         Logger.log(LogCategory.KERNEL32, `GetModuleHandleA("${name}") -> 0 (not found)`);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
 
@@ -631,7 +634,7 @@ function initModuleFunctions(): void {
         }
 
         Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleW("${name}") -> 0 (not found)`);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
 
@@ -701,7 +704,7 @@ function initModuleFunctions(): void {
 
             if (moduleHandle === 0) {
                 Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleExW("${name}") -> 0 (not found)`);
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -780,7 +783,7 @@ function initModuleFunctions(): void {
 
             if (moduleHandle === 0) {
                 Logger.verbose(LogCategory.KERNEL32, `GetModuleHandleExA("${name}") -> 0 (not found)`);
-                system.process!.lastError = 126;
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
                 if (phModule !== 0 && phModule + 4 <= mem.length) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(phModule, 0, true);
@@ -929,7 +932,7 @@ function initModuleFunctions(): void {
         }
 
         Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): NOT FOUND`);
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 12 };
     };
 
@@ -997,13 +1000,14 @@ function initModuleFunctions(): void {
                     return { value: module.baseAddress, stackCleanup: 12 };
                 }
             } catch (e) {
+                loadLibraryFailureNote = `VFS load failed: ${e}`;
                 Logger.warn(LogCategory.KERNEL32,
                     `LoadLibraryExA("${dllName}"): VFS load failed: ${e}`);
             }
         }
 
         Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): NOT FOUND`);
-        system.process!.lastError = 126;
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 12 };
     };
 
@@ -1073,7 +1077,7 @@ function initModuleFunctions(): void {
         if (verbose) {
             Logger.verbose(LogCategory.KERNEL32, `LoadLibraryW("${dllName}") -> NOT FOUND`);
         }
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         return { value: 0, stackCleanup: 4 };
     };
 
@@ -1125,7 +1129,8 @@ function initModuleFunctions(): void {
 
             // Under HLE video stubs, deny MSS32 for Smacker/Bink callers.
             if (!EMU_NATIVE_VIDEO_DLLS && dllBaseName === 'mss32' && (isSmackerCaller || isBinkCaller)) {
-                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
+                loadLibraryFailureNote = `denied for video caller "${callerName || "unknown"}" (HLE video stubs)`;
                 Logger.warn(LogCategory.KERNEL32, `LoadLibraryA("${dllName}") denied for caller "${callerName || "unknown"}"`);
                 return { value: 0, stackCleanup: 4 };
             }
@@ -1161,11 +1166,12 @@ function initModuleFunctions(): void {
                     return { value: module.baseAddress, stackCleanup: 4 };
                 }
             } catch (e) {
+                loadLibraryFailureNote = `VFS load failed: ${e}`;
                 Logger.warn(LogCategory.KERNEL32, `LoadLibraryA("${dllName}") failed: ${e}${callerInfo}`);
             }
         }
 
-        system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+        system.scheduler.setLastError(126); // ERROR_MOD_NOT_FOUND
         Logger.log(
             LogCategory.KERNEL32,
             `LoadLibraryA("${dllName}") -> NOT FOUND (err=126)${callerInfo}`
@@ -1354,6 +1360,45 @@ function initModuleFunctions(): void {
 }
 
 initModuleFunctions();
+wrapLoadLibraryForDiagnostics();
+
+function describeLoadLibraryResult(handle: number): string {
+    if (handle === 0) return loadLibraryFailureNote || "not found on VFS or HLE catalog (err=126)";
+    const pseudo = THUNKED_DLL_PSEUDO_BY_BASE.get(handle);
+    if (pseudo) return `hle ${pseudo}`;
+    const mod = System.getInstance().process?.moduleRegistry?.getModuleContainingAddress(handle);
+    if (mod) return mod.isExecutable ? `main exe ${mod.name}` : `native ${mod.name}.dll`;
+    return "hle (generated)";
+}
+
+/**
+ * Record every LoadLibrary* request (name → handle/why-not, caller) into loadLibraryRegistry
+ * for the exit report. Wraps rather than edits the four handlers so each return path stays
+ * untouched; the DLL name is re-read from args[0] — LoadLibrary is never a hot path.
+ */
+function wrapLoadLibraryForDiagnostics(): void {
+    const apis: Array<[string, boolean]> = [
+        ['LoadLibraryA', false], ['LoadLibraryExA', false], ['LoadLibraryW', true], ['LoadLibraryExW', true],
+    ];
+    for (const [api, wide] of apis) {
+        const inner = exports[api];
+        if (!inner) continue;
+        exports[api] = async (ctx, mem, args) => {
+            const lpName = args[0] >>> 0;
+            const name = lpName ? (wide ? Marshaler.readStringW(mem, lpName) : Marshaler.readString(mem, lpName)) : "";
+            const esp = (ctx?.esp ?? 0) >>> 0;
+            const caller = esp && esp + 4 <= mem.length
+                ? new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(esp, true) >>> 0
+                : 0;
+            loadLibraryFailureNote = "";
+            const raw = await inner(ctx, mem, args);
+            const result: ThunkResult = typeof raw === 'number' ? { value: raw } : raw;
+            const handle = result.value >>> 0;
+            loadLibraryRegistry.record(api, name, handle, describeLoadLibraryResult(handle), caller);
+            return result;
+        };
+    }
+}
 
 /**
  * Pre-populate GetProcAddress cache for all known thunked exports.

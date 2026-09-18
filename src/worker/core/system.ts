@@ -58,6 +58,8 @@ export interface CrashFaultPayload {
     getProcMisses?: HarnessReport["getProcMisses"];
     silentStubs?: HarnessReport["silentStubs"];
     recentGetProc?: HarnessReport["recentGetProc"];
+    recentLoadLibrary?: HarnessReport["recentLoadLibrary"];
+    recentMessageBoxes?: HarnessReport["recentMessageBoxes"];
     faults?: HarnessReport["faults"];
     /** Recent C++ exceptions (decoded type/message + caught/unhandled outcome). An
      *  `unhandled` entry is the usual root of an MSVC/UE "Runtime Error! terminate". */
@@ -433,6 +435,8 @@ export class System {
             fault.getProcMisses = report.getProcMisses;
             fault.silentStubs = report.silentStubs;
             fault.recentGetProc = report.recentGetProc;
+            fault.recentLoadLibrary = report.recentLoadLibrary;
+            fault.recentMessageBoxes = report.recentMessageBoxes;
             fault.faults = report.faults;
             fault.cxxExceptions = report.cxxExceptions;
             fault.threads = report.threads;
