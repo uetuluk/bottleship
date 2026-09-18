@@ -33,8 +33,8 @@ let initPromise: Promise<InitOutput> | null = null;
 export function init7z(): Promise<InitOutput> {
     if (!initPromise) {
         const url = import.meta.env?.DEV
-            ? `/unpack-buffered.wasm?t=${Date.now()}`
-            : "/unpack-buffered.wasm";
+            ? `${import.meta.env.BASE_URL}unpack-buffered.wasm?t=${Date.now()}`
+            : `${import.meta.env.BASE_URL}unpack-buffered.wasm`;
         initPromise = init({ module_or_path: fetch(url) });
     }
     return initPromise;

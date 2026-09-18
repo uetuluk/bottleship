@@ -33,7 +33,7 @@ import {
     synthesizeManifest,
     type SynthOptions,
 } from "@bottleship/repack/manifest-synth";
-import { loadOverrides, getOverride, type GogOverridesDb } from "@bottleship/repack/overrides";
+import { loadOverrides, getOverride, setOverridesUrl, type GogOverridesDb } from "@bottleship/repack/overrides";
 import { isGogJunk, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 import { detectInstallShield, extractInstallerFromFiles } from "@bottleship/repack/container-extract";
 import { IsoImage, detectSectorLayout, extractIsoToMap } from "@bottleship/formats/iso";
@@ -44,6 +44,8 @@ import { getBottleshipRoot } from "./container-store";
 import { WgbCache } from "./wgb-cache";
 import { Logger, LogCategory } from "../../core/logger";
 import { asWriteChunk } from "../../../dom-buffer";
+
+setOverridesUrl(`${import.meta.env?.BASE_URL ?? "/"}gog-overrides.json`);
 
 // --- public types ----------------------------------------------------------------
 
@@ -242,7 +244,7 @@ function entriesFromZip(zipEntries: ZipEntry[]): StagedEntry[] {
 let _lzmaWasm: ArrayBuffer | null = null;
 async function getLzmaWasm(): Promise<ArrayBuffer> {
     if (_lzmaWasm) return _lzmaWasm;
-    const resp = await fetch("/unpack-streaming.wasm");
+    const resp = await fetch(`${import.meta.env.BASE_URL}unpack-streaming.wasm`);
     _lzmaWasm = await resp.arrayBuffer();
     return _lzmaWasm;
 }

@@ -2393,7 +2393,7 @@ export default function App() {
             No entry for “{gameIdFromUrl}” in games-catalog.json.
           </p>
           <button
-            onClick={() => window.location.assign("/")}
+            onClick={() => window.location.assign(import.meta.env.BASE_URL)}
             style={{
               marginTop: "8px",
               alignSelf: "flex-start",
@@ -2446,7 +2446,7 @@ export default function App() {
             Launching games is disabled in this browser. Open the page in an up-to-date Google Chrome or Safari 26+ and try again.
           </p>
           <button
-            onClick={() => window.location.assign("/")}
+            onClick={() => window.location.assign(import.meta.env.BASE_URL)}
             style={{
               marginTop: "8px",
               alignSelf: "flex-start",
@@ -2491,7 +2491,7 @@ export default function App() {
     >
       {/* Top bar */}
       <header className={s["emu-topbar"]}>
-        <button className={cx(s, "emu-topbar-btn", "emu-back-btn")} onClick={() => window.location.assign("/")} title="Back to game selection">
+        <button className={cx(s, "emu-topbar-btn", "emu-back-btn")} onClick={() => window.location.assign(import.meta.env.BASE_URL)} title="Back to game selection">
           ← Menu
         </button>
         <div className={s["emu-game-title"]}>

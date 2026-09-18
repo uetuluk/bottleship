@@ -162,7 +162,7 @@ export default function GameSelectScreen({
       <header className={s["cmdbar"]}>
         <div className={s["brand"]}>
           <div className={s["brand__mark"]}>
-            <img src="/bottleship_logo.png" className={s["brand__bottle"]} alt="BottleShip" />
+            <img src={`${import.meta.env.BASE_URL}bottleship_logo.png`} className={s["brand__bottle"]} alt="BottleShip" />
             <span className={s["wordmark"]}>
               Bottle<b>Ship</b>
             </span>
@@ -219,7 +219,7 @@ export default function GameSelectScreen({
 
       {isFirstRun ? (
         <section className={s["hero"]}>
-          <img src="/bottleship_logo.png" className={s["hero__bottle"]} alt="BottleShip" />
+          <img src={`${import.meta.env.BASE_URL}bottleship_logo.png`} className={s["hero__bottle"]} alt="BottleShip" />
           <div className={s["hero__t"]}>Turn classic Windows games into browser-playable packages.</div>
           <div className={s["hero__h"]}>
             Drop a GOG installer, a folder, a ZIP, or a .wgb file. BottleShip runs it locally with

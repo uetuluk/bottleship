@@ -1340,7 +1340,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         throw new Error(msg);
       }
 
-      const wasmResp = await fetch("/unpack-streaming.wasm");
+      const wasmResp = await fetch(`${import.meta.env.BASE_URL}unpack-streaming.wasm`);
       const wasmBytes = await wasmResp.arrayBuffer();
       const lzma = new UnpackDecoder();
       await lzma.init(wasmBytes);
@@ -1411,7 +1411,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         }
         if (kind === "inno") {
           let installProgressLast = 0;
-          const wasmResp = await fetch("/unpack-streaming.wasm");
+          const wasmResp = await fetch(`${import.meta.env.BASE_URL}unpack-streaming.wasm`);
           const wasmBytes = await wasmResp.arrayBuffer();
 
           const lzma = new UnpackDecoder();
@@ -1800,11 +1800,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
     // DEV cache-bust: the worker's wasm fetch is NOT covered by a hard-reload's cache bypass,
     // so a rebuilt /v86.wasm would otherwise keep loading from the browser cache. Unique URL per
     // worker load forces a fresh fetch in dev. (Prod keeps the stable URL for HTTP caching.)
-    wasm_path: import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm",
+    wasm_path: import.meta.env?.DEV ? `${import.meta.env.BASE_URL}v86.wasm?t=${Date.now()}` : `${import.meta.env.BASE_URL}v86.wasm`,
     memory_size: ramSize,
     vga_memory_size: EMU_VGA_MEMORY_SIZE,
-    bios: { url: "/bios/seabios.bin" },
-    vga_bios: { url: "/bios/vgabios.bin" },
+    bios: { url: `${import.meta.env.BASE_URL}bios/seabios.bin` },
+    vga_bios: { url: `${import.meta.env.BASE_URL}bios/vgabios.bin` },
     autostart: false,
     log_level: 0, // Disable v86 debug logging for performance
   };
@@ -2460,7 +2460,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
 
       // Dev-mode only: load debug-config.json if present and enabled
       if (import.meta.env.DEV) {
-        fetch('/debug-config.json')
+        fetch(`${import.meta.env.BASE_URL}debug-config.json`)
           .then(r => r.ok ? r.json() : null)
           .catch(() => null)
           .then((cfg) => {

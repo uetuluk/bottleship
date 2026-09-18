@@ -7,7 +7,7 @@ export default function SettingsAboutSection(): React.ReactElement {
   return (
     <SettingsSection>
       <div className={s["about"]}>
-        <img src="/bottleship_logo.png" className={s["about__bottle"]} alt="BottleShip" />
+        <img src={`${import.meta.env.BASE_URL}bottleship_logo.png`} className={s["about__bottle"]} alt="BottleShip" />
         <div className={s["about__title"]}>
           Bottle<b>Ship</b>
         </div>

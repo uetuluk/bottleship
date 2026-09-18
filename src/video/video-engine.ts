@@ -167,7 +167,7 @@ export class VideoEngine {
 
     private async _load(): Promise<void> {
         try {
-            const url = "/video-decoder.wasm";
+            const url = `${import.meta.env.BASE_URL}video-decoder.wasm`;
             Logger.log(LogCategory.SYSTEM, `[VideoEngine] Fetching ${url} …`);
             const resp = await fetch(url);
             if (!resp.ok) throw new Error(`fetch ${url} → ${resp.status}`);

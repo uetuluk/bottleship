@@ -53,7 +53,7 @@ export default function ExitOverlay({ exitInfo, errorMessage, gameName, onDismis
               <button className={cx(s, "app__exit-btn", "app__exit-btn--primary")} onClick={() => window.location.reload()}>
                 Restart
               </button>
-              <button className={s["app__exit-btn"]} onClick={() => window.location.assign("/")}>
+              <button className={s["app__exit-btn"]} onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
                 Back to library
               </button>
             </div>
@@ -73,7 +73,7 @@ export default function ExitOverlay({ exitInfo, errorMessage, gameName, onDismis
               <button className={cx(s, "app__exit-btn", "app__exit-btn--primary")} onClick={onDismissError}>
                 Dismiss
               </button>
-              <button className={s["app__exit-btn"]} onClick={() => window.location.assign("/")}>
+              <button className={s["app__exit-btn"]} onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
                 Back to library
               </button>
             </div>

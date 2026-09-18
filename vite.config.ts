@@ -149,6 +149,7 @@ function copyPublicDirExceptApps(): Plugin {
 }
 
 export default defineConfig({
+  base: process.env.VITE_BASE_PATH || "/",
   define: {
     __BUILD_SHA__: JSON.stringify(BUILD_SHA),
   },

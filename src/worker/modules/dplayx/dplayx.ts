@@ -1273,6 +1273,9 @@ export class DPlayX implements IModule {
 
         this.exports["directplaylobbycreatea"] = directPlayLobbyCreateAImpl;
         this.exports["ord_4"] = directPlayLobbyCreateAImpl;
+        // Creation-only compatibility alias; Unicode lobby methods are not implemented.
+        this.exports["directplaylobbycreatew"] = directPlayLobbyCreateAImpl;
+        this.exports["ord_5"] = directPlayLobbyCreateAImpl;
     }
 
     private bytesToGuid(bytes: Uint8Array): string {

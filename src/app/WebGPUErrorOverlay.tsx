@@ -134,7 +134,7 @@ export default function WebGPUErrorOverlay({
         <button className="wgpu-err__btn wgpu-err__btn--primary" onClick={() => window.location.reload()}>
           Retry
         </button>
-        <button className="wgpu-err__btn wgpu-err__btn--ghost" onClick={() => window.location.assign("/")}>
+        <button className="wgpu-err__btn wgpu-err__btn--ghost" onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
           Back to library
         </button>
       </div>

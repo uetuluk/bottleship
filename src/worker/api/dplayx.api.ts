@@ -285,6 +285,19 @@ export const dplayxModule: ModuleDescriptor = {
             returnType: "u32",
             callingConvention: "stdcall",
         },
+        {
+            name: "DirectPlayLobbyCreateW",
+            ordinal: 5,
+            params: [
+                { name: "lpGUID", type: "ptr" },
+                { name: "lplpDPL", type: "ptr", direction: "out" },
+                { name: "pUnkOuter", type: "ptr" },
+                { name: "lpData", type: "ptr" },
+                { name: "dwDataSize", type: "u32" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
     ],
     interfaces: [IDirectPlayLobby3A, IDirectPlayLobbyCompatA, IDirectPlay4A, IDirectPlayLobby, IDirectPlay, IDirectPlay8LobbyClient],
 };
