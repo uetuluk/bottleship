@@ -1229,8 +1229,11 @@ export class InputManager {
     }
 
     getGamepadState(): { connected: boolean; buttons: number; axes: [number, number, number, number]; triggers: [number, number] } {
+        // Presence straight from the SAB: a device enumeration right after a process
+        // reset (before the next poll) must still see the pad the host has published.
+        const connected = this.inputView ? this.inputView[INPUT_INDEX.gamepadConnected] === 1 : this.gamepadConnected;
         return {
-            connected: this.gamepadConnected,
+            connected,
             buttons: this.gamepadButtons,
             axes: this.gamepadAxes,
             triggers: this.gamepadTriggers,
