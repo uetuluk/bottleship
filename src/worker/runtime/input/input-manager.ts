@@ -70,7 +70,8 @@ const INPUT_INDEX = {
     dinputDY: 15,     // accumulated DInput raw movementY delta
     // 16..23 reserved for the keyboard bitfield (see KEY_BITFIELD_BASE); 24 = guest gamepad seq
     gamepadLT: 25,    // left analog trigger 0..32767
-    gamepadRT: 26     // right analog trigger 0..32767
+    gamepadRT: 26,    // right analog trigger 0..32767
+    pollAck: 27       // worker → host: seq of the last record poll() consumed
 } as const;
 
 // Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
@@ -494,6 +495,10 @@ export class InputManager {
             this._bufferDInputKeyboardEvents();
         }
 
+        // Bitfield consumed: acknowledge so the host's tap queue can release a
+        // synthesized press only after the guest-visible state carried it.
+        Atomics.store(this.inputView, INPUT_INDEX.pollAck, seq);
+
         const keyStateSnapshot = this.buildPackedKeyState(this.packedKeyStateScratch);
 
         // Keyboard target = the FOCUS window (Win32 routes keystrokes to GetFocus(),
@@ -805,6 +810,9 @@ export class InputManager {
      * Edge bits (pressed-since, toggle) stay poll()-owned — do NOT touch them here,
      * or poll()'s diff bookkeeping breaks.
      */
+    /** Seq of the last input record poll() consumed (mirrors the SAB pollAck slot). */
+    get lastConsumedSeq(): number { return this.lastSeq; }
+
     readKeyLevelFromSab(vk: number): boolean {
         const v = this.inputView;
         const k = vk & 0xFF;

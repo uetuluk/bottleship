@@ -293,6 +293,10 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     bindMsgTimerDiag("h3TimerDiag"); // deprecated alias
 
     function writeMsgToMemory(mem: Uint8Array, lpMsg: number, msg: any) {
+        // Retrieval makes the message's key-state snapshot the thread's synchronous
+        // keyboard state: GetKeyState / TranslateMessage see the modifiers as they were
+        // when the key went down, not the live level that may have moved on since.
+        if (msg.keyStatePacked) System.getInstance().inputManager.applyQueuedKeyState(msg.keyStatePacked);
         if (lpMsg) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(lpMsg, msg.hwnd, true);      // hwnd
@@ -1043,10 +1047,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     const VK_SHIFT = 0x10;
     const VK_CAPITAL = 0x14;
 
-    function vkToChar(vk: number, keyStates: Uint8Array): number {
-        const shiftDown = (keyStates[VK_SHIFT] & 0x80) !== 0;
-        // CapsLock toggle state: bit 0 of keyState (we approximate with pressed state)
-        const capsLock = (keyStates[VK_CAPITAL] & 0x80) !== 0;
+    function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): number {
         const upper = shiftDown !== capsLock; // XOR: shift or caps, not both
 
         // Letters A-Z (VK 0x41-0x5A)
@@ -1113,7 +1114,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const hwnd = view.getUint32(lpMsg, true);
         const vk = view.getUint32(lpMsg + 8, true) & 0xFF;
 
-        const charCode = vkToChar(vk, System.getInstance().inputManager.keyStates);
+        // Modifier state as the message queue sees it (GetKeyState: synchronous, with the
+        // CapsLock toggle bit) — not the live async level, which may already have moved on
+        // by the time the app pumps the queued WM_KEYDOWN.
+        const inputManager = System.getInstance().inputManager;
+        const shiftDown = (inputManager.getKeyState(VK_SHIFT) & 0x8000) !== 0;
+        const capsLock = (inputManager.getKeyState(VK_CAPITAL) & 0x0001) !== 0;
+        const charCode = vkToChar(vk, shiftDown, capsLock);
         if (charCode === 0) return 0;
 
         // Post WM_CHAR (or WM_SYSCHAR for SYSKEYDOWN)

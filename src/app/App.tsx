@@ -29,6 +29,8 @@ import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
 import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
+import { charToKey, vkFromKeyboardEvent, VK_BACK, VK_DELETE, VK_RETURN } from "../worker/runtime/input/us-keyboard-layout";
+import { KeyTapQueue } from "./soft-keyboard";
 import {
   DEFAULT_UI_SETTINGS,
   UI_SETTINGS_STORAGE_KEY,
@@ -97,7 +99,8 @@ const INPUT_INDEX = {
   gamepadLT: 25,    // left analog trigger 0..32767 (slots 16..24 are the key bitfield + guest seq)
   gamepadRT: 26,    // right analog trigger 0..32767
   // 16..23 reserved for the keyboard bitfield (KEY_BITFIELD_BASE)
-  guestGamepadSeq: 24  // worker bumps when the GAME reads the joystick/gamepad API
+  guestGamepadSeq: 24, // worker bumps when the GAME reads the joystick/gamepad API
+  pollAck: 27       // worker → host: seq of the last input record its poll() consumed
 } as const;
 
 // Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
@@ -209,6 +212,27 @@ function beginInputWrite(inputView: Int32Array): void {
 function endInputWrite(inputView: Int32Array): void {
     Atomics.add(inputView, INPUT_INDEX.seq, 1); // odd -> even: publish (release)
 }
+
+/** Publish one key level to the guest: pressed set → bitfield, seqlock, worker nudge. */
+function setKeyLevel(vk: number, down: boolean): void {
+    const inputView = globalInputView;
+    if (!inputView) return;
+    if (down) pressedKeys.add(vk); else pressedKeys.delete(vk);
+    beginInputWrite(inputView);
+    syncKeyBitfield(inputView);
+    inputView[INPUT_INDEX.keyCode] = 0; // legacy single-event slots stay clear
+    inputView[INPUT_INDEX.keyState] = 0;
+    endInputWrite(inputView);
+    globalWorker?.postMessage({ type: "input_tick" });
+}
+
+// Text that reaches us as characters (soft keyboard, IME, paste) replayed as key taps,
+// each held until the worker has consumed the press.
+const keyTapQueue = new KeyTapQueue({
+    setKey: setKeyLevel,
+    publishedSeq: () => (globalInputView ? Atomics.load(globalInputView, INPUT_INDEX.seq) : 0),
+    consumedSeq: () => (globalInputView ? Atomics.load(globalInputView, INPUT_INDEX.pollAck) : 0),
+});
 
 // Win32 MessageBox button tables + the dev-mode modal live in ./MessageBoxModal.tsx.
 
@@ -513,6 +537,64 @@ export default function App() {
   const userReleasedLockRef = useRef(false);
   /** Host F11 fullscreen — ref so the mount-stable input effect can call it. */
   const toggleFullscreenRef = useRef<() => void>(() => {});
+
+  // Soft-keyboard proxy: an offscreen text input a touch device focuses to raise its
+  // on-screen keyboard. Keys with an identity go through handleKey; text that only
+  // arrives as characters (composition, autocorrect, paste) is replayed as key taps.
+  const kbProxyRef = useRef<HTMLInputElement | null>(null);
+  const softKbAtDownRef = useRef(false);
+  const lastProxyKeyRef = useRef({ vk: 0, at: 0 });
+  const [softKeyboardOpen, setSoftKeyboardOpen] = useState(false);
+  useEffect(() => {
+    const proxy = kbProxyRef.current;
+    if (!proxy) return;
+    const clearValue = () => { if (proxy.value) proxy.value = ""; };
+    const onBeforeInput = (event: InputEvent) => {
+      const type = event.inputType;
+      // Composition text settles on compositionend; cancelling it mid-way breaks IMEs.
+      if (type === "insertCompositionText" || type === "deleteCompositionText") return;
+      event.preventDefault();
+      if (type.startsWith("insert") && type !== "insertLineBreak" && type !== "insertParagraph") {
+        const data = event.data ?? "";
+        const recent = lastProxyKeyRef.current;
+        // The same character already went out as a keydown a moment ago.
+        if (data.length === 1 && performance.now() - recent.at < 50 && charToKey(data)?.vk === recent.vk) return;
+        keyTapQueue.typeText(data);
+      } else if (type === "insertLineBreak" || type === "insertParagraph") {
+        keyTapQueue.tap(VK_RETURN);
+      } else if (type.startsWith("delete")) {
+        keyTapQueue.tap(type.endsWith("Forward") ? VK_DELETE : VK_BACK);
+      }
+    };
+    const onCompositionEnd = (event: CompositionEvent) => {
+      if (event.data) keyTapQueue.typeText(event.data);
+      clearValue();
+    };
+    const onFocus = () => setSoftKeyboardOpen(true);
+    const onBlur = () => { setSoftKeyboardOpen(false); keyTapQueue.clear(); clearValue(); };
+    proxy.addEventListener("beforeinput", onBeforeInput);
+    proxy.addEventListener("compositionend", onCompositionEnd);
+    proxy.addEventListener("input", clearValue); // whatever the browser refused to cancel
+    proxy.addEventListener("focus", onFocus);
+    proxy.addEventListener("blur", onBlur);
+    return () => {
+      proxy.removeEventListener("beforeinput", onBeforeInput);
+      proxy.removeEventListener("compositionend", onCompositionEnd);
+      proxy.removeEventListener("input", clearValue);
+      proxy.removeEventListener("focus", onFocus);
+      proxy.removeEventListener("blur", onBlur);
+    };
+  }, []);
+  const toggleSoftKeyboard = useCallback(() => {
+    const proxy = kbProxyRef.current;
+    if (!proxy) return;
+    if (document.activeElement === proxy) {
+      proxy.blur();
+      canvasRef.current?.focus();
+    } else {
+      proxy.focus({ preventScroll: true });
+    }
+  }, []);
 
   const requestPointerLockSafe = (canvas: HTMLCanvasElement) => {
     if (pointerLockCooldownRef.current) return;
@@ -1518,22 +1600,25 @@ export default function App() {
         void audioEngine?.resume();
       }
 
-      // Update pressed keys set and serialize to bitfield
-      const vk = event.keyCode & 0xff;
-      if (state === 1) {
-        pressedKeys.add(vk);
-      } else {
-        pressedKeys.delete(vk);
+      if (event.target === kbProxyRef.current) {
+        // Typed into the soft-keyboard proxy: the guest's key, never the input's text.
+        event.preventDefault();
+        // A soft keyboard's Shift never reaches us as a key, so a printable key is
+        // replayed as the chord that types the character (Shift included).
+        const chord = event.key.length === 1 ? charToKey(event.key) : null;
+        if (chord) {
+          if (state === 1) {
+            lastProxyKeyRef.current = { vk: chord.vk, at: performance.now() };
+            keyTapQueue.tap(chord.vk, chord.shift);
+          }
+          return;
+        }
       }
-      beginInputWrite(inputView);
-      syncKeyBitfield(inputView);
-
-      // Clear legacy single-event slots (deprecated)
-      inputView[INPUT_INDEX.keyCode] = 0;
-      inputView[INPUT_INDEX.keyState] = 0;
-
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
+      // No key identity (IME / soft keyboard mid-composition, keyCode 229): the text
+      // arrives through the proxy's beforeinput instead.
+      const vk = vkFromKeyboardEvent(event);
+      if (vk === 0) return;
+      setKeyLevel(vk, state === 1);
       if (isRecording) {
         recordedInputs.push({
           t: performance.now() - recordStart,
@@ -1652,6 +1737,7 @@ export default function App() {
         void audioEngine?.resume();
       }
       if (event.pointerType === "touch") {
+        softKbAtDownRef.current = document.activeElement === kbProxyRef.current;
         handleTouchDown(event);
         return;
       }
@@ -1672,13 +1758,26 @@ export default function App() {
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
       }
-      if (event.pointerType === "touch") handleTouchUp(event);
-      else writePointer(event);
+      if (event.pointerType === "touch") {
+        handleTouchUp(event);
+        // A tap on the canvas must not dismiss the soft keyboard mid-entry.
+        const proxy = kbProxyRef.current;
+        if (softKbAtDownRef.current && proxy && document.activeElement !== proxy) proxy.focus({ preventScroll: true });
+      } else {
+        writePointer(event);
+      }
     };
 
     const handleContextMenu = (event: Event) => {
       event.preventDefault();
     };
+    // Focus moves on mousedown (and its touch compat event): block it while the soft
+    // keyboard proxy holds focus so a canvas tap does not close the keyboard.
+    const keepSoftKeyboard = (event: Event) => {
+      if (document.activeElement === kbProxyRef.current) event.preventDefault();
+    };
+    canvas.addEventListener("mousedown", keepSoftKeyboard);
+    canvas.addEventListener("touchstart", keepSoftKeyboard, { passive: false });
 
     canvas.addEventListener("pointermove", handlePointerMove);
     canvas.addEventListener("pointerdown", handlePointerDown);
@@ -1803,6 +1902,7 @@ export default function App() {
 
     // Clear all pressed keys on focus loss to prevent stuck keys
     const handleBlur = () => {
+      keyTapQueue.clear();
       pressedKeys.clear();
       const inputView = globalInputView;
       if (inputView) {
@@ -2139,6 +2239,8 @@ export default function App() {
       canvas.removeEventListener("pointermove", handlePointerMove);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointerup", handlePointerUp);
+      canvas.removeEventListener("mousedown", keepSoftKeyboard);
+      canvas.removeEventListener("touchstart", keepSoftKeyboard);
       canvas.removeEventListener("pointercancel", handlePointerCancel);
       touchReset();
       canvas.removeEventListener("pointerenter", handlePointerEnter);
@@ -2717,18 +2819,46 @@ export default function App() {
           className={cx(s, "app__canvas", uiSettings.canvasFiltering === "pixelated" && "app__canvas--pixelated")}
           style={{ aspectRatio: `${guestResolution.width} / ${guestResolution.height}` }}
         />
-        {isFullscreen && (
-          <button
-            className={s["emu-fs-exit"]}
-            onClick={toggleFullscreen}
-            title="Exit fullscreen"
-            aria-label="Exit fullscreen"
-          >
-            <svg width="16" height="16" viewBox="0 0 14 14" fill="currentColor">
-              <path d="M5 1H1v4h1.5V2.5H5V1zM9 1v1.5h2.5V5H13V1H9zM1 9v4h4v-1.5H2.5V9H1zM11.5 11.5H9V13h4V9h-1.5v2.5z"/>
-            </svg>
-          </button>
-        )}
+        <input
+          ref={kbProxyRef}
+          className={s["emu-kb-proxy"]}
+          type="text"
+          tabIndex={-1}
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          enterKeyHint="enter"
+          aria-label="Keyboard input for the game"
+        />
+        <div className={s["emu-touch-tools"]}>
+          {workerStatus === "ready" && (
+            <button
+              className={cx(s, "emu-touch-btn", softKeyboardOpen && "emu-touch-btn--active")}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={toggleSoftKeyboard}
+              title="On-screen keyboard"
+              aria-label="Toggle on-screen keyboard"
+              aria-pressed={softKeyboardOpen}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor">
+                <path d="M2 4h14a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 2v1.5h1.5V6H3zm2.5 0v1.5H7V6H5.5zM8 6v1.5h1.5V6H8zm2.5 0v1.5H12V6h-1.5zM13 6v1.5h1.5V6H13zM3 8.5V10h1.5V8.5H3zm2.5 0V10H7V8.5H5.5zM8 8.5V10h1.5V8.5H8zm2.5 0V10H12V8.5h-1.5zM13 8.5V10h1.5V8.5H13zM5 11v1.5h8V11H5z"/>
+              </svg>
+            </button>
+          )}
+          {isFullscreen && (
+            <button
+              className={s["emu-touch-btn"]}
+              onClick={toggleFullscreen}
+              title="Exit fullscreen"
+              aria-label="Exit fullscreen"
+            >
+              <svg width="16" height="16" viewBox="0 0 14 14" fill="currentColor">
+                <path d="M5 1H1v4h1.5V2.5H5V1zM9 1v1.5h2.5V5H13V1H9zM1 9v4h4v-1.5H2.5V9H1zM11.5 11.5H9V13h4V9h-1.5v2.5z"/>
+              </svg>
+            </button>
+          )}
+        </div>
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);

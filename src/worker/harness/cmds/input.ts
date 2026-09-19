@@ -12,6 +12,7 @@ import { sys } from "../serialize";
 import { windows } from "../../modules/user32/shared-state";
 import { describeDlgControl, findDlgControl } from "../dlg";
 import { recorder } from "../recorder";
+import { charToKey } from "../../runtime/input/us-keyboard-layout";
 
 /** Common key name -> Win32 VK. Single characters fall through to char-code mapping. */
 const VK_NAMES: Record<string, number> = {
@@ -22,37 +23,6 @@ const VK_NAMES: Record<string, number> = {
     f1: 0x70, f2: 0x71, f3: 0x72, f4: 0x73, f5: 0x74, f6: 0x75,
     f7: 0x76, f8: 0x77, f9: 0x78, f10: 0x79, f11: 0x7a, f12: 0x7b,
 };
-
-/** char -> {vk, shift} of the US-layout key that PRODUCES it. The producing
- *  key's VK is NOT the char code for shifted symbols ('!' is Shift+'1', VK 0x31 —
- *  not 33=VK_PRIOR). Returns null for unmappable code points (skipped by type()). */
-const SHIFT_CHARS: Record<string, { vk: number; shift: boolean }> = {
-    "!": { vk: 0x31, shift: true }, "@": { vk: 0x32, shift: true }, "#": { vk: 0x33, shift: true },
-    "$": { vk: 0x34, shift: true }, "%": { vk: 0x35, shift: true }, "^": { vk: 0x36, shift: true },
-    "&": { vk: 0x37, shift: true }, "*": { vk: 0x38, shift: true }, "(": { vk: 0x39, shift: true }, ")": { vk: 0x30, shift: true },
-    ";": { vk: 0xba, shift: false }, ":": { vk: 0xba, shift: true },
-    "=": { vk: 0xbb, shift: false }, "+": { vk: 0xbb, shift: true },
-    ",": { vk: 0xbc, shift: false }, "<": { vk: 0xbc, shift: true },
-    "-": { vk: 0xbd, shift: false }, "_": { vk: 0xbd, shift: true },
-    ".": { vk: 0xbe, shift: false }, ">": { vk: 0xbe, shift: true },
-    "/": { vk: 0xbf, shift: false }, "?": { vk: 0xbf, shift: true },
-    "`": { vk: 0xc0, shift: false }, "~": { vk: 0xc0, shift: true },
-    "[": { vk: 0xdb, shift: false }, "{": { vk: 0xdb, shift: true },
-    "\\": { vk: 0xdc, shift: false }, "|": { vk: 0xdc, shift: true },
-    "]": { vk: 0xdd, shift: false }, "}": { vk: 0xdd, shift: true },
-    "'": { vk: 0xde, shift: false }, '"': { vk: 0xde, shift: true },
-};
-
-function charToKey(ch: string): { vk: number; shift: boolean } | null {
-    if (ch.length !== 1) return null; // astral / surrogate pair → skip, don't throw
-    if (ch >= "A" && ch <= "Z") return { vk: ch.charCodeAt(0), shift: true };
-    if (ch >= "a" && ch <= "z") return { vk: ch.toUpperCase().charCodeAt(0), shift: false };
-    if (ch >= "0" && ch <= "9") return { vk: ch.charCodeAt(0), shift: false };
-    if (ch === " ") return { vk: 0x20, shift: false };
-    if (ch === "\t") return { vk: 0x09, shift: false };
-    if (ch === "\n" || ch === "\r") return { vk: 0x0d, shift: false };
-    return SHIFT_CHARS[ch] ?? null;
-}
 
 function toVk(key: number | string): number {
     if (typeof key === "number") return key & 0xff;
@@ -185,6 +155,14 @@ export function registerInputCommands(svc: HarnessService): void {
     // Actions: "start" | "stop" | "read" (returns + keeps) | "clear".
     /** The pad as the guest sees it: connected flag, button mask, sticks (±32767), triggers (0..32767). */
     svc.register("gamepad", () => sys().inputManager.getGamepadState());
+
+    /** keys() — VKs the guest currently sees down, plus the input seq its poll() last consumed. */
+    svc.register("keys", () => {
+        const im = sys().inputManager;
+        const pressed: number[] = [];
+        for (let vk = 0; vk < 256; vk++) if (im.keyStates[vk] & 0x80) pressed.push(vk);
+        return { pressed, consumedSeq: im.lastConsumedSeq };
+    });
 
     svc.register("inputTrace", (args) => {
         const action = String(args[0] ?? "read");

@@ -83,6 +83,8 @@ export class HarnessChain {
     move(x: number, y: number): this { return this.push("move", [x, y]); }
     drag(x0: number, y0: number, x1: number, y1: number, button?: number): this { return this.push("drag", [x0, y0, x1, y1, button]); }
     wheel(x: number, y: number, delta: number): this { return this.push("wheel", [x, y, delta]); }
+    /** VKs the guest currently sees down + the input seq its poll last consumed. Confirms a key reached the worker, not just the SAB. */
+    keys(): this { return this.push("keys", []); }
 
     // ── observe ──
     state(sections?: string[]): this { return this.push("state", [sections]); }

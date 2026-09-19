@@ -87,15 +87,27 @@
   display: none;
 }
 
-/* Touch devices have no F11 / Escape: a discreet exit button inside the fullscreen panel. */
-.emu-fs-exit {
+/* Touch devices have no F11 / Escape / keyboard: discreet buttons inside the panel. */
+.emu-touch-tools {
   display: none;
   position: absolute;
   top: max(10px, env(safe-area-inset-top));
   right: max(10px, env(safe-area-inset-right));
   z-index: 20;
+  gap: 8px;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .emu-touch-tools {
+    display: flex;
+  }
+}
+
+.emu-touch-btn {
   width: 44px;
   height: 44px;
+  padding: 0;
+  display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
@@ -106,14 +118,24 @@
   cursor: pointer;
 }
 
-@media (hover: none), (pointer: coarse) {
-  .emu-fs-exit {
-    display: flex;
-  }
+.emu-touch-btn:active,
+.emu-touch-btn--active {
+  opacity: 1;
 }
 
-.emu-fs-exit:active {
-  opacity: 1;
+/* Offscreen-but-focusable: display:none / visibility:hidden inputs never raise a soft keyboard.
+   16px font keeps iOS from zooming the page on focus. */
+.emu-kb-proxy {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  font-size: 16px;
+  pointer-events: none;
 }
 
 .app--fullscreen-aspect-lock .app__panel:fullscreen .app__canvas,
