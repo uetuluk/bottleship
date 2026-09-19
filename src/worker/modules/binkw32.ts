@@ -40,6 +40,32 @@ import { VideoFrameViews } from "../video/video-routing-types";
 // populated header.  Allocate generously and zero-fill so all pointer fields
 // are NULL and all counts are 0 — prevents games from dereferencing garbage.
 const BINK_HANDLE_SIZE = 2048;
+const BINK_FILE_HEADER_SIZE = 44;
+
+export interface BinkFileHeader {
+    width: number;
+    height: number;
+    frames: number;
+    fps: number;
+    /** Whole stream length in bytes (header + payload), from the size field. */
+    totalSize: number;
+}
+
+/** Parse the fixed BIK file header ("BIKx", size, frames, largest, frames, width, height, fps, fpsDiv). */
+export function parseBinkFileHeader(bytes: Uint8Array): BinkFileHeader | null {
+    if (bytes.length < BINK_FILE_HEADER_SIZE) return null;
+    if (bytes[0] !== 0x42 || bytes[1] !== 0x49 || bytes[2] !== 0x4b) return null; // "BIK"
+    const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const fpsNum = v.getUint32(28, true);
+    const fpsDiv = v.getUint32(32, true) || 1;
+    return {
+        width: v.getUint32(20, true),
+        height: v.getUint32(24, true),
+        frames: v.getUint32(8, true),
+        fps: fpsNum / fpsDiv,
+        totalSize: v.getUint32(4, true) + 8,
+    };
+}
 
 /**
  * Detect destination bytes-per-pixel from pitch and destination row width in pixels.
@@ -532,6 +558,79 @@ export class BinkW32 implements IModule {
         }
     }
 
+    /** Read just the BIK file header at `offset` in `path`. */
+    private async peekBinkHeader(path: string, offset: number): Promise<BinkFileHeader | null> {
+        try {
+            const vfs = System.getInstance().fileSystem;
+            const handle = await vfs.open(path, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
+            if (!handle) return null;
+            if (offset > 0) vfs.setPosition(handle, offset, 0);
+            return parseBinkFileHeader(await vfs.read(handle, BINK_FILE_HEADER_SIZE));
+        } catch (e) {
+            Logger.warn(LogCategory.SYSTEM, `[BinkW32] peekBinkHeader("${path}"@${offset}) error: ${e}`);
+            return null;
+        }
+    }
+
+    /** Fill the public BINK struct head: Width, Height, Frames, FrameNum, LastFrameNum, FrameRate, FrameRateDiv. */
+    private writeBinkStructHead(m: Uint8Array, ptr: number, width: number, height: number, frames: number,
+        frameNum: number, lastFrameNum: number, fps: number): void {
+        this.writeU32(m, ptr + 0, width);
+        this.writeU32(m, ptr + 4, height);
+        this.writeU32(m, ptr + 8, frames);
+        this.writeU32(m, ptr + 12, frameNum);
+        this.writeU32(m, ptr + 16, lastFrameNum);
+        this.writeU32(m, ptr + 20, Math.max(1, Math.round(fps)));
+        this.writeU32(m, ptr + 24, 1);
+    }
+
+    /**
+     * skipVideo: hand the game a real HBINK that is already on its last frame, so its play
+     * loop exits at once. A NULL handle reads as "movie file missing", which most titles
+     * treat as fatal (GTA2: "Couldn't open bink for playing movie" → exit).
+     */
+    private async openFinishedSession(mem: Uint8Array, namePtr: number, isFileHandle: boolean): Promise<number> {
+        const sys = System.getInstance();
+        let path: string;
+        let offset = 0;
+        let wrapper: { position: number; seek(pos: number): void; vfsHandle?: { path: string } | null } | null = null;
+        if (isFileHandle) {
+            const fw = sys.resourceProvider.getFileHandle(namePtr);
+            if (!fw?.vfsHandle) return 0;
+            wrapper = fw;
+            path = fw.vfsHandle.path;
+            offset = fw.position;
+        } else {
+            path = namePtr ? this.readCString(mem, namePtr) : "";
+            if (!path) return 0;
+        }
+        const hdr = await this.peekBinkHeader(path, offset);
+        if (!hdr) {
+            Logger.warn(LogCategory.SYSTEM, `BinkOpen("${path}"@${offset}): no Bink header → NULL (skipVideo)`);
+            return 0;
+        }
+        // Native Bink leaves the caller's file handle past the stream.
+        if (wrapper) wrapper.seek(offset + hdr.totalSize);
+
+        const guestPtr = this.process.memory.alloc(BINK_HANDLE_SIZE);
+        const m = this.getMemory();
+        m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
+        this.writeBinkStructHead(m, guestPtr, hdr.width, hdr.height, hdr.frames, hdr.frames, hdr.frames, hdr.fps);
+        this.sessions.set(guestPtr, {
+            guestPtr, engineHandle: -1,
+            width: hdr.width, height: hdr.height, frameCount: hdr.frames, fps: hdr.fps,
+            lastFrameMs: 0, paused: false, loggedCopy: false, eof: true,
+            audioCtrl: null, lastPlayCursor: 0, audioWrapCount: 0, audioBaselineMs: -1,
+            frameDecodeCount: 0, lastWaitYieldMs: 0,
+            destPtr: 0, destPitch: 0, destHeight: 0, destX: 0, destY: 0, destBpp: 0,
+            explicitDdrawSurface: null, explicitGlideSurfacePtr: 0, lastCopyAtMs: 0,
+            hasBufferApiHint: false, hasPointerFault: false, videoOn: true, ioSize: this.pendingIoSize,
+        });
+        Logger.log(LogCategory.SYSTEM,
+            `BinkOpen("${path}") → 0x${guestPtr.toString(16)} finished at open (skipVideo, ${hdr.width}×${hdr.height} ${hdr.frames}f)`);
+        return guestPtr;
+    }
+
     initialize(process: Process): void {
         this.process = process;
 
@@ -675,16 +774,14 @@ export class BinkW32 implements IModule {
             const namePtr = args[0];
             const flags   = args[1];
 
-            // skipVideo: return 0 (stub) to skip video playback entirely
-            if (EmulatorConfig.getInstance().skipVideo) {
-                console.log(`[BINK] BinkOpen: SKIPPED (skipVideo=true)`);
-                return 0;
-            }
-
             // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer.
             // Different Bink SDK versions use different flag bits:
             //   Bink 1.x: 0x00800000, some versions: 0x08000000
             const isFileHandle = !!(flags & (0x00800000 | 0x08000000));
+
+            if (EmulatorConfig.getInstance().skipVideo) {
+                return this.openFinishedSession(mem, namePtr, isFileHandle);
+            }
 
             let bytes: Uint8Array | null = null;
             let label: string;
@@ -783,12 +880,8 @@ export class BinkW32 implements IModule {
                 const guestPtr = process.memory.alloc(BINK_HANDLE_SIZE);
                 const m = this.getMemory();
                 m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
-                this.writeU32(m, guestPtr +  0, info.width);
-                this.writeU32(m, guestPtr +  4, info.height);
-                this.writeU32(m, guestPtr +  8, info.frameCount);
-                this.writeU32(m, guestPtr + 12, info.currentFrame);
-                this.writeU32(m, guestPtr + 16, Math.round(info.fps));
-                this.writeU32(m, guestPtr + 20, 1);
+                this.writeBinkStructHead(m, guestPtr, info.width, info.height, info.frameCount,
+                    info.currentFrame, 0, info.fps);
 
                 const session: BinkSession = {
                     guestPtr, engineHandle,
