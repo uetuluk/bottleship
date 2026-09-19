@@ -295,7 +295,7 @@ export class ModuleRegistry {
         if (!mod) return null;
 
         const rva = addr - mod.baseAddress;
-        let label = `${mod.name}.dll+0x${rva.toString(16)}`;
+        let label = `${mod.name}${mod.isExecutable ? ".exe" : ".dll"}+0x${rva.toString(16)}`;
 
         // Find nearest export at or before this address
         let bestName: string | null = null;

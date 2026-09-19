@@ -221,7 +221,8 @@ NOT a browser MCP — the harness owns the Chrome instance; a second CDP client 
   - ANY non-standard situation (froze / vanished / black frame / unexpected exit / wild EIP) → FIRST
     pull `report()` (CLI: `bun tools/harness.ts report`). One firehose-immune POJO with: CPU regs, the
     module-labelled guest call stack (`backtrace()`), the recent WinAPI ring (last thunks), the
-    UNIMPLEMENTED-thunk registry (`stubs()`), recent page faults, and threads. The usual root cause of a
+    UNIMPLEMENTED-thunk registry (`stubs()`), the recent LoadLibrary ring (DLL name → handle / why NULL),
+    the last MessageBox texts, recent page faults, and threads. The usual root cause of a
     game "gracefully vanishing" is a stub: it calls a vtable slot / export with no JS handler, gets a
     garbage return, and takes an "unsupported → exit(0)" branch — `stubs()` names it (e.g. a graphics-options
     screen → unimplemented `d3d9:CreateCubeTexture` → `exit(0)`) with the guest caller for `re`. A clean

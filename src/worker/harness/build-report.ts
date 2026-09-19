@@ -7,6 +7,8 @@ import { serializeCpu, serializeThreads, proc, symbolize, guestMem } from "./ser
 import { faultRecorder } from "../core/memory/fault-recorder";
 import { stubRegistry } from "../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../core/diagnostics/get-proc-address-registry";
+import { loadLibraryRegistry } from "../core/diagnostics/load-library-registry";
+import { messageBoxRegistry } from "../core/diagnostics/message-box-registry";
 import { apiCensus } from "../core/diagnostics/api-census";
 import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
@@ -42,6 +44,10 @@ export interface HarnessReport {
         module: string; proc: string; addr: string | null;
         caller: string; callerSym: string | null;
     }>;
+    /** Recent LoadLibrary* requests: DLL name → handle (or why it failed), with the guest caller. */
+    recentLoadLibrary: Array<{ api: string; name: string; handle: string | null; note: string; caller: string; callerSym: string | null }>;
+    /** Recent MessageBox* calls (caption/text/style) — the last error box before an exit. */
+    recentMessageBoxes: Array<{ api: string; caption: string; text: string; uType: string; caller: string; callerSym: string | null }>;
     faults: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
     /** Recent C++ (0xe06d7363) exceptions: decoded type/message + caught/unhandled outcome.
      *  The usual root cause of an MSVC/UE "Runtime Error! terminate" is an `unhandled` entry. */
@@ -157,6 +163,22 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             addr: h.address !== 0 ? hx(h.address) : null,
             caller: hx(h.caller),
             callerSym: symbolize(h.caller),
+        })),
+        recentLoadLibrary: loadLibraryRegistry.recent(16).map((h) => ({
+            api: h.api,
+            name: h.name,
+            handle: h.handle !== 0 ? hx(h.handle) : null,
+            note: h.note,
+            caller: hx(h.caller),
+            callerSym: symbolize(h.caller),
+        })),
+        recentMessageBoxes: messageBoxRegistry.recent().map((m) => ({
+            api: m.api,
+            caption: m.caption,
+            text: m.text,
+            uType: hx(m.uType),
+            caller: hx(m.caller),
+            callerSym: symbolize(m.caller),
         })),
         faults: faultRecorder.recent(8).map((f) => ({
             eip: hx(f.eip),

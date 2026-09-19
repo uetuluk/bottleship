@@ -39,6 +39,8 @@ export interface CrashFault {
     module: string; proc: string; addr: string | null;
     caller: string; callerSym: string | null;
   }>;
+  recentLoadLibrary?: Array<{ api: string; name: string; handle: string | null; note: string; caller: string; callerSym: string | null }>;
+  recentMessageBoxes?: Array<{ api: string; caption: string; text: string; uType: string; caller: string; callerSym: string | null }>;
   faults?: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
   cxxExceptions?: Array<{ seq: number; threadId: number; type: string; thrown: string; throwModule: string; rethrow: boolean; outcome: string; caughtBy: string }>;
   recentFaults?: Array<{ eip: number; faultAddr: number; lastThunk: string; threadId: number | null; kind: string }>;
@@ -197,6 +199,16 @@ export function formatGuestReport(f: CrashFault, gameName: string, crashed: bool
     lines.push(``, `recent GetProcAddress (${f.recentGetProc.length}, newest last):`,
       ...f.recentGetProc.map((h) =>
         `  ${h.module}:"${h.proc}" → ${h.addr ?? "NULL"}  caller=${h.caller}${h.callerSym ? ` ${h.callerSym}` : ""}`));
+  }
+  if (f.recentLoadLibrary?.length) {
+    lines.push(``, `recent LoadLibrary (${f.recentLoadLibrary.length}, newest last) — a NULL here is the usual "error box then exit":`,
+      ...f.recentLoadLibrary.map((h) =>
+        `  ${h.api}("${h.name}") → ${h.handle ?? "NULL"}  ${h.note}  caller=${h.caller}${h.callerSym ? ` ${h.callerSym}` : ""}`));
+  }
+  if (f.recentMessageBoxes?.length) {
+    lines.push(``, `recent MessageBox (${f.recentMessageBoxes.length}, newest last):`,
+      ...f.recentMessageBoxes.map((m) =>
+        `  ${m.api} "${m.caption}": ${JSON.stringify(m.text)}  type=${m.uType}  caller=${m.caller}${m.callerSym ? ` ${m.callerSym}` : ""}`));
   }
   if (f.silentStubs?.length) {
     lines.push(``, `suspected silent stubs (implemented but ignore args) (${f.silentStubs.length}):`,

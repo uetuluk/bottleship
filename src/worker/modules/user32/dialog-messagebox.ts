@@ -9,6 +9,14 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { requestMessageBox } from '../../runtime/dialog-bridge';
 import { System } from '../../core/system';
+import { messageBoxRegistry } from '../../core/diagnostics/message-box-registry';
+
+/** Return address at [ESP] on thunk entry — the guest call site of the box. */
+function readMessageBoxCaller(ctx: { esp?: number }, mem: Uint8Array): number {
+    const esp = (ctx?.esp ?? 0) >>> 0;
+    if (!esp || esp + 4 > mem.length) return 0;
+    return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(esp, true) >>> 0;
+}
 
 function formatGuestStackCodeRefs(ctx: { esp?: number; eip?: number }, mem: Uint8Array, maxSlots = 384): string {
     const registry = System.getInstance().process?.moduleRegistry;
@@ -391,6 +399,7 @@ export function registerMessageBoxExports(exports: Record<string, ThunkImplement
             Logger.log(LogCategory.USER32, `MessageBoxA: ${caption} - ${text}`);
         }
 
+        messageBoxRegistry.record('MessageBoxA', caption, text, uType, readMessageBoxCaller(ctx, mem));
         const result = await requestMessageBox(text, caption, uType);
         return { value: result, stackCleanup: 16 };
     };
@@ -404,6 +413,7 @@ export function registerMessageBoxExports(exports: Record<string, ThunkImplement
         const caption = lpCaption ? Marshaler.readWideString(mem, lpCaption) : 'Message';
 
         Logger.log(LogCategory.USER32, `MessageBoxW: ${caption} - ${text}`);
+        messageBoxRegistry.record('MessageBoxW', caption, text, uType, readMessageBoxCaller(ctx, mem));
         const result = await requestMessageBox(text, caption, uType);
         return { value: result, stackCleanup: 16 };
     };
@@ -426,6 +436,7 @@ export function registerMessageBoxExports(exports: Record<string, ThunkImplement
         const caption = lpszCaption ? Marshaler.readString(mem, lpszCaption) : 'Message';
 
         Logger.log(LogCategory.USER32, `MessageBoxIndirectA: ${caption} - ${text}`);
+        messageBoxRegistry.record('MessageBoxIndirectA', caption, text, dwStyle, readMessageBoxCaller(ctx, mem));
         const result = await requestMessageBox(text, caption, dwStyle);
         return { value: result, stackCleanup: 4 };
     };
@@ -448,6 +459,7 @@ export function registerMessageBoxExports(exports: Record<string, ThunkImplement
         const caption = lpszCaption ? Marshaler.readWideString(mem, lpszCaption) : 'Message';
 
         Logger.log(LogCategory.USER32, `MessageBoxIndirectW: ${caption} - ${text}`);
+        messageBoxRegistry.record('MessageBoxIndirectW', caption, text, dwStyle, readMessageBoxCaller(ctx, mem));
         const result = await requestMessageBox(text, caption, dwStyle);
         return { value: result, stackCleanup: 4 };
     };

@@ -45,8 +45,10 @@ far too much log output to grep. So the harness gives you structured views inste
 
 - **`report()`** — the firehose-immune snapshot. One plain object with CPU registers, the
   module-labelled guest call stack, the recent WinAPI call ring (the last thunks that ran), the
-  **unimplemented-stub registry**, recent page faults, and thread states. This is the first
-  thing to pull for *any* non-standard situation (froze / vanished / black frame / wild EIP).
+  **unimplemented-stub registry**, the recent `LoadLibrary` ring (DLL name → handle, or why it
+  came back NULL), the last `MessageBox` captions/texts, recent page faults, and thread states.
+  This is the first thing to pull for *any* non-standard situation (froze / vanished / black
+  frame / wild EIP).
 - **Stub registry.** The usual reason a game "gracefully vanishes" is that it called an export
   or vtable slot with no implementation, got a garbage return, and took an "unsupported → exit"
   branch. The stub registry names exactly which unimplemented call it was and who called it.
