@@ -585,9 +585,11 @@ export class BinkW32 implements IModule {
     }
 
     /**
-     * skipVideo: hand the game a real HBINK that is already on its last frame, so its play
-     * loop exits at once. A NULL handle reads as "movie file missing", which most titles
-     * treat as fatal (GTA2: "Couldn't open bink for playing movie" → exit).
+     * skipVideo: hand the game a real HBINK for a one-frame clip (Frames = FrameNum =
+     * LastFrameNum = 1). Every end-of-movie test games use holds immediately: FrameNum ==
+     * Frames before BinkNextFrame, FrameNum == 1 after it (native Bink wraps past the last
+     * frame), FrameNum < Frames as a loop guard. A NULL handle instead reads as "movie
+     * file missing", which most titles treat as fatal.
      */
     private async openFinishedSession(mem: Uint8Array, namePtr: number, isFileHandle: boolean): Promise<number> {
         const sys = System.getInstance();
@@ -615,10 +617,10 @@ export class BinkW32 implements IModule {
         const guestPtr = this.process.memory.alloc(BINK_HANDLE_SIZE);
         const m = this.getMemory();
         m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
-        this.writeBinkStructHead(m, guestPtr, hdr.width, hdr.height, hdr.frames, hdr.frames, hdr.frames, hdr.fps);
+        this.writeBinkStructHead(m, guestPtr, hdr.width, hdr.height, 1, 1, 1, hdr.fps);
         this.sessions.set(guestPtr, {
             guestPtr, engineHandle: -1,
-            width: hdr.width, height: hdr.height, frameCount: hdr.frames, fps: hdr.fps,
+            width: hdr.width, height: hdr.height, frameCount: 1, fps: hdr.fps,
             lastFrameMs: 0, paused: false, loggedCopy: false, eof: true,
             audioCtrl: null, lastPlayCursor: 0, audioWrapCount: 0, audioBaselineMs: -1,
             frameDecodeCount: 0, lastWaitYieldMs: 0,
@@ -627,7 +629,7 @@ export class BinkW32 implements IModule {
             hasBufferApiHint: false, hasPointerFault: false, videoOn: true, ioSize: this.pendingIoSize,
         });
         Logger.log(LogCategory.SYSTEM,
-            `BinkOpen("${path}") → 0x${guestPtr.toString(16)} finished at open (skipVideo, ${hdr.width}×${hdr.height} ${hdr.frames}f)`);
+            `BinkOpen("${path}") → 0x${guestPtr.toString(16)} one-frame stand-in (skipVideo, ${hdr.width}×${hdr.height}, ${hdr.frames}f skipped)`);
         return guestPtr;
     }
 
@@ -1189,13 +1191,17 @@ export class BinkW32 implements IModule {
                     explicitGlideSink: null,
                 });
             }
+            const m = this.getMemory();
+            if (s.engineHandle < 0) {
+                // One-frame stand-in (skipVideo): past the last frame native Bink wraps to frame 1.
+                this.writeU32(m, bink + 16, 1);
+                this.writeU32(m, bink + 12, 1);
+                return 0;
+            }
             videoEngine.nextFrame(s.engineHandle);
             /* Update FrameNum in guest struct */
             const info = videoEngine.getInfo(s.engineHandle);
-            if (info) {
-                const m = this.getMemory();
-                this.writeU32(m, bink + 12, info.currentFrame);
-            }
+            if (info) this.writeU32(m, bink + 12, info.currentFrame);
             return 0;
         };
 
