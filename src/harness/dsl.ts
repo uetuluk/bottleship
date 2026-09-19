@@ -57,6 +57,8 @@ export class HarnessChain {
     streamLogs(categories?: string[]): this { return this.push("streamLogs", [categories]); }
     logs(count?: number, filter?: string): this { return this.push("logs", [count, filter]); }
     logStats(count?: number, top?: number): this { return this.push("logStats", [count, top]); }
+    /** Raise or lower one log category for the ring, e.g. logLevel("KERNEL32", "VERBOSE"). */
+    logLevel(category: string, level: string): this { return this.push("logLevel", [category, level]); }
     /** Grow the worker log ring (default 50 lines) so logsSince can cover a whole boot. */
     logRing(size: number): this { return this.push("logRing", [size]); }
     markLog(label: string): this { return this.push("markLog", [label]); }

@@ -12,6 +12,8 @@
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
 
+import { existsSync, realpathSync } from "node:fs";
+import { dirname } from "node:path";
 export const DEFAULT_CDP_PORT = 9333;
 export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
 export const GAME_DEV_FILTER = "game=dev";
@@ -73,15 +75,23 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
         }).unref();
     } else if (IS_LINUX) {
         const headless = !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+        // Without a Vulkan device the GPU process has no shared-image backing for a
+        // WebGPU swap chain: the device is lost on the first canvas present. Chrome
+        // ships a SwiftShader Vulkan ICD next to its binary; point the loader at it.
+        const chromeDir = dirname(realpathSync(CHROME_PATH));
+        const swiftshaderIcd = `${chromeDir}/vk_swiftshader_icd.json`;
+        const env: Record<string, string | undefined> = { ...process.env };
+        if (!env.VK_ICD_FILENAMES && existsSync(swiftshaderIcd)) env.VK_ICD_FILENAMES = swiftshaderIcd;
         const linuxArgs = [
             ...(headless ? ["--headless=new", "--hide-scrollbars"] : []),
             "--no-sandbox",
             "--enable-unsafe-webgpu",
             "--use-angle=swiftshader",
             "--enable-features=Vulkan",
+            "--use-vulkan=swiftshader",
             ...args,
         ];
-        Bun.spawn([CHROME_PATH, ...linuxArgs], { stdout: "ignore", stderr: "ignore" }).unref();
+        Bun.spawn([CHROME_PATH, ...linuxArgs], { stdout: "ignore", stderr: "ignore", env }).unref();
     } else {
         // Detached via PowerShell Start-Process so Chrome outlives this bun process
         // (a plain Bun.spawn child dies with bun on Windows).

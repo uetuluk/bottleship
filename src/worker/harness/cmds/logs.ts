@@ -99,6 +99,17 @@ export function registerLogCommands(svc: HarnessService): void {
         return { scanned: entries.length, distinct: templates.size, levelHist, unimplemented, unknownArgs, top: ranked };
     });
 
+    /** logLevel(category, level) — raise/lower one category (e.g. "KERNEL32", "VERBOSE") for the ring. */
+    svc.register("logLevel", (args) => {
+        const cat = String(args[0] ?? "").toUpperCase() as LogCategory;
+        const lvlName = String(args[1] ?? "VERBOSE").toUpperCase() as keyof typeof LogLevel;
+        if (!(cat in LogCategory) || !(lvlName in LogLevel)) {
+            throw new HarnessError(`logLevel expects (LogCategory, LogLevel) — got ${String(args[0])}, ${String(args[1])}`, HarnessErrorCode.BAD_ARGS);
+        }
+        Logger.setCategoryLevel(LogCategory[cat as keyof typeof LogCategory], LogLevel[lvlName]);
+        return { category: cat, level: lvlName };
+    });
+
     /** logRing(size?) — grow the worker log ring so logsSince can span a whole boot; returns the size. */
     svc.register("logRing", (args) => {
         if (typeof args[0] === "number") Logger.setBufferSize(args[0] as number);
