@@ -212,6 +212,13 @@ export class PELoader {
      * Return DLLs that need DllMain(DLL_PROCESS_ATTACH) called at boot time.
      * Consumed by bootloader trampoline; clears the list after retrieval.
      */
+    /** Directories the last failed findDllPath probed, for the LoadLibrary diagnostics ring. */
+    private lastDllSearchMiss: { name: string; dirs: string[] } | null = null;
+
+    getLastDllSearchMiss(): { name: string; dirs: string[] } | null {
+        return this.lastDllSearchMiss;
+    }
+
     getPendingDllInits(): DllInitEntry[] {
         const inits = this.pendingDllInits;
         this.pendingDllInits = [];
@@ -1050,6 +1057,10 @@ export class PELoader {
             }
         }
 
+        this.lastDllSearchMiss = {
+            name: dllFileName,
+            dirs: searchPaths.map((p) => p.slice(0, p.length - dllFileName.length)),
+        };
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): NOT FOUND`);
         return null;
     }

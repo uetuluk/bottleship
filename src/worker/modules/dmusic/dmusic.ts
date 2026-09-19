@@ -83,8 +83,8 @@ export class DMusic implements IModule {
             Logger.log(LogCategory.COM, `IDirectMusic::QueryInterface(${iid}) -> E_NOINTERFACE`);
             return E_NOINTERFACE;
         };
-        this.exports["IDirectMusic2_AddRef"] = () => 1;
-        this.exports["IDirectMusic2_Release"] = () => 0;
+        this.exports["IDirectMusic2_AddRef"] = (_ctx, _mem, _args) => 1;
+        this.exports["IDirectMusic2_Release"] = (_ctx, _mem, _args) => 0;
 
         this.exports["IDirectMusic2_EnumPort"] = (_ctx, _mem, args) => {
             Logger.verbose(LogCategory.COM, `IDirectMusic::EnumPort(${args[1]}) -> S_FALSE (no ports)`);
@@ -99,15 +99,15 @@ export class DMusic implements IModule {
             Logger.log(LogCategory.COM, `IDirectMusic::CreatePort -> DMUS_E_NOT_FOUND (no ports)`);
             return DMUS_E_NOT_FOUND;
         };
-        this.exports["IDirectMusic2_EnumMasterClock"] = () => S_FALSE;
+        this.exports["IDirectMusic2_EnumMasterClock"] = (_ctx, _mem, _args) => S_FALSE;
         this.exports["IDirectMusic2_GetMasterClock"] = (_ctx, mem, args) => {
             writePtr(mem, args[2] >>> 0, 0);
             return E_NOTIMPL;
         };
-        this.exports["IDirectMusic2_SetMasterClock"] = () => S_OK;
-        this.exports["IDirectMusic2_Activate"] = () => S_OK;
-        this.exports["IDirectMusic2_GetDefaultPort"] = () => DMUS_E_NOT_FOUND;
-        this.exports["IDirectMusic2_SetDirectSound"] = () => S_OK;
-        this.exports["IDirectMusic2_SetExternalMasterClock"] = () => S_OK;
+        this.exports["IDirectMusic2_SetMasterClock"] = (_ctx, _mem, _args) => S_OK;
+        this.exports["IDirectMusic2_Activate"] = (_ctx, _mem, _args) => S_OK;
+        this.exports["IDirectMusic2_GetDefaultPort"] = (_ctx, _mem, _args) => DMUS_E_NOT_FOUND;
+        this.exports["IDirectMusic2_SetDirectSound"] = (_ctx, _mem, _args) => S_OK;
+        this.exports["IDirectMusic2_SetExternalMasterClock"] = (_ctx, _mem, _args) => S_OK;
     }
 }

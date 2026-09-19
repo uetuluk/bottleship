@@ -1362,8 +1362,16 @@ function initModuleFunctions(): void {
 initModuleFunctions();
 wrapLoadLibraryForDiagnostics();
 
-function describeLoadLibraryResult(handle: number): string {
-    if (handle === 0) return loadLibraryFailureNote || "not found on VFS or HLE catalog (err=126)";
+function describeLoadLibraryResult(handle: number, name: string): string {
+    if (handle === 0) {
+        if (loadLibraryFailureNote) return loadLibraryFailureNote;
+        const miss = System.getInstance().process?.loader?.getLastDllSearchMiss?.();
+        const leaf = name.replace(/\//g, "\\").split("\\").pop()?.toLowerCase() ?? "";
+        if (miss && (miss.name === leaf || miss.name === `${leaf}.dll`)) {
+            return `not an HLE DLL and not on the VFS; searched ${miss.dirs.join(" ")} (err=126)`;
+        }
+        return "not found on VFS or HLE catalog (err=126)";
+    }
     const pseudo = THUNKED_DLL_PSEUDO_BY_BASE.get(handle);
     if (pseudo) return `hle ${pseudo}`;
     const mod = System.getInstance().process?.moduleRegistry?.getModuleContainingAddress(handle);
@@ -1394,7 +1402,7 @@ function wrapLoadLibraryForDiagnostics(): void {
             const raw = await inner(ctx, mem, args);
             const result: ThunkResult = typeof raw === 'number' ? { value: raw } : raw;
             const handle = result.value >>> 0;
-            loadLibraryRegistry.record(api, name, handle, describeLoadLibraryResult(handle), caller);
+            loadLibraryRegistry.record(api, name, handle, describeLoadLibraryResult(handle, name), caller);
             return result;
         };
     }
