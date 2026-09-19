@@ -18,6 +18,7 @@ import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
 import DevPanel from "./DevPanel";
 import ExitOverlay from "./ExitOverlay";
+import { TouchKeypad } from "./TouchKeypad";
 import MessageBoxModal, { type MessageBoxRequest } from "../debug/MessageBoxModal";
 import type { GuestExitInfo } from "../guest-report";
 import { detectBrowserSupport, probeWebGPU, type WebGPUProbeResult } from "../browser-support";
@@ -29,7 +30,7 @@ import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
 import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
-import { charToKey, vkFromKeyboardEvent, VK_BACK, VK_DELETE, VK_RETURN } from "../worker/runtime/input/us-keyboard-layout";
+import { charToKey, vkFromKeyboardEvent, VK_BACK, VK_CONTROL, VK_DELETE, VK_MENU, VK_RETURN, VK_SHIFT } from "../worker/runtime/input/us-keyboard-layout";
 import { KeyTapQueue } from "./soft-keyboard";
 import {
   DEFAULT_UI_SETTINGS,
@@ -545,6 +546,7 @@ export default function App() {
   const softKbAtDownRef = useRef(false);
   const lastProxyKeyRef = useRef({ vk: 0, at: 0 });
   const [softKeyboardOpen, setSoftKeyboardOpen] = useState(false);
+  const [keypadOpen, setKeypadOpen] = useState(false);
   useEffect(() => {
     const proxy = kbProxyRef.current;
     if (!proxy) return;
@@ -1602,17 +1604,20 @@ export default function App() {
 
       if (event.target === kbProxyRef.current) {
         // Typed into the soft-keyboard proxy: the guest's key, never the input's text.
+        // A soft keyboard lifts a key within a millisecond of pressing it, so every key
+        // is replayed as a held tap; a printable one as the chord that types the
+        // character, since the soft keyboard's own Shift never arrives as a key.
         event.preventDefault();
-        // A soft keyboard's Shift never reaches us as a key, so a printable key is
-        // replayed as the chord that types the character (Shift included).
+        if (state !== 1) return;
         const chord = event.key.length === 1 ? charToKey(event.key) : null;
         if (chord) {
-          if (state === 1) {
-            lastProxyKeyRef.current = { vk: chord.vk, at: performance.now() };
-            keyTapQueue.tap(chord.vk, chord.shift);
-          }
+          lastProxyKeyRef.current = { vk: chord.vk, at: performance.now() };
+          keyTapQueue.tap(chord.vk, chord.shift);
           return;
         }
+        const proxyVk = vkFromKeyboardEvent(event);
+        if (proxyVk !== 0 && proxyVk !== VK_SHIFT && proxyVk !== VK_CONTROL && proxyVk !== VK_MENU) keyTapQueue.tap(proxyVk);
+        return;
       }
       // No key identity (IME / soft keyboard mid-composition, keyCode 229): the text
       // arrives through the proxy's beforeinput instead.
@@ -2846,6 +2851,20 @@ export default function App() {
               </svg>
             </button>
           )}
+          {workerStatus === "ready" && (
+            <button
+              className={cx(s, "emu-touch-btn", keypadOpen && "emu-touch-btn--active")}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => setKeypadOpen((v) => !v)}
+              title="Arrow keys and Enter"
+              aria-label="Toggle touch keypad"
+              aria-pressed={keypadOpen}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor">
+                <path d="M9 1l3 3.5H6L9 1zm0 16l-3-3.5h6L9 17zM1 9l3.5-3v6L1 9zm16 0l-3.5 3V6L17 9zM7 7h4v4H7V7z"/>
+              </svg>
+            </button>
+          )}
           {isFullscreen && (
             <button
               className={s["emu-touch-btn"]}
@@ -2859,6 +2878,7 @@ export default function App() {
             </button>
           )}
         </div>
+        {workerStatus === "ready" && keypadOpen && <TouchKeypad onKey={setKeyLevel} />}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);
