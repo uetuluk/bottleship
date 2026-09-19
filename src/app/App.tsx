@@ -102,6 +102,14 @@ const INPUT_INDEX = {
 const KEY_BITFIELD_BASE = 16;
 const KEY_BITFIELD_COUNT = 8;
 
+/** True when running as an installed web app (home-screen PWA): already chrome-less and edge-to-edge. */
+function isStandaloneDisplayMode(): boolean {
+  const nav = navigator as Navigator & { standalone?: boolean };
+  if (nav.standalone === true) return true;
+  return typeof matchMedia === "function" &&
+    (matchMedia("(display-mode: standalone)").matches || matchMedia("(display-mode: fullscreen)").matches);
+}
+
 type WorkerStatus = "idle" | "ready" | "error";
 
 // CrashFault + formatGuestReport (the crash/exit report machinery) live in
@@ -298,7 +306,14 @@ export default function App() {
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
   const [messageBox, setMessageBox] = useState<MessageBoxRequest | null>(null);
   const [isPaused, setIsPaused] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isElementFullscreen, setIsElementFullscreen] = useState(false);
+  // CSS-only fullscreen for surfaces without a usable Element Fullscreen API (an installed
+  // iPad/iPhone PWA, or a browser that rejects the request): hides the chrome and pins the
+  // panel to the viewport, so the guest still gets the whole screen.
+  const [immersive, setImmersive] = useState(false);
+  const immersiveRef = useRef(false);
+  immersiveRef.current = immersive;
+  const isFullscreen = isElementFullscreen || immersive;
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
   const qualityRef = useRef<QualityConfig>(quality);
@@ -2153,7 +2168,7 @@ export default function App() {
     const syncFullscreenState = () => {
       const doc = document as Document & { webkitFullscreenElement?: Element | null };
       const fs = Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
-      setIsFullscreen(fs);
+      setIsElementFullscreen(fs);
       // Unsupported / not granted → ESC keeps exiting fullscreen, same as before.
       if (fs) kb?.lock?.(["Escape"]).catch(() => { /* best-effort */ });
       else kb?.unlock?.();
@@ -2222,23 +2237,38 @@ export default function App() {
       webkitRequestFullscreen?: () => Promise<void> | void;
     };
 
-    try {
-      if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+    if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+      try {
         if (document.exitFullscreen) {
           await document.exitFullscreen();
         } else {
           await doc.webkitExitFullscreen?.();
         }
-        return;
+      } catch (err) {
+        setErrorMessage(`Fullscreen failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+      return;
+    }
+    if (immersiveRef.current) {
+      setImmersive(false);
+      return;
+    }
 
-      if (target.requestFullscreen) {
-        await target.requestFullscreen();
-      } else {
-        await element.webkitRequestFullscreen?.();
-      }
-    } catch (err) {
-      setErrorMessage(`Fullscreen failed: ${err instanceof Error ? err.message : String(err)}`);
+    // An installed (standalone) web app is already edge-to-edge and iOS rejects element
+    // fullscreen there; a page without the API can't ask at all. Both get the CSS mode.
+    const request = target.requestFullscreen
+      ? () => target.requestFullscreen()
+      : element.webkitRequestFullscreen
+        ? () => Promise.resolve(element.webkitRequestFullscreen!())
+        : null;
+    if (isStandaloneDisplayMode() || !request) {
+      setImmersive(true);
+      return;
+    }
+    try {
+      await request();
+    } catch {
+      setImmersive(true);
     }
   }, []);
   toggleFullscreenRef.current = () => {
@@ -2473,7 +2503,7 @@ export default function App() {
 
   return (
     <div
-      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer")}
+      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer", immersive && "app--immersive")}
       style={
         {
           ["--fullscreen-aspect-w" as string]: String(fullscreenAspect.w),
@@ -2572,6 +2602,18 @@ export default function App() {
           className={cx(s, "app__canvas", uiSettings.canvasFiltering === "pixelated" && "app__canvas--pixelated")}
           style={{ aspectRatio: `${guestResolution.width} / ${guestResolution.height}` }}
         />
+        {isFullscreen && (
+          <button
+            className={s["emu-fs-exit"]}
+            onClick={toggleFullscreen}
+            title="Exit fullscreen"
+            aria-label="Exit fullscreen"
+          >
+            <svg width="16" height="16" viewBox="0 0 14 14" fill="currentColor">
+              <path d="M5 1H1v4h1.5V2.5H5V1zM9 1v1.5h2.5V5H13V1H9zM1 9v4h4v-1.5H2.5V9H1zM11.5 11.5H9V13h4V9h-1.5v2.5z"/>
+            </svg>
+          </button>
+        )}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);

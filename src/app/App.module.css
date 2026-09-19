@@ -7,6 +7,7 @@
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -57,9 +58,10 @@
   line-height: 1.4;
 }
 
-/* Fullscreen */
+/* Fullscreen — element fullscreen, or the CSS-only immersive mode (installed PWA / no API). */
 .app__panel:fullscreen,
-.app__panel:-webkit-full-screen {
+.app__panel:-webkit-full-screen,
+.app--immersive .app__panel {
   padding: 0;
   border: none;
   border-radius: 0;
@@ -69,8 +71,49 @@
   justify-content: center;
 }
 
+.app--immersive .app__panel {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.app--immersive .emu-topbar,
+.app--immersive .emu-info-strip {
+  display: none;
+}
+
+/* Touch devices have no F11 / Escape: a discreet exit button inside the fullscreen panel. */
+.emu-fs-exit {
+  display: none;
+  position: absolute;
+  top: max(10px, env(safe-area-inset-top));
+  right: max(10px, env(safe-area-inset-right));
+  z-index: 20;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  opacity: 0.5;
+  cursor: pointer;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .emu-fs-exit {
+    display: flex;
+  }
+}
+
+.emu-fs-exit:active {
+  opacity: 1;
+}
+
 .app--fullscreen-aspect-lock .app__panel:fullscreen .app__canvas,
-.app--fullscreen-aspect-lock .app__panel:-webkit-full-screen .app__canvas {
+.app--fullscreen-aspect-lock .app__panel:-webkit-full-screen .app__canvas,
+.app--fullscreen-aspect-lock.app--immersive .app__panel .app__canvas {
   width: min(100vw, calc(100dvh * (var(--fullscreen-aspect-w) / var(--fullscreen-aspect-h)))) !important;
   height: min(100dvh, calc(100vw * (var(--fullscreen-aspect-h) / var(--fullscreen-aspect-w)))) !important;
   min-height: 0 !important;
@@ -78,7 +121,8 @@
 }
 
 .app--fullscreen-aspect-free .app__panel:fullscreen .app__canvas,
-.app--fullscreen-aspect-free .app__panel:-webkit-full-screen .app__canvas {
+.app--fullscreen-aspect-free .app__panel:-webkit-full-screen .app__canvas,
+.app--fullscreen-aspect-free.app--immersive .app__panel .app__canvas {
   width: 100vw !important;
   height: 100dvh !important;
   min-height: 0 !important;
@@ -86,13 +130,15 @@
 }
 
 .app--fullscreen-integer .app__panel:fullscreen .app__canvas,
-.app--fullscreen-integer .app__panel:-webkit-full-screen .app__canvas {
+.app--fullscreen-integer .app__panel:-webkit-full-screen .app__canvas,
+.app--fullscreen-integer.app--immersive .app__panel .app__canvas {
   width: var(--fullscreen-integer-w) !important;
   height: var(--fullscreen-integer-h) !important;
 }
 
 .app__panel:fullscreen .app__warning,
-.app__panel:-webkit-full-screen .app__warning {
+.app__panel:-webkit-full-screen .app__warning,
+.app--immersive .app__panel .app__warning {
   display: none;
 }
 

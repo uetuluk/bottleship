@@ -16,10 +16,17 @@ export const DEFAULT_CDP_PORT = 9333;
 export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
-const CHROME_PATH = IS_MAC
-    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    : "C:/Program Files/Google/Chrome/Application/chrome.exe";
-const DEFAULT_PROFILE = IS_MAC
+const IS_LINUX = process.platform === "linux";
+// Linux: a Playwright-provisioned Chromium (PLAYWRIGHT_BROWSERS_PATH) or BS_CHROME override;
+// headless when there is no display (CI / cloud sessions).
+const CHROME_PATH = process.env.BS_CHROME
+    ?? (IS_MAC
+        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        : IS_LINUX
+            ? `${process.env.PLAYWRIGHT_BROWSERS_PATH ?? "/opt/pw-browsers"}/chromium`
+            : "C:/Program Files/Google/Chrome/Application/chrome.exe");
+// Keep the profile outside the repo: Vite's watcher trips on Chrome's SingletonSocket.
+const DEFAULT_PROFILE = IS_MAC || IS_LINUX
     ? `${process.env.HOME}/.bottleship-cdp-profile`
     : `${process.cwd()}/tmp/cdp-profile`;
 
@@ -64,6 +71,17 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
             stdout: "ignore",
             stderr: "ignore",
         }).unref();
+    } else if (IS_LINUX) {
+        const headless = !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+        const linuxArgs = [
+            ...(headless ? ["--headless=new", "--hide-scrollbars"] : []),
+            "--no-sandbox",
+            "--enable-unsafe-webgpu",
+            "--use-angle=swiftshader",
+            "--enable-features=Vulkan",
+            ...args,
+        ];
+        Bun.spawn([CHROME_PATH, ...linuxArgs], { stdout: "ignore", stderr: "ignore" }).unref();
     } else {
         // Detached via PowerShell Start-Process so Chrome outlives this bun process
         // (a plain Bun.spawn child dies with bun on Windows).
@@ -140,7 +158,7 @@ export class CdpSession {
             if (m.id && this.pending.has(m.id)) {
                 const p = this.pending.get(m.id)!;
                 this.pending.delete(m.id);
-                if (m.error) p.reject(new Error(`${m.error.message ?? "CDP error"} (${m.error.code ?? "?"})`));
+                if (m.error) p.reject(new Error(`${m.error.message ?? "CDP error"}${m.error.data ? `: ${m.error.data}` : ""} (${m.error.code ?? "?"})`));
                 else p.resolve(m);
                 return;
             }
