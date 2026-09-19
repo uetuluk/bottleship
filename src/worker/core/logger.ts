@@ -716,6 +716,8 @@ class LoggerImpl {
         if (i >= 0) this.taps.splice(i, 1);
     }
 
+    getBufferSize(): number { return this.bufferSize; }
+
     /**
      * Get the last N entries from the ring buffer
      */

@@ -99,6 +99,12 @@ export function registerLogCommands(svc: HarnessService): void {
         return { scanned: entries.length, distinct: templates.size, levelHist, unimplemented, unknownArgs, top: ranked };
     });
 
+    /** logRing(size?) — grow the worker log ring so logsSince can span a whole boot; returns the size. */
+    svc.register("logRing", (args) => {
+        if (typeof args[0] === "number") Logger.setBufferSize(args[0] as number);
+        return { size: Logger.getBufferSize() };
+    });
+
     /** markLog(label) — drop a virtual-time marker for logsSince windowing. */
     svc.register("markLog", (args) => {
         const label = String(args[0] ?? "mark");

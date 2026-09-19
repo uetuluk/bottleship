@@ -18,7 +18,7 @@ const E_NOTIMPL = 0x80004001;
 const E_POINTER = 0x80004003;
 const E_INVALIDARG = 0x80070057;
 const DPERR_BUFFERTOOSMALL = 0x8877001e;
-const DPERR_NOTLOBBIED = 0x88770023;
+const DPERR_NOTLOBBIED = 0x8877042E; // MAKE_DPHRESULT(1070)
 const DPERR_NOMESSAGES = 0x887700BE;
 const DPERR_INVALIDOBJECT = 0x88770082;
 const DPERR_UNINITIALIZED = 0x88770140;
@@ -580,8 +580,8 @@ export class DPlayX implements IModule {
         const getConnectionSettingsImpl = (iface: string): ThunkImplementation => (ctx, mem, args) => {
             const dwAppID = args[1] >>> 0;
             const lpdwDataSize = args[3] >>> 0;
-            // Zero out *lpdwDataSize so games that blindly read it after an error
-            // (e.g. Re-Volt) don't LocalAlloc with garbage → OOM crash.
+            // A game that only distinguishes NOTLOBBIED from "need a bigger buffer" reads
+            // *lpdwDataSize after any other error, so leave it defined.
             if (lpdwDataSize) {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 view.setUint32(lpdwDataSize, 0, true);

@@ -207,6 +207,24 @@ const GUID_SYS_KEYBOARD = [0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF,
 const GUID_SYS_MOUSE = [0x60, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
 const GUID_SYS_GAMEPAD = [0x70, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
 
+/** GUID text → the 16 bytes as they sit in guest memory (Data1..3 little-endian, Data4 as-is). */
+export function guidBytes(text: string): number[] {
+    const [d1, d2, d3, d4a, d4b] = text.split("-");
+    const out: number[] = [];
+    for (const [hex, width] of [[d1, 4], [d2, 2], [d3, 2]] as Array<[string, number]>) {
+        const v = parseInt(hex, 16);
+        for (let i = 0; i < width; i++) out.push((v >>> (8 * i)) & 0xff);
+    }
+    for (const hex of [d4a, d4b]) for (let i = 0; i < hex.length; i += 2) out.push(parseInt(hex.slice(i, i + 2), 16));
+    return out;
+}
+const IID_IUNKNOWN = guidBytes("00000000-0000-0000-c000-000000000046");
+const IID_IDirectInputDeviceA = guidBytes("5944e680-c92e-11cf-bfc7-444553540000");
+const IID_IDirectInputDevice2A = guidBytes("5944e682-c92e-11cf-bfc7-444553540000");
+const IID_IDirectInputDevice7A = guidBytes("57d7c6bc-2356-11d3-8e9d-00c04f6844ae");
+const IID_IDirectInputDevice8A = guidBytes("54d41080-dc15-4833-a41b-748f73a38179");
+const IID_IDirectInputDevice8W = guidBytes("54d41081-dc15-4833-a41b-748f73a38179");
+
 // IID for IDirectInputDevice8A (returned by IDirectInput8::CreateDevice / EnumDevicesBySemantics)
 const IID_IDIRECTINPUTDEVICE8A = "54d41080-dc15-4833-a41b-748f73a38179";
 const IID_IDIRECTINPUTDEVICE8W = "54d41081-dc15-4833-a41b-748f73a38179";
@@ -985,37 +1003,13 @@ export class DInput implements IModule {
             for (let i = 0; i < 16; i++) iid.push(freshMem[riidPtr + i]);
             const iidStr = iid.map(b => b.toString(16).padStart(2, '0')).join('');
 
-            // IID_IDirectInputDeviceA:  80e64459-2ec9-11cf-bfc7-444553540000
-            // IID_IDirectInputDevice2A: 82e64459-2ec9-11cf-bfc7-444553540000
-            // IID_IDirectInputDevice8A: 54d41080-dc15-4833-a41b-748f73a38179
-            // GUID memory layout: DWORD + WORD + WORD stored little-endian, tail 8 bytes as-is.
-            // So for 80e64459-2ec9-11cf-...: bytes [59 44 e6 80 c9 2e cf 11 ...]
-            const tailMatches =
-                iid[2] === 0xe6 && iid[1] === 0x44 && iid[0] === 0x59 &&
-                iid[5] === 0x2e && iid[4] === 0xc9 &&
-                iid[7] === 0x11 && iid[6] === 0xcf;
-            const isDeviceA = tailMatches && iid[3] === 0x80;
-            const isDevice2A = tailMatches && iid[3] === 0x82;
-            // IID_IDirectInputDevice7A: 57D7C6BC-2356-11D3-8E9D-00C04F6844AE
-            const isDevice7A =
-                iid[0] === 0xbc && iid[1] === 0xc6 && iid[2] === 0xd7 && iid[3] === 0x57 &&
-                iid[4] === 0x56 && iid[5] === 0x23 &&
-                iid[6] === 0xd3 && iid[7] === 0x11;
-            // IID_IDirectInputDevice8A: 54d41080-dc15-4833-a41b-748f73a38179
-            const isDevice8A =
-                iid[0] === 0x80 && iid[1] === 0x10 && iid[2] === 0xd4 && iid[3] === 0x54 &&
-                iid[4] === 0x15 && iid[5] === 0xdc &&
-                iid[6] === 0x33 && iid[7] === 0x48;
-            // IID_IDirectInputDevice8W: 54d41081-dc15-4833-a41b-748f73a38179
-            const isDevice8W =
-                iid[0] === 0x81 && iid[1] === 0x10 && iid[2] === 0xd4 && iid[3] === 0x54 &&
-                iid[4] === 0x15 && iid[5] === 0xdc &&
-                iid[6] === 0x33 && iid[7] === 0x48;
-            // IID_IUnknown: 00000000-0000-0000-C000-000000000046
-            const isIUnknown =
-                iid[0] === 0 && iid[1] === 0 && iid[2] === 0 && iid[3] === 0 &&
-                iid[4] === 0 && iid[5] === 0 && iid[6] === 0 && iid[7] === 0 &&
-                iid[8] === 0xc0;
+            const guid = new Uint8Array(iid);
+            const isDeviceA = this.guidEquals(guid, IID_IDirectInputDeviceA);
+            const isDevice2A = this.guidEquals(guid, IID_IDirectInputDevice2A);
+            const isDevice7A = this.guidEquals(guid, IID_IDirectInputDevice7A);
+            const isDevice8A = this.guidEquals(guid, IID_IDirectInputDevice8A);
+            const isDevice8W = this.guidEquals(guid, IID_IDirectInputDevice8W);
+            const isIUnknown = this.guidEquals(guid, IID_IUNKNOWN);
 
             Logger.verbose(LogCategory.COM, `IDirectInputDeviceA_QueryInterface: iid=${iidStr} isA=${isDeviceA} is2A=${isDevice2A}`);
 
@@ -1427,6 +1421,18 @@ export class DInput implements IModule {
         for (const method of IDirectInputDevice2A_StubMethods) {
             this.exports[`IDirectInputDevice2A_${method}`] = () => DI_OK;
         }
+        // No device here has force feedback: effect creation and FF state/commands fail
+        // as on a non-FF device, so an app never dereferences an effect that was never made.
+        this.exports["IDirectInputDevice2A_CreateEffect"] = (ctx, mem, args) => {
+            const ppdeff = args[3] >>> 0;
+            if (ppdeff) {
+                const m = this.getMemory();
+                new DataView(m.buffer, m.byteOffset, m.byteLength).setUint32(ppdeff, 0, true);
+            }
+            return DIERR_UNSUPPORTED;
+        };
+        this.exports["IDirectInputDevice2A_GetForceFeedbackState"] = () => DIERR_UNSUPPORTED;
+        this.exports["IDirectInputDevice2A_SendForceFeedbackCommand"] = () => DIERR_UNSUPPORTED;
 
         // IDirectInputDevice2A_Poll - specifically log this as it's a hot path
         this.exports["IDirectInputDevice2A_Poll"] = (ctx, mem, args) => {

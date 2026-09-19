@@ -63,6 +63,19 @@ export function registerStateCommands(svc: HarnessService): void {
      * the worker services between scheduler quanta, so it works even while v86 is running
      * (unlike a worker-target CDP eval, which starves on a busy worker).
      */
+    /** writeBytes(addr, hex) — poke guest memory (e.g. flip a game global to steer a bring-up). */
+    svc.register("writeBytes", (args) => {
+        const addr = ((args[0] as number) ?? 0) >>> 0;
+        const hex = String(args[1] ?? "").replace(/[^0-9a-fA-F]/g, "");
+        if (hex.length === 0 || hex.length % 2 !== 0) throw new HarnessError("writeBytes expects an even-length hex string", HarnessErrorCode.BAD_ARGS);
+        const mem = sys().process?.getCurrentMemory?.();
+        if (!mem) throw new HarnessError("no guest memory (no process loaded?)", HarnessErrorCode.BAD_ARGS);
+        const len = hex.length / 2;
+        if (addr + len > mem.length) throw new HarnessError(`range 0x${addr.toString(16)}+${len} exceeds mem 0x${mem.length.toString(16)}`, HarnessErrorCode.BAD_ARGS);
+        for (let i = 0; i < len; i++) mem[addr + i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        return { base: "0x" + addr.toString(16), len };
+    });
+
     svc.register("readBytes", (args) => {
         const addr = ((args[0] as number) ?? 0) >>> 0;
         const len = Math.min(Math.max(((args[1] as number) ?? 64) >>> 0, 1), 0x10000);

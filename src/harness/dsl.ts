@@ -57,6 +57,8 @@ export class HarnessChain {
     streamLogs(categories?: string[]): this { return this.push("streamLogs", [categories]); }
     logs(count?: number, filter?: string): this { return this.push("logs", [count, filter]); }
     logStats(count?: number, top?: number): this { return this.push("logStats", [count, top]); }
+    /** Grow the worker log ring (default 50 lines) so logsSince can cover a whole boot. */
+    logRing(size: number): this { return this.push("logRing", [size]); }
     markLog(label: string): this { return this.push("markLog", [label]); }
     logsSince(label: string, opts?: { filter?: string; count?: number }): this { return this.push("logsSince", [label, opts]); }
     watchLog(pattern: string, opts?: { once?: boolean }): this { return this.push("watchLog", [pattern, opts]); }
@@ -94,6 +96,10 @@ export class HarnessChain {
     stubs(): this { return this.push("stubs", []); }
     /** One-shot incident report: cpu + backtrace + last thunks + stubs + faults + threads. The go-to for ANY anomaly (freeze/crash/exit/black frame). */
     report(esp?: number): this { return this.push("report", [esp]); }
+    /** Read guest memory as hex. */
+    readBytes(addr: number, len?: number): this { return this.push("readBytes", [addr, len]); }
+    /** Poke guest memory with a hex string (a game global, a flag) to steer a bring-up. */
+    writeBytes(addr: number, hex: string): this { return this.push("writeBytes", [addr, hex]); }
     /** Recent guest page faults (EIP / fault addr / thread / last thunk / regs). */
     faults(n?: number): this { return this.push("faults", [n]); }
     shot(opts?: { save?: string }): this { return this.push("shot", [opts]); }
