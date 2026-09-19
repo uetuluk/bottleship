@@ -67,8 +67,10 @@ const INPUT_INDEX = {
     mouseWheel: 12,
     mouseInside: 13,  // 1 = cursor inside canvas, 0 = outside
     dinputDX: 14,     // accumulated DInput raw movementX delta
-    dinputDY: 15      // accumulated DInput raw movementY delta
-    // 16..23 reserved for the keyboard bitfield (see KEY_BITFIELD_BASE)
+    dinputDY: 15,     // accumulated DInput raw movementY delta
+    // 16..23 reserved for the keyboard bitfield (see KEY_BITFIELD_BASE); 24 = guest gamepad seq
+    gamepadLT: 25,    // left analog trigger 0..32767
+    gamepadRT: 26     // right analog trigger 0..32767
 } as const;
 
 // Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
@@ -233,6 +235,7 @@ export class InputManager {
     private gamepadConnected = false;
     private gamepadButtons = 0;
     private gamepadAxes: [number, number, number, number] = [0, 0, 0, 0];
+    private gamepadTriggers: [number, number] = [0, 0];
 
     // Previous state for change detection
     private lastSeq = 0;
@@ -400,6 +403,8 @@ export class InputManager {
         const gamepadAxis1     = this.inputView[INPUT_INDEX.gamepadAxis1];
         const gamepadAxis2     = this.inputView[INPUT_INDEX.gamepadAxis2];
         const gamepadAxis3     = this.inputView[INPUT_INDEX.gamepadAxis3];
+        const gamepadLT        = this.inputView[INPUT_INDEX.gamepadLT];
+        const gamepadRT        = this.inputView[INPUT_INDEX.gamepadRT];
 
         if (Atomics.load(this.inputView, INPUT_INDEX.seq) !== seq) return;
         this.lastSeq = seq;
@@ -431,6 +436,7 @@ export class InputManager {
         this.gamepadConnected = gamepadConnected;
         this.gamepadButtons   = gamepadButtons;
         this.gamepadAxes      = [gamepadAxis0, gamepadAxis1, gamepadAxis2, gamepadAxis3];
+        this.gamepadTriggers  = [gamepadLT, gamepadRT];
         if (this.dinputGamepadBufferSize > 0) {
             this._bufferDInputGamepadEvents(gamepadButtons, this.gamepadAxes, gamepadConnected);
         }
@@ -1214,11 +1220,12 @@ export class InputManager {
         return this.injectKey(vk, false);
     }
 
-    getGamepadState(): { connected: boolean; buttons: number; axes: [number, number, number, number] } {
+    getGamepadState(): { connected: boolean; buttons: number; axes: [number, number, number, number]; triggers: [number, number] } {
         return {
             connected: this.gamepadConnected,
             buttons: this.gamepadButtons,
-            axes: this.gamepadAxes
+            axes: this.gamepadAxes,
+            triggers: this.gamepadTriggers,
         };
     }
 

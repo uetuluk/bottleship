@@ -63,7 +63,11 @@ export const winmmModule: ModuleDescriptor = {
         // Joystick functions
         makeFunc("joyGetNumDevs", 0),
         makeFunc("joyGetDevCapsA", 3),
+        makeFunc("joyGetDevCapsW", 3),
+        makeFunc("joyGetPos", 2),
         makeFunc("joyGetPosEx", 2),
+        makeFunc("joyGetThreshold", 2),
+        makeFunc("joySetThreshold", 2),
         // MCI (Media Control Interface) functions
         makeFunc("mciGetDeviceIDA", 1),
         makeFunc("mciSendCommandA", 4),

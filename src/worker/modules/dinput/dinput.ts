@@ -1,4 +1,10 @@
 import { IModule } from "../../core/module";
+import {
+    GUID_XAXIS, GUID_YAXIS, GUID_ZAXIS, GUID_RXAXIS, GUID_RYAXIS, GUID_BUTTON, GUID_POVOBJ,
+    JOY_AXIS_GUIDS, JOY_AXIS_NAMES, JOY_AXIS_COUNT, JOY_REPORTED_AXES, JOY_REPORTED_BUTTONS, JOY_REPORTED_POVS,
+    DIJOYSTATE_FORMAT, DIJOYSTATE2_FORMAT, DIJOYSTATE2_SIZE, defaultJoystickAxes, axesForProperty,
+    parseJoystickDataFormat, writeJoystickState, type JoyFormatObject, type AxisConditioning,
+} from "./joystick-state";
 import { Process } from "../../core/process";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
@@ -69,6 +75,9 @@ const DI8DEVTYPE_MOUSE = 0x12;
 const DI8DEVTYPE_KEYBOARD = 0x13;
 const DI8DEVTYPE_JOYSTICK = 0x14;
 const DI8DEVTYPE_GAMEPAD = 0x15;
+const DI8DEVTYPEGAMEPAD_STANDARD = 2;
+const DIDEVTYPEJOYSTICK_GAMEPAD = 4;
+const DIDEVTYPE_HID = 0x00010000;
 
 // DIEDFL_* flags (EnumDevices filter flags)
 const DIEDFL_ALLDEVICES = 0x00000000;
@@ -102,6 +111,8 @@ const DIPROP_BUFFERSIZE = 1;
 const DIPROP_AXISMODE = 2;
 const DIPROP_GRANULARITY = 3;
 const DIPROP_RANGE = 4;
+const DIPROP_DEADZONE = 5;
+const DIPROP_SATURATION = 6;
 const DIPROPRANGE_NOMIN = 0x80000000;
 const DIPROPRANGE_NOMAX = 0x7FFFFFFF;
 const DIERR_UNSUPPORTED = 0x80004001; // E_NOTIMPL
@@ -117,13 +128,6 @@ const DIPH_BYID = 2;
 const DIDEVICEOBJECTINSTANCEA_SIZE = 316; // DX5+ A variant; DX3 subset is the first 288 bytes
 
 // Object-type GUIDs (dinput.h), little-endian byte order
-const GUID_XAXIS  = [0xE0, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_YAXIS  = [0xE1, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_ZAXIS  = [0xE2, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_RXAXIS = [0xF4, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_RYAXIS = [0xF5, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_BUTTON = [0xF0, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
-const GUID_POVOBJ = [0xF2, 0x02, 0x6D, 0xA3, 0xF3, 0xC9, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
 const GUID_KEY    = [0x20, 0x82, 0x72, 0x55, 0x3C, 0xD3, 0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00];
 
 interface DeviceObjectSpec {
@@ -172,15 +176,14 @@ function getDeviceObjectSpecs(deviceType: string): DeviceObjectSpec[] {
         }));
     }
     if (deviceType === "joystick" || deviceType === "gamepad") {
-        const objs: DeviceObjectSpec[] = [
-            { name: "X-axis",  dwOfs: 0,  dwType: DIDFT_ABSAXIS | (0 << 8), guid: GUID_XAXIS },
-            { name: "Y-axis",  dwOfs: 4,  dwType: DIDFT_ABSAXIS | (1 << 8), guid: GUID_YAXIS },
-            { name: "Rx-axis", dwOfs: 12, dwType: DIDFT_ABSAXIS | (2 << 8), guid: GUID_RXAXIS },
-            { name: "Ry-axis", dwOfs: 16, dwType: DIDFT_ABSAXIS | (3 << 8), guid: GUID_RYAXIS },
-            { name: "POV",     dwOfs: 32, dwType: DIDFT_POV     | (4 << 8), guid: GUID_POVOBJ },
-        ];
+        // c_dfDIJoystick offsets; instance numbers count per object class, as DirectInput does.
+        const objs: DeviceObjectSpec[] = [];
+        for (let a = 0; a < JOY_AXIS_COUNT; a++) {
+            objs.push({ name: JOY_AXIS_NAMES[a], dwOfs: a * 4, dwType: DIDFT_ABSAXIS | (a << 8), guid: JOY_AXIS_GUIDS[a] });
+        }
+        objs.push({ name: "Hat Switch", dwOfs: 32, dwType: DIDFT_POV | (0 << 8), guid: GUID_POVOBJ });
         for (let i = 0; i < 32; i++) {
-            objs.push({ name: `Button ${i}`, dwOfs: 48 + i, dwType: DIDFT_PSHBUTTON | ((5 + i) << 8), guid: GUID_BUTTON });
+            objs.push({ name: `Button ${i}`, dwOfs: 48 + i, dwType: DIDFT_PSHBUTTON | (i << 8), guid: GUID_BUTTON });
         }
         return objs;
     }
@@ -235,6 +238,9 @@ const IDirectInputDevice2A_StubMethods = ["CreateEffect", "EnumEffects", "GetEff
  * DirectInput COM object implementation
  */
 class DirectInputObject extends BaseComObject {
+    /** Created by DirectInput8Create: enumerations use DI8DEVTYPE_* encodings. */
+    public di8 = false;
+
     constructor(vtableAddress: number) {
         super("89521360-AA8A-11CF-BFC7-444553540000", vtableAddress); // IDirectInputA IID
     }
@@ -253,6 +259,12 @@ class DirectInputDeviceObject extends BaseComObject {
     public dataSize = 0;
     public acquired = false;
     public exclusive = false;  // DISCL_EXCLUSIVE requested via SetCooperativeLevel
+    /** Created through IDirectInput8 (DI8 device-type encoding in caps/instance). */
+    public di8 = false;
+    /** Joystick objects bound by SetDataFormat; null = no format set yet. */
+    public joyFormat: JoyFormatObject[] | null = null;
+    /** Per-axis DIPROP_RANGE / DEADZONE / SATURATION. */
+    public joyAxes: AxisConditioning[] = defaultJoystickAxes();
     public lastMouseX = 0;
     public lastMouseY = 0;
     public lastDInputAccumX = 0;  // last-seen value of the SAB running accumulator
@@ -377,6 +389,7 @@ export class DInput implements IModule {
 
             const obj = ComObjectFactory.create(iid, vtableAddr);
             if (!obj) return DIERR_OUTOFMEMORY;
+            if (obj instanceof DirectInputObject) obj.di8 = true;
 
             const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
             const freshMem = this.getMemory();
@@ -477,11 +490,12 @@ export class DInput implements IModule {
             }
 
             // Add joystick if requested (even though we don't have a real one)
-            if (matchesFilter(DIDEVTYPE_JOYSTICK, DI8DEVTYPE_JOYSTICK)) {
+            if (matchesFilter(DIDEVTYPE_JOYSTICK, DI8DEVTYPE_JOYSTICK) || matchesFilter(DIDEVTYPE_JOYSTICK, DI8DEVTYPE_GAMEPAD)) {
                 const gamepadState = System.getInstance().inputManager.getGamepadState();
                 if (gamepadState.connected) {
+                    const caller = resourceProvider.getComObjectByAddress(args[0]);
                     devices.push({
-                        devType: DIDEVTYPE_JOYSTICK,
+                        devType: this.joystickDevType(caller instanceof DirectInputObject && caller.di8),
                         instanceName: "Gamepad",
                         productName: "Browser Gamepad",
                         guidInstance: GUID_SYS_GAMEPAD,
@@ -761,6 +775,13 @@ export class DInput implements IModule {
             if (device) {
                 device.dataSize = dwDataSize;
                 device.dataFormat = this.resolveDataFormat(device.deviceType, dwDataSize);
+                if (device.deviceType === "joystick" || device.deviceType === "gamepad") {
+                    const bound = parseJoystickDataFormat(freshMem, lpdf);
+                    device.joyFormat = bound?.objects ?? null;
+                    device.dataFormat = "gamepad";
+                    Logger.log(LogCategory.SYSTEM,
+                        `IDirectInputDeviceA_SetDataFormat: pad format ${dwDataSize}B, ${bound?.objects.length ?? 0}/${dwNumObjs} objects bound`);
+                }
             }
 
             Logger.log(LogCategory.SYSTEM, `IDirectInputDeviceA_SetDataFormat: this=0x${thisPtr.toString(16)}, size=${dwSize}, objSize=${dwObjSize}, flags=0x${dwFlags.toString(16)}, dataSize=${dwDataSize}, objs=${dwNumObjs}`);
@@ -795,7 +816,8 @@ export class DInput implements IModule {
             if (size < 12) return DIERR_INVALIDPARAM;
 
             const device = this.getDevice(thisPtr);
-            const devType = this.getDeviceTypeValue(device?.deviceType ?? "unknown");
+            const isPad = device?.deviceType === "joystick" || device?.deviceType === "gamepad";
+            const devType = isPad ? this.joystickDevType(!!device?.di8) : this.getDeviceTypeValue(device?.deviceType ?? "unknown");
 
             // dwFlags: report DIDC_ATTACHED for devices we actually present. Keyboard and
             // mouse are always attached; joystick only when a browser gamepad is connected
@@ -821,11 +843,12 @@ export class DInput implements IModule {
             view.setUint32(lpDIDevCaps + 8, devType, true);
 
             if (size >= 20) {
-                const axes = device?.deviceType === "mouse" ? 3 : 0;    // X, Y, Z (wheel)
-                const btns = device?.deviceType === "mouse" ? 5 : 0;    // L, R, M, X1, X2
+                const axes = device?.deviceType === "mouse" ? 3 : isPad ? JOY_REPORTED_AXES : 0;      // mouse: X, Y, Z (wheel)
+                const btns = device?.deviceType === "mouse" ? 5 : isPad ? JOY_REPORTED_BUTTONS : 0;   // mouse: L, R, M, X1, X2
                 view.setUint32(lpDIDevCaps + 12, axes, true);
                 view.setUint32(lpDIDevCaps + 16, btns, true);
             }
+            if (size >= 24) view.setUint32(lpDIDevCaps + 20, isPad ? JOY_REPORTED_POVS : 0, true);
 
             return DI_OK;
         };
@@ -842,7 +865,7 @@ export class DInput implements IModule {
             if (size < 4) return DIERR_INVALIDPARAM;
 
             const device = this.getDevice(thisPtr);
-            this.writeDeviceInstance(mem, lpddi, size, device?.deviceType ?? "unknown");
+            this.writeDeviceInstance(mem, lpddi, size, device?.deviceType ?? "unknown", !!device?.di8);
             return DI_OK;
         };
 
@@ -927,30 +950,18 @@ export class DInput implements IModule {
             }
 
             if (format === "gamepad" || format === "joystick" || cbData >= DIJOYSTATE_SIZE) {
-                if (cbData < DIJOYSTATE_SIZE) return DIERR_INVALIDPARAM;
-                const freshMem = this.getMemory();
-                const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
-                mem.fill(0, lpvData, lpvData + DIJOYSTATE_SIZE);
-                inputManager.noteGuestGamepadRead();
-                const gamepad = inputManager.getGamepadState();
-                const axes = gamepad.axes;
-                view.setInt32(lpvData, axes[0], true);
-                view.setInt32(lpvData + 4, axes[1], true);
-                view.setInt32(lpvData + 8, 0, true);
-                view.setInt32(lpvData + 12, axes[2], true);
-                view.setInt32(lpvData + 16, axes[3], true);
-                view.setInt32(lpvData + 20, 0, true);
-                view.setUint32(lpvData + 24, 0, true);
-                view.setUint32(lpvData + 28, 0, true);
-                view.setUint32(lpvData + 32, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 36, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 40, 0xFFFFFFFF, true);
-                view.setUint32(lpvData + 44, 0xFFFFFFFF, true);
-
-                const buttonsMask = gamepad.connected ? gamepad.buttons : 0;
-                for (let i = 0; i < 32; i++) {
-                    mem[lpvData + 48 + i] = (buttonsMask & (1 << i)) ? 0x80 : 0x00;
+                // With a bound format the buffer must be exactly its size (real DirectInput
+                // rejects anything else); without one, accept DIJOYSTATE / DIJOYSTATE2.
+                const bound = device?.joyFormat ?? null;
+                if (bound) {
+                    if (cbData !== device!.dataSize) return DIERR_INVALIDPARAM;
+                } else if (cbData < DIJOYSTATE_SIZE) {
+                    return DIERR_INVALIDPARAM;
                 }
+                const objects = bound ?? (cbData >= DIJOYSTATE2_SIZE ? DIJOYSTATE2_FORMAT : DIJOYSTATE_FORMAT);
+                inputManager.noteGuestGamepadRead();
+                writeJoystickState(this.getMemory(), lpvData, cbData, objects, inputManager.getGamepadState(),
+                    device?.joyAxes ?? defaultJoystickAxes());
                 return DI_OK;
             }
 
@@ -1065,6 +1076,35 @@ export class DInput implements IModule {
                 return DI_OK;
             }
 
+            if ((rguidProp & 0xFFFF0000) === 0 &&
+                (rguidProp === DIPROP_RANGE || rguidProp === DIPROP_DEADZONE || rguidProp === DIPROP_SATURATION)) {
+                const device = this.getDevice(thisPtr);
+                if (device && (device.deviceType === "joystick" || device.deviceType === "gamepad")) {
+                    const freshMem = this.getMemory();
+                    const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+                    const dwObj = view.getUint32(pdiph + 8, true);
+                    const dwHow = view.getUint32(pdiph + 12, true);
+                    const axes = axesForProperty(device.joyFormat ?? DIJOYSTATE_FORMAT, dwObj, dwHow);
+                    if (axes.length === 0) return DIERR_OBJECTNOTFOUND;
+                    for (const a of axes) {
+                        const c = device.joyAxes[a];
+                        if (rguidProp === DIPROP_RANGE) {
+                            const lMin = view.getInt32(pdiph + 16, true);
+                            const lMax = view.getInt32(pdiph + 20, true);
+                            if (lMin >= lMax) return DIERR_INVALIDPARAM;
+                            c.min = lMin; c.max = lMax;
+                        } else if (rguidProp === DIPROP_DEADZONE) {
+                            c.deadzone = Math.min(10000, view.getUint32(pdiph + 16, true));
+                        } else {
+                            c.saturation = Math.min(10000, view.getUint32(pdiph + 16, true));
+                        }
+                    }
+                    Logger.log(LogCategory.SYSTEM,
+                        `IDirectInputDeviceA_SetProperty: prop=${rguidProp} axes=[${axes.join(",")}] -> ${JSON.stringify(device.joyAxes[axes[0]])}`);
+                    return DI_OK;
+                }
+            }
+
             Logger.verbose(LogCategory.SYSTEM, `IDirectInputDeviceA_SetProperty: prop=0x${rguidProp.toString(16)} (stub)`);
             return DI_OK;
         };
@@ -1114,15 +1154,32 @@ export class DInput implements IModule {
                 return DI_OK;
             }
 
-            if ((rguidProp & 0xFFFF0000) === 0 && rguidProp === DIPROP_RANGE) {
-                // DIPROPRANGE { header(16), lMin(+16), lMax(+20) }. Mouse/keyboard axes are
-                // relative → no defined range; absolute joystick axes report 0..65535.
+            if ((rguidProp & 0xFFFF0000) === 0 &&
+                (rguidProp === DIPROP_RANGE || rguidProp === DIPROP_DEADZONE || rguidProp === DIPROP_SATURATION)) {
+                // DIPROPRANGE { header(16), lMin(+16), lMax(+20) }; DIPROPDWORD { header, dwData(+16) }.
+                // Mouse/keyboard axes are relative → no defined range; pad axes report what
+                // SetProperty configured (DirectInput default 0..65535, no deadzone).
                 const freshMem = this.getMemory();
                 const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
                 const device = this.getDevice(thisPtr);
                 const absolute = device?.deviceType === "joystick" || device?.deviceType === "gamepad";
-                view.setUint32(pdiph + 16, absolute ? 0 : DIPROPRANGE_NOMIN, true);
-                view.setUint32(pdiph + 20, absolute ? 65535 : DIPROPRANGE_NOMAX, true);
+                if (!absolute) {
+                    if (rguidProp !== DIPROP_RANGE) return DIERR_UNSUPPORTED;
+                    view.setUint32(pdiph + 16, DIPROPRANGE_NOMIN, true);
+                    view.setUint32(pdiph + 20, DIPROPRANGE_NOMAX, true);
+                    return DI_OK;
+                }
+                const dwObj = view.getUint32(pdiph + 8, true);
+                const dwHow = view.getUint32(pdiph + 12, true);
+                const axes = axesForProperty(device!.joyFormat ?? DIJOYSTATE_FORMAT, dwObj, dwHow);
+                if (axes.length === 0) return DIERR_OBJECTNOTFOUND;
+                const c = device!.joyAxes[axes[0]];
+                if (rguidProp === DIPROP_RANGE) {
+                    view.setInt32(pdiph + 16, c.min, true);
+                    view.setInt32(pdiph + 20, c.max, true);
+                } else {
+                    view.setUint32(pdiph + 16, rguidProp === DIPROP_DEADZONE ? c.deadzone : c.saturation, true);
+                }
                 return DI_OK;
             }
 
@@ -1536,6 +1593,7 @@ export class DInput implements IModule {
         const obj = ComObjectFactory.create<DirectInputDeviceObject>(iid, vtableAddr, iid);
         if (!obj) return 0;
         obj.deviceType = deviceType;
+        obj.di8 = true;
         const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
         SystemResourceProvider.getInstance().mapAddressToHandle(objAddr, obj.handle);
         return objAddr;
@@ -1881,6 +1939,13 @@ export class DInput implements IModule {
         return obj instanceof DirectInputDeviceObject ? obj : null;
     }
 
+    /** dwDevType for the pad: DI8 gamepad subtype + HID, or the DX5/7 joystick/gamepad subtype. */
+    private joystickDevType(di8: boolean): number {
+        return di8
+            ? (DI8DEVTYPE_GAMEPAD | (DI8DEVTYPEGAMEPAD_STANDARD << 8) | DIDEVTYPE_HID)
+            : (DIDEVTYPE_JOYSTICK | (DIDEVTYPEJOYSTICK_GAMEPAD << 8));
+    }
+
     private resolveDeviceType(mem: Uint8Array, guidPtr: number): "keyboard" | "mouse" | "joystick" | "gamepad" | "unknown" {
         if (!guidPtr) return "unknown";
         const guidBytes = this.readGuidBytes(mem, guidPtr);
@@ -1933,7 +1998,7 @@ export class DInput implements IModule {
         return true;
     }
 
-    private writeDeviceInstance(mem: Uint8Array, address: number, size: number, deviceType: string): void {
+    private writeDeviceInstance(mem: Uint8Array, address: number, size: number, deviceType: string, di8 = false): void {
         const freshMem = this.getMemory();
         const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
         const cappedSize = Math.min(size, DIDEVICEINSTANCEA_SIZE);
@@ -1945,7 +2010,7 @@ export class DInput implements IModule {
         const isGamepad = deviceType === "gamepad" || deviceType === "joystick";
         const guidInstance = isKeyboard ? GUID_SYS_KEYBOARD : (isMouse ? GUID_SYS_MOUSE : (isGamepad ? GUID_SYS_GAMEPAD : GUID_SYS_KEYBOARD));
         const guidProduct = guidInstance;
-        const devType = isKeyboard ? DIDEVTYPE_KEYBOARD : (isMouse ? DIDEVTYPE_MOUSE : (isGamepad ? DIDEVTYPE_JOYSTICK : DIDEVTYPE_DEVICE));
+        const devType = isKeyboard ? DIDEVTYPE_KEYBOARD : (isMouse ? DIDEVTYPE_MOUSE : (isGamepad ? this.joystickDevType(di8) : DIDEVTYPE_DEVICE));
         const instanceName = isKeyboard ? "Keyboard" : (isMouse ? "Mouse" : (isGamepad ? "Gamepad" : "Input Device"));
         const productName = isKeyboard ? "Standard Keyboard" : (isMouse ? "Standard Mouse" : (isGamepad ? "Browser Gamepad" : "Input Device"));
 

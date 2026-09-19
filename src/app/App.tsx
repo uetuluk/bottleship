@@ -94,6 +94,8 @@ const INPUT_INDEX = {
   mouseInside: 13,  // 1 = cursor inside canvas, 0 = outside
   dinputDX: 14,     // accumulated DInput raw movementX delta (Atomics.add / exchange)
   dinputDY: 15,     // accumulated DInput raw movementY delta
+  gamepadLT: 25,    // left analog trigger 0..32767 (slots 16..24 are the key bitfield + guest seq)
+  gamepadRT: 26,    // right analog trigger 0..32767
   // 16..23 reserved for the keyboard bitfield (KEY_BITFIELD_BASE)
   guestGamepadSeq: 24  // worker bumps when the GAME reads the joystick/gamepad API
 } as const;
@@ -311,8 +313,6 @@ export default function App() {
   // iPad/iPhone PWA, or a browser that rejects the request): hides the chrome and pins the
   // panel to the viewport, so the guest still gets the whole screen.
   const [immersive, setImmersive] = useState(false);
-  const immersiveRef = useRef(false);
-  immersiveRef.current = immersive;
   const isFullscreen = isElementFullscreen || immersive;
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
@@ -2172,6 +2172,7 @@ export default function App() {
     let lastGamepadConnected = 0;
     let lastGamepadButtons = 0;
     let lastGamepadAxes = [0, 0, 0, 0];
+    let lastGamepadTriggers = [0, 0];
 
     // Input-status overlay: derive "game is using the pad" from the worker's
     // guestGamepadSeq counter (bumped on DInput Acquire/GetDeviceState / joyGetPosEx).
@@ -2196,16 +2197,20 @@ export default function App() {
         const connected = livePad ? 1 : cachedMeta ? 1 : 0;
         let buttonsMask = 0;
         const axes = [0, 0, 0, 0];
+        const triggers = [0, 0];
 
         if (pad) {
           const buttons = pad.buttons ?? [];
-          for (let i = 0; i < Math.min(16, buttons.length); i++) {
+          for (let i = 0; i < Math.min(32, buttons.length); i++) {
             if (buttons[i]?.pressed) buttonsMask |= (1 << i);
           }
           const rawAxes = pad.axes ?? [];
           for (let i = 0; i < 4; i++) {
             axes[i] = Math.round(clampAxis(rawAxes[i] ?? 0) * 32767);
           }
+          // Standard mapping: buttons 6/7 are the analog triggers (value 0..1).
+          triggers[0] = Math.round(Math.max(0, Math.min(1, buttons[6]?.value ?? 0)) * 32767);
+          triggers[1] = Math.round(Math.max(0, Math.min(1, buttons[7]?.value ?? 0)) * 32767);
         }
 
         const changed = connected !== lastGamepadConnected ||
@@ -2213,7 +2218,9 @@ export default function App() {
           axes[0] !== lastGamepadAxes[0] ||
           axes[1] !== lastGamepadAxes[1] ||
           axes[2] !== lastGamepadAxes[2] ||
-          axes[3] !== lastGamepadAxes[3];
+          axes[3] !== lastGamepadAxes[3] ||
+          triggers[0] !== lastGamepadTriggers[0] ||
+          triggers[1] !== lastGamepadTriggers[1];
 
         if (changed) {
           beginInputWrite(inputView);
@@ -2223,10 +2230,13 @@ export default function App() {
           inputView[INPUT_INDEX.gamepadAxis1] = axes[1];
           inputView[INPUT_INDEX.gamepadAxis2] = axes[2];
           inputView[INPUT_INDEX.gamepadAxis3] = axes[3];
+          inputView[INPUT_INDEX.gamepadLT] = triggers[0];
+          inputView[INPUT_INDEX.gamepadRT] = triggers[1];
           endInputWrite(inputView);
           lastGamepadConnected = connected;
           lastGamepadButtons = buttonsMask;
           lastGamepadAxes = axes;
+          lastGamepadTriggers = triggers;
         }
 
         // Drive the input-status overlay (independent of the SAB-write gate above).
@@ -2354,7 +2364,7 @@ export default function App() {
       }
       return;
     }
-    if (immersiveRef.current) {
+    if (immersive) {
       setImmersive(false);
       return;
     }
@@ -2375,7 +2385,7 @@ export default function App() {
     } catch {
       setImmersive(true);
     }
-  }, []);
+  }, [immersive]);
   toggleFullscreenRef.current = () => {
     void toggleFullscreen();
   };

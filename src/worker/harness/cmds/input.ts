@@ -183,6 +183,9 @@ export function registerInputCommands(svc: HarnessService): void {
     // Born from the MP wheel-scale bug (DIMOFS_Z=12000): the drain trace showed the
     // bogus value in one look where code review of clean-looking paths did not.
     // Actions: "start" | "stop" | "read" (returns + keeps) | "clear".
+    /** The pad as the guest sees it: connected flag, button mask, sticks (±32767), triggers (0..32767). */
+    svc.register("gamepad", () => sys().inputManager.getGamepadState());
+
     svc.register("inputTrace", (args) => {
         const action = String(args[0] ?? "read");
         const im = input();
