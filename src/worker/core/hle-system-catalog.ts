@@ -46,6 +46,7 @@ export const THUNKED_DLL_PSEUDO_BASE: Record<string, number> = {
     w32skrnl: 0x729c0000,
     riched32: 0x729d0000,
     wtsapi32: 0x729e0000,
+    dmusic: 0x729f0000,
 };
 
 export const HLE_SYSTEM_DLL_NAMES = new Set(Object.keys(THUNKED_DLL_PSEUDO_BASE));

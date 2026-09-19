@@ -731,6 +731,11 @@ export class Ole32 implements IModule {
                 Logger.verbose(LogCategory.COM, `CoCreateInstance: DirectPlay Lobby CLSID detected, trying IDirectPlayLobby3A IID`);
                 targetIID = "2db72491-652c-11d1-a7a8-0000f803abfc";
             }
+        } else if (clsidNormalized === "636b9f10-0c7d-11d1-95b2-0020afdc7421") {
+            // CLSID_DirectMusic: IDirectMusic / IDirectMusic8 / IUnknown all ride the IDirectMusic2 vtable.
+            if (!interfaceRegistry.isRegistered(iidNormalized)) {
+                targetIID = "6fc2cae1-bc78-11d2-afa6-00aa0024d8b6";
+            }
         } else if (clsidNormalized === "d8f1eee0-f634-11cf-8700-00a0245d918b") {
             Logger.log(LogCategory.COM, `CoCreateInstance: CLSID_A3d (A3D 1.0) detected, A3D not available — returning REGDB_E_CLASSNOTREG`);
             if (ppv) view.setUint32(ppv, 0, true);
@@ -840,9 +845,9 @@ export class Ole32 implements IModule {
                 return 0x80004002;
             }
             vtableAddr = specificVtable.address;
-        } else if (mapping.moduleName === "a3d") {
-            const a3dMod = this.process.modules.get("a3d") as { vtables?: Record<string, { address: number }> } | undefined;
-            const specificVtable = a3dMod?.vtables?.[mapping.className];
+        } else if (mapping.moduleName === "a3d" || mapping.moduleName === "dmusic") {
+            const mod = this.process.modules.get(mapping.moduleName) as { vtables?: Record<string, { address: number }> } | undefined;
+            const specificVtable = mod?.vtables?.[mapping.className];
             if (!specificVtable) {
                 if (ppv) view.setUint32(ppv, 0, true);
                 return 0x80004002;
