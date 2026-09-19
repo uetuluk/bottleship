@@ -516,7 +516,8 @@ export default function App() {
 
   const requestPointerLockSafe = (canvas: HTMLCanvasElement) => {
     if (pointerLockCooldownRef.current) return;
-    Promise.resolve(canvas.requestPointerLock()).catch(() => {});
+    if (typeof canvas.requestPointerLock !== "function") return; // iPadOS Safari: no Pointer Lock API
+    try { Promise.resolve(canvas.requestPointerLock()).catch(() => {}); } catch { /* not a gesture */ }
   };
 
   // Recompute the relative-mouse intent (OR of the two faithful signals) and engage/release
@@ -824,6 +825,7 @@ export default function App() {
       console.log('BottleShip: Initializing SharedArrayBuffer');
       globalSab = new SharedArrayBuffer(INPUT_BUFFER_SIZE);
       globalInputView = new Int32Array(globalSab);
+      ((window as unknown as { __BS__?: Record<string, unknown> }).__BS__ ??= {}).inputView = globalInputView;
       setIsBufferInitialized(true);
     }
     const inputBuffer = globalSab;
@@ -1304,15 +1306,26 @@ export default function App() {
     resizeObserver.observe(canvas);
 
     // 5. Input Handlers
-    const writePointer = (event: PointerEvent) => {
+    interface PointerLike { clientX: number; clientY: number; pointerId: number; pointerType: string; movementX: number; movementY: number; buttons: number }
+    // A pen's eraser end is the right button (Pointer Events puts the barrel button on bit 2
+    // already, so barrel = right without help).
+    const pointerButtons = (event: PointerLike): number =>
+      event.pointerType === "pen" && (event.buttons & 32) ? ((event.buttons & ~32) | 2) : event.buttons;
+
+    const writePointer = (event: PointerLike, buttonsOverride?: number) => {
       const inputView = globalInputView;
       if (!inputView) return;
+      // Pen and finger are absolute by nature: never relative-mouse them, whatever the guest
+      // asked for (and iPadOS has no Pointer Lock to ask anyway).
+      const absoluteOnly = event.pointerType !== "mouse";
+      const buttons = buttonsOverride ?? pointerButtons(event);
 
       // Opportunistic re-acquire after an ESC-exit: if the guest still wants relative mouse and
       // the user didn't deliberately release (Right Ctrl), retry on pointermove. Many browsers
       // don't treat pointermove as a valid activation gesture, so this is best-effort — the
       // reliable path is the canvas click in handlePointerDown. Guarded so a rejection is silent.
       if (
+        !absoluteOnly &&
         !pointerLockedRef.current &&
         wantsPointerLockRef.current &&
         !userReleasedLockRef.current &&
@@ -1323,7 +1336,7 @@ export default function App() {
       }
 
       // --- Pointer Lock mode: use relative movementX/Y, skip canvas bounds check ---
-      if (pointerLockedRef.current) {
+      if (pointerLockedRef.current && !absoluteOnly) {
         const pointerSpace =
           mouseCoordinateModeRef.current === "guest"
             ? guestResolutionRef.current
@@ -1339,7 +1352,7 @@ export default function App() {
         beginInputWrite(inputView);
         inputView[INPUT_INDEX.mouseX]  = Math.round(virt.x);
         inputView[INPUT_INDEX.mouseY]  = Math.round(virt.y);
-        inputView[INPUT_INDEX.buttons] = event.buttons;
+        inputView[INPUT_INDEX.buttons] = buttons;
         // DirectInput reports RAW device deltas (relative axes), NOT canvas-scaled — feed the
         // accumulator unscaled movementX/Y. The virtual cursor above stays scaled (CSS→guest).
         // (dinputDX/DY are independent atomic accumulators, not part of the seqlock snapshot.)
@@ -1365,6 +1378,7 @@ export default function App() {
         }
         return;
       }
+      if (absoluteOnly && !isCanvasHoveredRef.current) handlePointerEnter(); // a pen/finger has no hover to announce itself
 
       const pointerSpace =
         mouseCoordinateModeRef.current === "guest"
@@ -1383,7 +1397,7 @@ export default function App() {
       beginInputWrite(inputView);
       inputView[INPUT_INDEX.mouseX] = Math.round(x);
       inputView[INPUT_INDEX.mouseY] = Math.round(y);
-      inputView[INPUT_INDEX.buttons] = event.buttons;
+      inputView[INPUT_INDEX.buttons] = buttons;
       Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX * scaleX));
       Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY * scaleY));
       endInputWrite(inputView);
@@ -1419,7 +1433,7 @@ export default function App() {
       }
     };
 
-    const handlePointerLeave = (event?: PointerEvent) => {
+    const handlePointerLeave = (event?: PointerLike) => {
       if (!isCanvasHoveredRef.current) return;
       // Don't leave if pointer is captured (button held down while moving outside)
       if (event && canvas.hasPointerCapture(event.pointerId)) return;
@@ -1543,6 +1557,89 @@ export default function App() {
     const handleKeyDown = (event: KeyboardEvent) => handleKey(event, 1);
     const handleKeyUp = (event: KeyboardEvent) => handleKey(event, 0);
 
+    // --- Finger touch as a tap / drag / long-press pointer ---
+    // A finger has no hover, so the guest first sees the cursor arrive at the touch point and
+    // the left button one beat later (hover-sensitive UI then reacts as it would to a mouse).
+    // A drag presses at once. Long press, or a second finger, is the right button.
+    const TOUCH_PRESS_DELAY_MS = 24;
+    const TOUCH_LONG_PRESS_MS = 550;
+    const TOUCH_SLOP_PX = 12;
+    const touch = { id: -1, x0: 0, y0: 0, moved: false, buttons: 0, pressTimer: 0, longTimer: 0, last: null as PointerLike | null };
+    const touchSnapshot = (e: PointerEvent): PointerLike =>
+      ({ clientX: e.clientX, clientY: e.clientY, pointerId: e.pointerId, pointerType: e.pointerType, movementX: 0, movementY: 0, buttons: 0 });
+    const touchWrite = (buttons: number) => {
+      touch.buttons = buttons;
+      if (touch.last) writePointer(touch.last, buttons);
+    };
+    const touchClearTimers = () => {
+      clearTimeout(touch.pressTimer); clearTimeout(touch.longTimer);
+      touch.pressTimer = 0; touch.longTimer = 0;
+    };
+    const touchReset = () => {
+      touchClearTimers();
+      touch.id = -1; touch.buttons = 0; touch.last = null; touch.moved = false;
+    };
+    const handleTouchDown = (event: PointerEvent) => {
+      if (touch.id !== -1 && event.pointerId !== touch.id) {
+        // Second finger while the first is down: right button, held until the first lifts.
+        touchClearTimers();
+        if (touch.buttons & 1) touchWrite(0);
+        touchWrite(2);
+        return;
+      }
+      touch.id = event.pointerId; touch.x0 = event.clientX; touch.y0 = event.clientY; touch.moved = false;
+      touch.last = touchSnapshot(event);
+      touchWrite(0);
+      touch.pressTimer = window.setTimeout(() => {
+        touch.pressTimer = 0;
+        if (touch.id !== -1 && touch.buttons === 0) touchWrite(1);
+      }, TOUCH_PRESS_DELAY_MS);
+      touch.longTimer = window.setTimeout(() => {
+        touch.longTimer = 0;
+        if (touch.id === -1 || touch.moved) return;
+        if (touch.buttons & 1) touchWrite(0);
+        touchWrite(2);
+      }, TOUCH_LONG_PRESS_MS);
+    };
+    const handleTouchMove = (event: PointerEvent) => {
+      if (event.pointerId !== touch.id) return;
+      const prev = touch.last;
+      touch.last = touchSnapshot(event);
+      if (prev) { touch.last.movementX = event.clientX - prev.clientX; touch.last.movementY = event.clientY - prev.clientY; }
+      if (!touch.moved && Math.hypot(event.clientX - touch.x0, event.clientY - touch.y0) > TOUCH_SLOP_PX) {
+        touch.moved = true;
+        clearTimeout(touch.longTimer); touch.longTimer = 0;
+        if (touch.pressTimer) { clearTimeout(touch.pressTimer); touch.pressTimer = 0; touch.buttons = 1; }
+      }
+      touchWrite(touch.buttons);
+    };
+    const handleTouchUp = (event: PointerEvent, cancelled = false) => {
+      if (event.pointerId !== touch.id) return; // the second finger's right button holds until the first lifts
+      touch.last = touchSnapshot(event);
+      const tapBeforePress = touch.pressTimer !== 0 && !cancelled;
+      touchClearTimers();
+      if (tapBeforePress) {
+        // Lifted before the press landed: still a full click — down now, up on the next beat.
+        touchWrite(1);
+        const at = touch.last;
+        window.setTimeout(() => writePointer(at, 0), TOUCH_PRESS_DELAY_MS);
+      } else {
+        touchWrite(0);
+      }
+      touchReset();
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (event.pointerType === "touch") handleTouchMove(event);
+      else writePointer(event);
+    };
+
+    const handlePointerCancel = (event: PointerEvent) => {
+      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      if (event.pointerType === "touch") handleTouchUp(event, true);
+      else writePointer(event, 0);
+    };
+
     const handlePointerDown = (event: PointerEvent) => {
       // Capture pointer to receive events even when cursor leaves canvas.
       // Guarded: throws InvalidStateError if the pointer was released before
@@ -1551,17 +1648,21 @@ export default function App() {
       // A deliberate click on the canvas is the re-engage gesture: clear the Right-Ctrl
       // host-release suppression so lock can be re-acquired.
       userReleasedLockRef.current = false;
+      if (!isPausedRef.current) {
+        void audioEngine?.resume();
+      }
+      if (event.pointerType === "touch") {
+        handleTouchDown(event);
+        return;
+      }
       // If cursor is hidden by guest, request pointer lock (user click = valid gesture)
-      if (wantsPointerLockRef.current && !pointerLockedRef.current) {
+      if (event.pointerType === "mouse" && wantsPointerLockRef.current && !pointerLockedRef.current) {
         requestPointerLockSafe(canvas);
         // Still forward this click — before pointer lock is acquired, absolute coords
         // are still valid (pointermove has been syncing them). Without forwarding,
         // button state never reaches the SAB and the game never sees WM_LBUTTONDOWN.
         // Games like HoMM3 call ShowCursor(FALSE) to draw a custom cursor but still
         // rely on WndProc mouse messages for click handling.
-      }
-      if (!isPausedRef.current) {
-        void audioEngine?.resume();
       }
       writePointer(event);
     };
@@ -1571,16 +1672,18 @@ export default function App() {
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
       }
-      writePointer(event);
+      if (event.pointerType === "touch") handleTouchUp(event);
+      else writePointer(event);
     };
 
     const handleContextMenu = (event: Event) => {
       event.preventDefault();
     };
 
-    canvas.addEventListener("pointermove", writePointer);
+    canvas.addEventListener("pointermove", handlePointerMove);
     canvas.addEventListener("pointerdown", handlePointerDown);
     canvas.addEventListener("pointerup", handlePointerUp);
+    canvas.addEventListener("pointercancel", handlePointerCancel);
     canvas.addEventListener("pointerenter", handlePointerEnter);
     canvas.addEventListener("pointerleave", handlePointerLeave);
     canvas.addEventListener("contextmenu", handleContextMenu);
@@ -2033,9 +2136,11 @@ export default function App() {
       window.visualViewport?.removeEventListener("resize", resize);
       document.removeEventListener("fullscreenchange", resize);
       resizeObserver.disconnect();
-      canvas.removeEventListener("pointermove", writePointer);
+      canvas.removeEventListener("pointermove", handlePointerMove);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointerup", handlePointerUp);
+      canvas.removeEventListener("pointercancel", handlePointerCancel);
+      touchReset();
       canvas.removeEventListener("pointerenter", handlePointerEnter);
       canvas.removeEventListener("pointerleave", handlePointerLeave);
       canvas.removeEventListener("contextmenu", handleContextMenu);

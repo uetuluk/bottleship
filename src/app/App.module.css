@@ -29,6 +29,11 @@
   height: auto;
   background: #000;
   touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
   position: relative;
   z-index: 1;
   /* The canvas is programmatically focused (tabIndex -1) to capture keyboard input;
