@@ -14,8 +14,13 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
-export const DEFAULT_CDP_PORT = 9333;
-export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
+// Per-worktree overrides: two agents on two checkouts each run their own Vite (and
+// optionally their own Chrome), so the transport's defaults must be env-settable.
+// BS_TAB (below) isolates tabs inside ONE Chrome; these isolate the servers.
+export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT) || 9333;
+export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? "http://localhost:5174/?game=dev";
+/** Origin of the Vite dev server backing DEFAULT_DEV_URL — what health() probes. */
+export const DEV_ORIGIN = new URL(DEFAULT_DEV_URL).origin;
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
@@ -409,7 +414,7 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     const probe = async (url: string, init?: RequestInit) => {
         try { return (await fetch(url, init)).ok; } catch { return false; }
     };
-    const vite = (await probe("http://localhost:5174/health")) || (await probe(DEFAULT_DEV_URL));
+    const vite = (await probe(`${DEV_ORIGIN}/health`)) || (await probe(DEFAULT_DEV_URL));
     const logServer = await (async () => {
         try { return (await (await fetch("http://localhost:3001/health")).text()).trim() === "OK"; } catch { return false; }
     })();

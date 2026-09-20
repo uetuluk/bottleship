@@ -252,6 +252,18 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("GetTextCharset", 1),
         makeFunc("GetTextCharsetInfo", 3),
         makeFunc("SelectClipPath", 2),
+        // GDI path bracket (BeginPath .. EndPath, then one of the render verbs)
+        makeFunc("BeginPath", 1),
+        makeFunc("EndPath", 1),
+        makeFunc("AbortPath", 1),
+        makeFunc("CloseFigure", 1),
+        makeFunc("FillPath", 1),
+        makeFunc("StrokePath", 1),
+        makeFunc("StrokeAndFillPath", 1),
+        makeFunc("FlattenPath", 1),
+        makeFunc("WidenPath", 1),
+        makeFunc("PathToRegion", 1),
+        makeFunc("GetPath", 4),
         makeFunc("SelectVisRgn", 2),
         makeFunc("SetTextJustification", 3),
 

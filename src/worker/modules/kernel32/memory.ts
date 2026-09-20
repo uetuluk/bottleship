@@ -666,6 +666,23 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return null;
     }
 
+    /**
+     * Range [base,end) already owned by an earlier VirtualAlloc, as a describing string
+     * (null = free). Windows reserves VA exactly once, so MEM_RESERVE at an explicit
+     * base must fail when it would straddle a live reservation.
+     */
+    function findReserveConflict(base: number, end: number): string | null {
+        const hit = (kind: string, b: number, size: number) =>
+            `${kind} 0x${b.toString(16)}..0x${(b + size).toString(16)}`;
+        for (const [rBase, rSize] of reservedPages) {
+            if (base < rBase + rSize && rBase < end) return hit('reservation', rBase, rSize);
+        }
+        for (const [rBase, rSize] of virtualAllocRegions) {
+            if (base < rBase + rSize && rBase < end) return hit('VirtualAlloc region', rBase, rSize);
+        }
+        return null;
+    }
+
     // Process heap handle constant (returned by GetProcessHeap)
     const PROCESS_HEAP_HANDLE = 0x12345678;
     const CURRENT_PROCESS = 0xFFFFFFFF;
@@ -1780,6 +1797,27 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
+        // MEM_RESERVE at an explicit base: Windows never double-reserves VA. If any page
+        // of the range is already reserved or mapped the call fails with
+        // ERROR_INVALID_ADDRESS, and callers (arena allocators growing contiguously)
+        // handle that by picking another base. Granting the overlap instead leaves two
+        // owners of the same pages — one writes over the other's headers and the
+        // corruption only surfaces later as wild pointers far from the real cause.
+        if ((flAllocationType & MEM_RESERVE) && effectiveAddress !== 0) {
+            // Windows rounds an explicit reserve base DOWN to 64KB allocation granularity.
+            const reserveBase = effectiveAddress & ~(ALLOC_GRANULARITY - 1);
+            const reserveEnd = effectiveAddress + alignedSize;
+            const conflict = findReserveConflict(reserveBase, reserveEnd);
+            if (conflict) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+                Logger.verbose(LogCategory.KERNEL32,
+                    `VirtualAlloc: MEM_RESERVE 0x${reserveBase.toString(16)}..0x${reserveEnd.toString(16)} ` +
+                    `overlaps ${conflict} -> NULL`);
+                return 0;
+            }
+            address = reserveBase;
+        }
+
         try {
             if (address === 0) {
                 // Align to 64KB allocation granularity (not just 4KB page).
@@ -1788,7 +1826,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // If two pools share the same >> 16 index (within same 64KB chunk),
                 // Free() decrements the WRONG pool's Taken counter → premature VirtualFree
                 // → use-after-free of GNames/other critical data.
-                address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                //
+                // A RESERVE gets its own top-down frontier (reserveGuestVa), off the bump
+                // frontier HeapAlloc shares, so the VA just above a reservation stays free
+                // for the guest to extend into. A bare MEM_COMMIT at lpAddress=0 is an
+                // implicit reserve+commit of ordinary memory and keeps the plain path.
+                address = (flAllocationType & MEM_RESERVE)
+                    ? process.memory.reserveGuestVa(alignedSize)
+                    : process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
             } else {
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
@@ -1881,6 +1926,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             clearDecommittedRange(lpAddress, trackedSize);
             reservedPages.delete(lpAddress);
             virtualAllocRegions.delete(lpAddress);
+
+            // A reservation carved by reserveGuestVa lives outside the bump/free-list
+            // world: release it to the reservation free list, never to the shared HEAP one.
+            if (process.memory.releaseGuestVa(lpAddress)) {
+                Logger.verbose(LogCategory.KERNEL32,
+                    `VirtualFree: released reservation at 0x${lpAddress.toString(16)}`);
+                return 1; // TRUE
+            }
 
             const allocSize = process.memory.getSize(lpAddress);
             if (allocSize === undefined) {

@@ -57,6 +57,24 @@ export class StoredFlagAccumulator {
         this.pos = (this.pos + 1) % 8;
     }
 
+    /**
+     * Consume one stored bit for flag `index`. Unlike {@link add} this survives past
+     * bit 31 (`|=` is 32-bit in JS): distinct powers of two sum exactly in a float64
+     * up to 2^52. Bits above that are still CONSUMED — stream alignment is what the
+     * parse depends on — but not recorded; only obsolete flags live up there.
+     */
+    addBit(index: number): void {
+        if (this.pos === 0) {
+            this.bytes++;
+            this.buffer = this.reader.u8();
+        }
+        if (this.buffer & (1 << this.pos)) {
+            if (index < 32) this.flags |= 1 << index;
+            else if (index <= 52) this.flags += 2 ** index;
+        }
+        this.pos = (this.pos + 1) % 8;
+    }
+
     finalize(): number {
         if (this.bytes === 3 && this.padBits === 32) {
             this.reader.u8();

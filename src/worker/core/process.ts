@@ -46,6 +46,10 @@ export class MemoryManager {
 
     // Free list: bucketKind → sorted array of {addr, size} blocks
     private freeBlocks: Map<RegionKind, Array<{ addr: number; size: number }>> = new Map();
+    /** Live guest VirtualAlloc(NULL, MEM_RESERVE) reservations: base → size. */
+    private vaReservations: Map<number, number> = new Map();
+    /** Released reservations, reusable only by another reservation (see reserveGuestVa). */
+    private vaFreeBlocks: Array<{ addr: number; size: number }> = [];
     // Track which bucket kind each allocation belongs to
     private allocBucket: Map<number, RegionKind> = new Map();
 
@@ -221,6 +225,82 @@ export class MemoryManager {
         ensureGuestPagesCommitted(addr, aligned);
         this.logLargeEvent('alloc', addr, aligned);
         return addr;
+    }
+
+    /**
+     * Carve VA for a guest `VirtualAlloc(NULL, …, MEM_RESERVE)` — top-down, from the
+     * same descending frontier as the slab arena, and NEVER from the guest bump
+     * frontier that HeapAlloc & co. allocate from.
+     *
+     * Why not the shared bump frontier: an arena allocator (Flash Player, the MSVC
+     * CRT's low-fragmentation heap, most engine allocators) reserves a big block and
+     * later extends it by reserving *at its own end*. Bump-allocating both reservations
+     * and heap blocks from one frontier puts whatever the guest allocated next — a
+     * 48-byte HeapAlloc is enough, since a reservation then rounds up to the next 64KB
+     * granule — squarely in that growth path, so the extend is refused. Windows does
+     * not collide that reliably: its heap sub-allocates inside its own segments and its
+     * address space has real holes. Growing DOWN restores the property the guest
+     * actually depends on — the VA immediately above a reservation stays free — while
+     * keeping reservations 64KB-granular as Win32 requires.
+     *
+     * Released reservations are reused only by other reservations: handing one back to
+     * the shared HEAP free list would let a later HeapAlloc land inside guest VA again
+     * and reintroduce exactly this fragmentation.
+     */
+    reserveGuestVa(size: number): number {
+        const bucket = this.bucketState.get('HEAP');
+        if (!bucket) throw new Error('MemoryManager: HEAP bucket unavailable for guest VA reservation');
+        const aligned = this.alignUp(size, 0x10000); // 64KB allocation granularity
+
+        // Best fit among released reservations; split the tail back for later reuse.
+        let bestIdx = -1;
+        let bestWaste = Infinity;
+        for (let i = 0; i < this.vaFreeBlocks.length; i++) {
+            const waste = this.vaFreeBlocks[i]!.size - aligned;
+            if (waste >= 0 && waste < bestWaste) {
+                bestWaste = waste;
+                bestIdx = i;
+            }
+        }
+        let addr: number;
+        if (bestIdx >= 0) {
+            const block = this.vaFreeBlocks[bestIdx]!;
+            this.vaFreeBlocks.splice(bestIdx, 1);
+            addr = block.addr;
+            const tail = block.size - aligned;
+            if (tail >= 0x10000) this.vaFreeBlocks.push({ addr: addr + aligned, size: tail });
+        } else {
+            const top = (bucket.slabTop ?? bucket.limit) >>> 0;
+            addr = (top - aligned) & ~0xffff;
+            if (addr < bucket.next) {
+                throw new Error(
+                    `MemoryManager: guest VA reservation OOM (top=0x${top.toString(16)} ` +
+                    `need 0x${aligned.toString(16)} would cross bump frontier 0x${bucket.next.toString(16)})`);
+            }
+            bucket.slabTop = addr;
+        }
+
+        this.vaReservations.set(addr, aligned);
+        this.recordAllocation(addr, aligned);
+        this.allocBucket.set(addr, 'HEAP');
+        ensureGuestPagesCommitted(addr, aligned);
+        this.logLargeEvent('alloc', addr, aligned);
+        return addr;
+    }
+
+    /** MEM_RELEASE of a {@link reserveGuestVa} block. False when `addr` isn't one. */
+    releaseGuestVa(addr: number): boolean {
+        const base = addr >>> 0;
+        const size = this.vaReservations.get(base);
+        if (size === undefined) return false;
+        this.vaReservations.delete(base);
+        this.allocations.delete(base);
+        this.allocBucket.delete(base);
+        this.reservedAddresses.delete(base);
+        this.currentBytes -= size;
+        this.vaFreeBlocks.push({ addr: base, size });
+        this.logLargeEvent('free', base, size);
+        return true;
     }
 
     allocAt(addr: number, size: number, kind?: RegionKind, perms?: RegionPerms): number {
