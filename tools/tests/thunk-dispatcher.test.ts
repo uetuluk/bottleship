@@ -143,7 +143,7 @@ describe('ThunkDispatcher.tryApplyPendingAsyncRestoreAtSafePoint — per-thread 
     it('Phase 1: readies a cross-thread waiter even when the FIFO head is blocked (head-of-line eliminated)', () => {
         const { d, tr } = mkWithScheduler();
         tr.parked.add(3);                                        // T3 is async-parked & ready
-        d._callbackManager = { hasInFlightCallbacks: () => true, getPendingCount: () => 1, hasSavedThunkContext: () => false }; // current (T1) blocked
+        d._callbackManager = { hasInFlightCallbacksForThread: () => true, getPendingCount: () => 1, hasSavedThunkContextForThread: () => false }; // current (T1) blocked
         d.pendingAsyncRestores = [restore(1, 'blockedHead'), restore(3, 'readyCrossThread')];
 
         const applied = d.tryApplyPendingAsyncRestoreAtSafePoint(cpu);
@@ -157,7 +157,7 @@ describe('ThunkDispatcher.tryApplyPendingAsyncRestoreAtSafePoint — per-thread 
 
     it('Phase 2: applies the CURRENT thread\'s restore by thread-id, not the head', () => {
         const { d, tr, setCurrent } = mkWithScheduler();
-        d._callbackManager = { hasInFlightCallbacks: () => false, getPendingCount: () => 0, hasSavedThunkContext: () => false };
+        d._callbackManager = { hasInFlightCallbacksForThread: () => false, getPendingCount: () => 0, hasSavedThunkContextForThread: () => false };
         tr.parked.add(3);
         d.pendingAsyncRestores = [restore(1, 'otherThreadHead'), restore(3, 'currentParked')];
         setCurrent(3);                                           // scheduler switched to T3 (still parked)
@@ -170,10 +170,23 @@ describe('ThunkDispatcher.tryApplyPendingAsyncRestoreAtSafePoint — per-thread 
         expect(d.pendingAsyncRestores.some((p: any) => p.info.threadId === 1)).toBe(true);  // T1's head untouched
     });
 
+    it("another thread’s callback frames do not block the current async restore", () => {
+        const { d, tr } = mkWithScheduler();
+        const checked: number[] = [];
+        d._callbackManager = {
+            hasInFlightCallbacksForThread: (tid: number) => { checked.push(tid); return tid === 2; },
+            hasSavedThunkContextForThread: (tid: number) => { checked.push(tid); return tid === 2; },
+        };
+        d.pendingAsyncRestores = [restore(1, 'currentWithPeerFrames')];
+        expect(d.tryApplyPendingAsyncRestoreAtSafePoint(cpu)).toBe(true);
+        expect(tr.appliedTids).toEqual([1]);
+        expect(checked).toEqual([1, 1]);
+    });
+
     it('preflight drops stale-generation restore before wake/apply', () => {
         const { d, tr, sched } = mkWithScheduler();
         sched.validateAsyncRestoreTarget = () => ({ ok: false, reason: 'stale-generation expected=1 actual=2 T3' });
-        d._callbackManager = { hasInFlightCallbacks: () => false, getPendingCount: () => 0, hasSavedThunkContext: () => false };
+        d._callbackManager = { hasInFlightCallbacksForThread: () => false, getPendingCount: () => 0, hasSavedThunkContextForThread: () => false };
         d.pendingAsyncRestores = [restore(3, 'stale', 1)];
 
         const applied = d.tryApplyPendingAsyncRestoreAtSafePoint(cpu, 'yieldToHost.resume');
@@ -190,7 +203,7 @@ describe('ThunkDispatcher.tryApplyPendingAsyncRestoreAtSafePoint — per-thread 
         setCurrent(3);
         tr.parked.add(3);
         sched.validateAsyncRestoreTarget = () => ({ ok: false, reason: 'invalid-returnAddr 0x141 T3' });
-        d._callbackManager = { hasInFlightCallbacks: () => false, getPendingCount: () => 0, hasSavedThunkContext: () => false };
+        d._callbackManager = { hasInFlightCallbacksForThread: () => false, getPendingCount: () => 0, hasSavedThunkContextForThread: () => false };
         d.pendingAsyncRestores = [restore(3, 'badRet', 4)];
 
         const applied = d.tryApplyPendingAsyncRestoreAtSafePoint(cpu, 'yieldToHost.resume');

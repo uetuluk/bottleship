@@ -1946,7 +1946,7 @@ export class ThunkDispatcher {
             const stackCleanup = argCount * 4;
 
             // Only save context if not already saved by the thunk itself (via CallbackManager.saveSuspendedThunkContext)
-            const hasSavedThunkContext = this._callbackManager?.hasSavedThunkContext?.() ?? false;
+            const hasSavedThunkContext = this._callbackManager?.hasSavedThunkContextForThread(this.ensureScheduler().getCurrentThreadId()) ?? false;
             if (this._callbackManager && !hasSavedThunkContext) {
                 this._callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, name);
                 Logger.verbose(LogCategory.THUNK,
@@ -2644,10 +2644,9 @@ export class ThunkDispatcher {
         // Otherwise protect the current thread's in-flight callback chain / stack: a restore here
         // would clobber a live callback frame. Defer until the chain unwinds.
         const cbMgr = this._callbackManager;
-        const hasInFlightCallbacks = typeof (cbMgr as any).hasInFlightCallbacks === 'function'
-            ? (cbMgr as any).hasInFlightCallbacks()
-            : cbMgr.getPendingCount() > 0;
-        if (hasInFlightCallbacks || cbMgr.hasSavedThunkContext()) {
+        const currentThreadId = this.ensureScheduler().getCurrentThreadId();
+        const hasInFlightCallbacks = cbMgr.hasInFlightCallbacksForThread(currentThreadId);
+        if (hasInFlightCallbacks || cbMgr.hasSavedThunkContextForThread(currentThreadId)) {
             return false;
         }
         if (this.isInAsyncCallbackStubRange(eip)) return false;

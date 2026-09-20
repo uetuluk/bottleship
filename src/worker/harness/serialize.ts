@@ -92,6 +92,7 @@ export function serializeThreads(): unknown {
     const currentThreadId: number | null = sched.currentThreadId ?? null;
     const runQueue: number[] = Array.isArray(sched.runQueue) ? [...sched.runQueue] : [];
     const liveCpu = cpu();
+    const suspendedFrames = proc()?.dispatcher?.callbackManager?.snapshotSuspendedFrames?.() ?? [];
     const threads: unknown[] = [];
     if (threadsMap) {
         for (const [, t] of threadsMap) {
@@ -112,12 +113,15 @@ export function serializeThreads(): unknown {
                 esp,
                 tebAddress: u32(t.tebAddress),
                 suspendCount: t.suspendCount ?? 0,
+                kernelPinCount: t.kernelPinCount ?? 0,
+                callbackFramePinCount: t.callbackFramePinCount ?? 0,
+                liveFrames: suspendedFrames.filter((frame: { threadId: number }) => frame.threadId === t.id).length,
                 priority: t.priority ?? 0,
                 running: isRunning,
             });
         }
     }
-    return { currentThreadId, runQueue, count: threads.length, threads };
+    return { currentThreadId, runQueue, count: threads.length, threads, suspendedFrames };
 }
 
 /** Enumerate all surface-like COM objects backend-agnostically (DDraw/D3D7/D3D8). */

@@ -91,6 +91,7 @@ function mkThread(id: number, state: ThreadState): Thread {
         lastSwitchInsn: 0,
         tebAddress: 0,
         kernelPinCount: 0,
+        callbackFramePinCount: 0,
         apcQueue: [],
         quitPosted: false,
         quitExitCode: 0,
@@ -1490,5 +1491,75 @@ describe("scheduler/timer dispatch pre-guard", () => {
         s.reset();
         expect((s as any).cachedWinmmTimerThreadId).toBe(0);
         expect((s as any).cachedWinmmTimerWakeEvent).toBe(0);
+    });
+});
+
+
+describe("scheduler/callback pin syscall boundary", () => {
+    function setup() {
+        const s = new Scheduler();
+        (s as any).process = { id: 1, getModule: () => undefined };
+        const t1 = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        s.pinCallbackFrame(t1.id);
+        const t2 = mkThread(2, ThreadState.READY);
+        t2.context = createInitialContext(0x00402000, 0x00290000);
+        inject(s, t2, { runnable: true });
+        const cpu = fakeCpu({ eip: 0x00401000, esp: 0x0028ff00 });
+        return { s, t1, cpu };
+    }
+
+    test("uncontended mutex release lets a due peer run inside a callback", () => {
+        const { s, t1, cpu } = setup();
+        const mutex = s.createMutex(true);
+        expect(s.releaseMutex(mutex)).toBe(true);
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(2);
+        expect(t1.kernelPinCount).toBe(1);
+        expect(t1.context?.eip).toBe(0x00401000);
+    });
+
+    test("a critical-runtime or timer pin still defers a syscall switch", () => {
+        const { s, cpu } = setup();
+        s.pinCurrentThread();
+        expect(s.releaseMutex(s.createMutex(true))).toBe(true);
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(1);
+    });
+
+    test("releasing another thread's frame balances its pins, not the current thread", () => {
+        const { s, t1 } = setup();
+        s.pinCallbackFrame(2);
+        s.unpinCallbackFrame(2);
+        expect(t1.kernelPinCount).toBe(1);
+        expect(t1.callbackFramePinCount).toBe(1);
+        expect((s as any).threads.get(2).kernelPinCount).toBe(0);
+    });
+
+    test("ordinary guest boundary retains the callback pin", () => {
+        const { s, cpu } = setup();
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(1);
+        expect((s as any).switchRequested).toBe(true);
+    });
+
+    test("a syscall without a due switch cannot unpin a later guest boundary", () => {
+        const { s, cpu } = setup();
+        cpu.instruction_counter[0] = 0;
+        expect(s.releaseMutex(s.createMutex(true))).toBe(true);
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(1);
+        cpu.instruction_counter[0] = 10_000_000;
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(1);
+    });
+
+    test("an async-restore early return consumes the syscall permission", () => {
+        const { s, cpu } = setup();
+        expect(s.releaseMutex(s.createMutex(true))).toBe(true);
+        s.onPollAsyncRestores = () => true;
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        s.onPollAsyncRestores = () => false;
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+        expect(s.getCurrentThreadId()).toBe(1);
     });
 });
