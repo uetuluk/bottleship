@@ -1826,7 +1826,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // If two pools share the same >> 16 index (within same 64KB chunk),
                 // Free() decrements the WRONG pool's Taken counter → premature VirtualFree
                 // → use-after-free of GNames/other critical data.
-                address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                //
+                // A RESERVE gets its own top-down frontier (reserveGuestVa), off the bump
+                // frontier HeapAlloc shares, so the VA just above a reservation stays free
+                // for the guest to extend into. A bare MEM_COMMIT at lpAddress=0 is an
+                // implicit reserve+commit of ordinary memory and keeps the plain path.
+                address = (flAllocationType & MEM_RESERVE)
+                    ? process.memory.reserveGuestVa(alignedSize)
+                    : process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
             } else {
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
@@ -1919,6 +1926,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             clearDecommittedRange(lpAddress, trackedSize);
             reservedPages.delete(lpAddress);
             virtualAllocRegions.delete(lpAddress);
+
+            // A reservation carved by reserveGuestVa lives outside the bump/free-list
+            // world: release it to the reservation free list, never to the shared HEAP one.
+            if (process.memory.releaseGuestVa(lpAddress)) {
+                Logger.verbose(LogCategory.KERNEL32,
+                    `VirtualFree: released reservation at 0x${lpAddress.toString(16)}`);
+                return 1; // TRUE
+            }
 
             const allocSize = process.memory.getSize(lpAddress);
             if (allocSize === undefined) {
