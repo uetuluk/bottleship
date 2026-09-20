@@ -666,6 +666,23 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return null;
     }
 
+    /**
+     * Range [base,end) already owned by an earlier VirtualAlloc, as a describing string
+     * (null = free). Windows reserves VA exactly once, so MEM_RESERVE at an explicit
+     * base must fail when it would straddle a live reservation.
+     */
+    function findReserveConflict(base: number, end: number): string | null {
+        const hit = (kind: string, b: number, size: number) =>
+            `${kind} 0x${b.toString(16)}..0x${(b + size).toString(16)}`;
+        for (const [rBase, rSize] of reservedPages) {
+            if (base < rBase + rSize && rBase < end) return hit('reservation', rBase, rSize);
+        }
+        for (const [rBase, rSize] of virtualAllocRegions) {
+            if (base < rBase + rSize && rBase < end) return hit('VirtualAlloc region', rBase, rSize);
+        }
+        return null;
+    }
+
     // Process heap handle constant (returned by GetProcessHeap)
     const PROCESS_HEAP_HANDLE = 0x12345678;
     const CURRENT_PROCESS = 0xFFFFFFFF;
@@ -1778,6 +1795,27 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
             Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: MEM_COMMIT at 0x${effectiveAddress.toString(16)} not within reserved region`);
             return 0;
+        }
+
+        // MEM_RESERVE at an explicit base: Windows never double-reserves VA. If any page
+        // of the range is already reserved or mapped the call fails with
+        // ERROR_INVALID_ADDRESS, and callers (arena allocators growing contiguously)
+        // handle that by picking another base. Granting the overlap instead leaves two
+        // owners of the same pages — one writes over the other's headers and the
+        // corruption only surfaces later as wild pointers far from the real cause.
+        if ((flAllocationType & MEM_RESERVE) && effectiveAddress !== 0) {
+            // Windows rounds an explicit reserve base DOWN to 64KB allocation granularity.
+            const reserveBase = effectiveAddress & ~(ALLOC_GRANULARITY - 1);
+            const reserveEnd = effectiveAddress + alignedSize;
+            const conflict = findReserveConflict(reserveBase, reserveEnd);
+            if (conflict) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+                Logger.verbose(LogCategory.KERNEL32,
+                    `VirtualAlloc: MEM_RESERVE 0x${reserveBase.toString(16)}..0x${reserveEnd.toString(16)} ` +
+                    `overlaps ${conflict} -> NULL`);
+                return 0;
+            }
+            address = reserveBase;
         }
 
         try {

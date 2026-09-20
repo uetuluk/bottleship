@@ -1817,6 +1817,53 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return INVALID_FILE_ATTRIBUTES;
     };
 
+    /**
+     * BOOL GetFileAttributesEx{A,W}(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
+     *                               LPVOID lpFileInformation)
+     *
+     * GetFileExInfoStandard (0) is the only level Windows defines; anything else is
+     * ERROR_INVALID_PARAMETER. Fills WIN32_FILE_ATTRIBUTE_DATA (36 bytes):
+     *   +0 dwFileAttributes  +4 ftCreationTime  +12 ftLastAccessTime
+     *   +20 ftLastWriteTime  +28 nFileSizeHigh  +32 nFileSizeLow
+     */
+    const getFileAttributesEx = (mem: Uint8Array, args: number[], wide: boolean) => {
+        const lpFileName = args[0] >>> 0;
+        const fInfoLevelId = args[1] >>> 0;
+        const lpFileInformation = args[2] >>> 0;
+        const suffix = wide ? 'W' : 'A';
+        const filename = lpFileName ? (wide ? readStringW(mem, lpFileName) : readStringA(mem, lpFileName)) : '';
+
+        if (fInfoLevelId !== 0 || !lpFileInformation || lpFileInformation + 36 > mem.length) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+
+        const vfs = System.getInstance().fileSystem;
+        const resolved = vfs.resolvePath(filename);
+        const isDir = vfs.directoryExists(resolved);
+        if (!isDir && !vfs.fileExists(resolved)) {
+            Logger.verbose(LogCategory.KERNEL32, `GetFileAttributesEx${suffix}: not found "${filename}"`);
+            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0; // FALSE
+        }
+
+        const size = isDir ? 0 : vfs.getFileSize(resolved);
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        view.setUint32(lpFileInformation + 0, isDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE, true);
+        const fakeTime = 132224352000000000n; // 2020-01-01, same epoch the find/stat paths report
+        view.setBigUint64(lpFileInformation + 4, fakeTime, true);
+        view.setBigUint64(lpFileInformation + 12, fakeTime, true);
+        view.setBigUint64(lpFileInformation + 20, fakeTime, true);
+        view.setUint32(lpFileInformation + 28, Math.floor(size / 0x100000000) >>> 0, true);
+        view.setUint32(lpFileInformation + 32, size >>> 0, true);
+
+        Logger.verbose(LogCategory.KERNEL32, `GetFileAttributesEx${suffix}("${filename}") size=${size} dir=${isDir}`);
+        return 1; // TRUE
+    };
+
+    exports['GetFileAttributesExA'] = (ctx, mem, args) => getFileAttributesEx(mem, args, false);
+    exports['GetFileAttributesExW'] = (ctx, mem, args) => getFileAttributesEx(mem, args, true);
+
     exports['SetFileAttributesA'] = (ctx, mem, args) => {
         const lpFileName = args[0];
         const dwFileAttributes = args[1];

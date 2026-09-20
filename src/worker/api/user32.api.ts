@@ -83,6 +83,7 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("UnloadKeyboardLayout", 1),
         makeFunc("keybd_event", 4),
         makeFunc("mouse_event", 5),
+        makeFunc("SendInput", 3),
         makeFunc("SetLastErrorEx", 2),
         makeFunc("CharUpperA", 1),
         makeFunc("CharUpperW", 1),
@@ -290,7 +291,9 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("DdeCreateStringHandleA", 3),
         makeFunc("DdeQueryStringA", 5),
         makeFunc("DdeConnect", 4),
+        makeFunc("DdeDisconnect", 1),
         makeFunc("DdeClientTransaction", 8),
+        makeFunc("DdeFreeStringHandle", 2),
         makeFunc("ReuseDDElParam", 5),
         makeFunc("UnpackDDElParam", 4),
         // Window properties

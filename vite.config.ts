@@ -177,7 +177,9 @@ export default defineConfig({
   },
   server: {
     host: true,
-    port: 5174,
+    // Env-overridable so a second checkout/worktree can run its own dev server
+    // alongside the primary one (the harness reads BS_DEV_URL to match).
+    port: Number(process.env.VITE_PORT) || 5174,
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,
