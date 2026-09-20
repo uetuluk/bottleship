@@ -231,7 +231,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const session = await ensureSession();
     const step = stepArg ? Number(stepArg) : 0;
     const inject = `(() => {
-        const cv = document.querySelector('.app__canvas');
+        const cv = document.querySelector('canvas[class*="app__canvas"]');
         if (!cv) return { error: 'no .app__canvas element' };
         const r = cv.getBoundingClientRect();
         // Guest surface dims (the space clickAt injects into). Prefer the explicit

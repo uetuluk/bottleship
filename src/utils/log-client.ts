@@ -40,7 +40,7 @@ class LogClient {
   private backpressureCallback: ((isHeavy: boolean) => void) | null = null;
   private backpressureState = false;
 
-  constructor(port: number = 3001) {
+  constructor(port: number = Number(import.meta.env.VITE_LOG_PORT ?? 3001)) {
     this.url = `ws://localhost:${port}`;
   }
 

@@ -22,6 +22,7 @@ import { registerRegistryCommands } from "./cmds/reg";
 import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
+import { registerCallbackFrameCommands } from "./cmds/callback-frames";
 import { registerPerfCommands } from "./cmds/perf";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
@@ -45,6 +46,7 @@ export function installHarnessCommands(): void {
     registerAssertCommands(harnessService);
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
+    registerCallbackFrameCommands(harnessService);
     registerPerfCommands(harnessService);
     registerFadeProbeCommands(harnessService);
     registerAudioCommands(harnessService);
