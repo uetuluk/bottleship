@@ -657,6 +657,7 @@ export class TextureConverter {
 
     // Buffers to destroy after next queue.submit() (avoid "used in submit while destroyed")
     private pendingDestroyBuffers: GPUBuffer[] = [];
+    private pendingLeakWarned = false;
 
     // Debug mode: 0 = normal, 1 = format, 2 = raw, 3 = UV grid
     private debugMode: number = 0;
@@ -1126,6 +1127,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         // Lifecycle invariant: push to pendingDestroy only after commands are recorded.
         this.pendingDestroyBuffers.push(tempSrc, tempParams, tempDst);
         if (tempPalette) this.pendingDestroyBuffers.push(tempPalette);
+        // A caller that submits its own encoder must drain this list afterwards; a growing
+        // list is a GPU memory leak of ~1.5 MB per upload.
+        if (this.pendingDestroyBuffers.length > 256 && !this.pendingLeakWarned) {
+            this.pendingLeakWarned = true;
+            Logger.error(LogCategory.DDRAW,
+                `TextureConverter: ${this.pendingDestroyBuffers.length} temp buffers awaiting destroy — a convertToTexture caller is not calling destroyPendingAfterSubmit()`);
+        }
 
         profiler.end("TextureConverter.convertToTexture");
     }

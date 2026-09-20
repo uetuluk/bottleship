@@ -790,6 +790,9 @@ export class DDrawPresenter implements RenderActive {
             palette
         );
         queue.submit([encoder.finish()]);
+        // This path owns its encoder, so the executor's flush never runs for it: release the
+        // converter's per-upload temp buffers here or every frame leaks ~1.5 MB of GPU memory.
+        textureConverter.destroyPendingAfterSubmit();
 
         // Mark as uploaded
         if (isRenderSurface(surface)) {
