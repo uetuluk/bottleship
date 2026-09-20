@@ -16,6 +16,20 @@ const LRU_META_FILE = "_cache-lru.json";
  *  never fills the origin to the brim (saves/overlay writes must keep working). */
 const STAGE_QUOTA_MARGIN = 256 * 1024 * 1024;
 
+/**
+ * A .wgb is a store-only ZIP, so its first four bytes are the local-file-header
+ * signature. Checking them is what separates "the server sent the bundle" from
+ * "the server sent 200 OK and something else" — a dev SPA fallback answering a
+ * missing /apps/<id>.wgb with index.html is the common case, and its Content-Length
+ * matches its body, so only the magic bytes catch it. Without this the HTML lands
+ * in the cache and every later launch fails with "EOCD not found".
+ */
+const ZIP_MAGIC = [0x50, 0x4b, 0x03, 0x04];
+
+function looksLikeZip(head: Uint8Array): boolean {
+    return head.length >= 4 && ZIP_MAGIC.every((b, i) => head[i] === b);
+}
+
 function urlToCacheKey(url: string): string {
     // "/apps/re-volt.wgb?v=2" → "re-volt.wgb"
     const path = url.split("?")[0];
@@ -292,6 +306,17 @@ export class WgbCache {
             onProgress(buffer.byteLength, buffer.byteLength);
         }
 
+        // A body that ends early reports done=true with no error, so the byte count against
+        // Content-Length is the only signal. Caching a short read would poison every later
+        // launch with "EOCD not found"; fail the launch instead, naming the real cause.
+        if (contentLength > 0 && buffer.byteLength !== contentLength) {
+            throw new Error(`incomplete download: got ${buffer.byteLength} of ${contentLength} bytes`);
+        }
+        if (!looksLikeZip(buffer)) {
+            throw new Error(`"${url}" is not a .wgb (no ZIP signature; ${buffer.byteLength} bytes` +
+                `, content-type ${resp.headers.get("content-type") ?? "?"})`);
+        }
+
         const mb = (buffer.byteLength / 1024 / 1024).toFixed(1);
         Logger.log(LogCategory.SYSTEM, `WgbCache: download done (${mb} MB), writing to OPFS`);
 
@@ -351,6 +376,8 @@ export class WgbCache {
         }
 
         const sah = await createSah.call(fileHandle);
+        const head = new Uint8Array(4);
+        let headLen = 0;
         try {
             sah.truncate(0);
             let pos = 0;
@@ -358,6 +385,7 @@ export class WgbCache {
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                for (let i = 0; headLen < head.length && i < value.byteLength; i++) head[headLen++] = value[i];
                 let w = 0;
                 while (w < value.byteLength) {
                     const n = sah.write(value.subarray(w), { at: pos + w });
@@ -374,12 +402,16 @@ export class WgbCache {
         }
 
         const size = sah.getSize();
-        // Reject a truncated stream (smaller than the minimum EOCD record) — trusting it
-        // makes the loader fail with "EOCD not found" and poisons every later launch.
-        if (size < 22) {
+        // Reject a truncated stream — trusting it makes the loader fail with "EOCD not
+        // found" and poisons every later launch, since the short file is indistinguishable
+        // from a complete one on the next open. A body that simply ends early (connection
+        // dropped, page reloaded mid-stream) reports done=true with no error, so the byte
+        // count against Content-Length is the only signal. Same invariant as stageInBackground.
+        if (size < 22 || (contentLength > 0 && size !== contentLength) || !looksLikeZip(head)) {
             try { sah.close(); } catch { /* best-effort */ }
             try { await dir.removeEntry(key); } catch { /* best-effort */ }
-            Logger.warn(LogCategory.SYSTEM, `WgbCache: streamed "${key}" too small (${size} bytes < EOCD) — discarding`);
+            Logger.warn(LogCategory.SYSTEM,
+                `WgbCache: streamed "${key}" unusable (${size}/${contentLength} bytes, zip=${looksLikeZip(head)}) — discarding`);
             return null;
         }
         const source = new SyncAccessHandleSource(sah, size);
@@ -422,6 +454,8 @@ export class WgbCache {
         }
 
         const sah = await movable.createSyncAccessHandle();
+        const head = new Uint8Array(4);
+        let headLen = 0;
         let size = 0;
         try {
             sah.truncate(0);
@@ -430,6 +464,7 @@ export class WgbCache {
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                for (let i = 0; headLen < head.length && i < value.byteLength; i++) head[headLen++] = value[i];
                 let w = 0;
                 while (w < value.byteLength) {
                     const n = sah.write(value.subarray(w), { at: pos + w });
@@ -444,9 +479,10 @@ export class WgbCache {
             try { sah.close(); } catch { /* best-effort */ }
         }
 
-        if (size < 22 || (contentLength > 0 && size !== contentLength)) {
+        if (size < 22 || (contentLength > 0 && size !== contentLength) || !looksLikeZip(head)) {
             try { await dir.removeEntry(partKey); } catch { /* best-effort */ }
-            Logger.warn(LogCategory.SYSTEM, `WgbCache: background stage of "${key}" incomplete (${size}/${contentLength}) — discarded`);
+            Logger.warn(LogCategory.SYSTEM,
+                `WgbCache: background stage of "${key}" unusable (${size}/${contentLength}, zip=${looksLikeZip(head)}) — discarded`);
             return false;
         }
         await movable.move(key);
