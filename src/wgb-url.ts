@@ -16,9 +16,17 @@ export function urlPath(url: string): string {
     return url.slice(0, end);
 }
 
+/**
+ * Dev-server route that streams a bundle off disk by absolute path
+ * (`/__wgb/?path=<abs .wgb>`, see vite.config serveWgbFromDisk). The bundle name lives
+ * in the query, so the path test below cannot see it.
+ */
+const DEV_DISK_ROUTE = "/__wgb/";
+
 /** True when `url` points at a `.wgb` bundle, query string and fragment notwithstanding. */
 export function isWgbUrl(url: string): boolean {
-    return urlPath(url).toLowerCase().endsWith(".wgb");
+    const path = urlPath(url);
+    return path.toLowerCase().endsWith(".wgb") || path.endsWith(DEV_DISK_ROUTE);
 }
 
 /** Filename a URL would be cached under (`…/game.wgb?token=x` → `game.wgb`). */
