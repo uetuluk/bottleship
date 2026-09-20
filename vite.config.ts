@@ -22,7 +22,7 @@ const BUILD_SHA = (
 const useSsl = !!process.env.VITE_SSL;
 // Ports are env-overridable so several worktrees can each run their own dev stack
 // side by side; the harness (tools/cdp-core.ts) reads the same variables.
-const VITE_PORT = Number(process.env.BS_VITE_PORT ?? 5174);
+const VITE_PORT = Number(process.env.BS_VITE_PORT ?? process.env.VITE_PORT ?? 5174);
 const LOG_PORT = Number(process.env.BS_LOG_PORT ?? 3001);
 
 const coopCoepHeaders = {
@@ -182,6 +182,8 @@ export default defineConfig({
   },
   server: {
     host: true,
+    // Env-overridable so a second checkout/worktree can run its own dev server
+    // alongside the primary one (the harness reads BS_VITE_PORT / BS_DEV_URL to match).
     port: VITE_PORT,
     strictPort: true,
     ...useSsl ? { https: true } : {},

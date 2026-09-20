@@ -20,12 +20,32 @@ export const VersionFlags = {
     ISX: 1 << 2,
 } as const;
 
-/** Supported range per M2 spec: [5.2.0, 6.4.x] */
-export const MIN_SUPPORTED_VERSION = INNO_VERSION(5, 2, 0);
+/**
+ * Supported range. The header/offset parsers below are a full innoextract port and
+ * already carry every 1.x-4.x branch; the floor sits at 4.1.0 because that is where
+ * Inno switched the data chunks to LZMA1, which is what our unpack backend decodes
+ * (4.0.x and earlier compiled chunks with zlib/bzip2 — the chunk reader rejects those
+ * with a clear message rather than mis-decoding them).
+ */
+export const MIN_SUPPORTED_VERSION = INNO_VERSION(4, 1, 0);
 export const MAX_SUPPORTED_VERSION = INNO_VERSION_EXT(6, 4, 255, 255);
 
 /** setup/version.cpp:74-189 — known version table (5.x unicode entries required) */
 const KNOWN_VERSIONS: { name: string; version: VersionConstant; variant: number }[] = [
+    { name: "Inno Setup Setup Data (4.1.0)", version: INNO_VERSION_EXT(4, 1, 0, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.2)", version: INNO_VERSION_EXT(4, 1, 2, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.3)", version: INNO_VERSION_EXT(4, 1, 3, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.4)", version: INNO_VERSION_EXT(4, 1, 4, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.5)", version: INNO_VERSION_EXT(4, 1, 5, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.6)", version: INNO_VERSION_EXT(4, 1, 6, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.1.8)", version: INNO_VERSION_EXT(4, 1, 8, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.0)", version: INNO_VERSION_EXT(4, 2, 0, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.1)", version: INNO_VERSION_EXT(4, 2, 1, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.2)", version: INNO_VERSION_EXT(4, 2, 2, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.3)", version: INNO_VERSION_EXT(4, 2, 3, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.4)", version: INNO_VERSION_EXT(4, 2, 4, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.5)", version: INNO_VERSION_EXT(4, 2, 5, 0), variant: 0 },
+    { name: "Inno Setup Setup Data (4.2.6)", version: INNO_VERSION_EXT(4, 2, 6, 0), variant: 0 },
     { name: "Inno Setup Setup Data (5.0.0)", version: INNO_VERSION_EXT(5, 0, 0, 0), variant: 0 },
     { name: "Inno Setup Setup Data (5.0.1)", version: INNO_VERSION_EXT(5, 0, 1, 0), variant: 0 },
     { name: "Inno Setup Setup Data (5.0.3)", version: INNO_VERSION_EXT(5, 0, 3, 0), variant: 0 },
@@ -237,10 +257,16 @@ export function parseVersionString(bytes: Uint8Array, baseOffset = 0): InnoVersi
     return new InnoVersion(value, variant, false, rawString);
 }
 
+function versionToString(v: VersionConstant): string {
+    const d = v & 0xff;
+    return `${v >>> 24}.${(v >>> 16) & 0xff}.${(v >>> 8) & 0xff}${d ? `.${d}` : ""}`;
+}
+
 export function assertSupportedVersion(version: InnoVersion, offset?: number): void {
     if (version.value < MIN_SUPPORTED_VERSION || version.value > MAX_SUPPORTED_VERSION) {
         throw new InnoFormatError(
-            `unsupported Inno Setup version ${version.toString()} (supported: 5.2.0 – 6.4.x)`,
+            `unsupported Inno Setup version ${version.toString()} ` +
+                `(supported: ${versionToString(MIN_SUPPORTED_VERSION)} - ${versionToString(MAX_SUPPORTED_VERSION)})`,
             offset,
         );
     }

@@ -14,13 +14,17 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
-// Ports are env-overridable (BS_CDP_PORT / BS_VITE_PORT / BS_LOG_PORT) so several
-// worktrees can each drive their own Chrome + dev stack side by side. vite.config.ts
-// and tools/log-server read the same variables.
+// Per-worktree overrides: several checkouts each drive their own Chrome + dev stack
+// side by side, so the transport's defaults must be env-settable. BS_TAB (below)
+// isolates tabs inside ONE Chrome; these isolate the servers. vite.config.ts and
+// tools/log-server read the same port variables. BS_DEV_URL overrides the whole URL
+// when the dev server isn't on localhost at the default port.
 export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT ?? 9333);
 export const DEFAULT_VITE_PORT = Number(process.env.BS_VITE_PORT ?? 5174);
 export const DEFAULT_LOG_PORT = Number(process.env.BS_LOG_PORT ?? 3001);
-export const DEFAULT_DEV_URL = `http://localhost:${DEFAULT_VITE_PORT}/?game=dev`;
+export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? `http://localhost:${DEFAULT_VITE_PORT}/?game=dev`;
+/** Origin of the Vite dev server backing DEFAULT_DEV_URL — what health() probes. */
+export const DEV_ORIGIN = new URL(DEFAULT_DEV_URL).origin;
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
@@ -415,7 +419,7 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     const probe = async (url: string, init?: RequestInit) => {
         try { return (await fetch(url, init)).ok; } catch { return false; }
     };
-    const vite = (await probe(`http://localhost:${DEFAULT_VITE_PORT}/health`)) || (await probe(DEFAULT_DEV_URL));
+    const vite = (await probe(`${DEV_ORIGIN}/health`)) || (await probe(DEFAULT_DEV_URL));
     const logServer = await (async () => {
         try { return (await (await fetch(`http://localhost:${DEFAULT_LOG_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
     })();
