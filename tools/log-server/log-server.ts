@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 
 const CONFIG = {
-  PORT: 3001,
+  PORT: Number(process.env.BS_LOG_PORT ?? 3001),
   LOG_DIR: "logs",
   MAX_SIZE: 50 * 1024 * 1024,  // 50MB per file (increased from 20MB)
   MAX_FILES: 5,                 // Keep only 5 files (reduced from 20)

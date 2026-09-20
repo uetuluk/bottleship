@@ -20,6 +20,10 @@ const BUILD_SHA = (
 // COOP-COEP work over plain HTTP and automation needn't clear a self-signed
 // cert). Opt into a self-signed HTTPS dev/preview server with VITE_SSL=1.
 const useSsl = !!process.env.VITE_SSL;
+// Ports are env-overridable so several worktrees can each run their own dev stack
+// side by side; the harness (tools/cdp-core.ts) reads the same variables.
+const VITE_PORT = Number(process.env.BS_VITE_PORT ?? 5174);
+const LOG_PORT = Number(process.env.BS_LOG_PORT ?? 3001);
 
 const coopCoepHeaders = {
   "Cross-Origin-Opener-Policy": "same-origin",
@@ -152,6 +156,7 @@ export default defineConfig({
   base: process.env.VITE_BASE_PATH || "/",
   define: {
     __BUILD_SHA__: JSON.stringify(BUILD_SHA),
+    "import.meta.env.VITE_LOG_PORT": JSON.stringify(String(LOG_PORT)),
   },
   plugins: [
     audioWorkletPlugin(),
@@ -177,7 +182,7 @@ export default defineConfig({
   },
   server: {
     host: true,
-    port: 5174,
+    port: VITE_PORT,
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,

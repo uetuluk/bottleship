@@ -640,14 +640,7 @@ export class CallbackManager {
 
             this.releaseCallback(functionId, stub);
             this.releaseFrame(frameIndex);
-
-            for (const [cbId, cb] of this.pendingCallbacks.entries()) {
-                if ((cb.frameId ?? 0) === frameId) {
-                    const orphanStub = this.stubsById.get(cbId);
-                    if (orphanStub) this.releaseCallback(cbId, orphanStub);
-                    else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
-                }
-            }
+            this.releasePendingCallbacksForFrame(frameId);
 
             return;
         }
@@ -743,12 +736,17 @@ export class CallbackManager {
         return false;
     }
 
+    /** Concurrent callbacks on different threads must resolve against their own stacks. */
     private getTopSuspendedFrameId(): number {
-        if (this.frameStackDepth <= 0) return 0;
-        const idx = this.frameStack[this.frameStackDepth - 1];
-        if (idx < 0 || idx >= SUSPENDED_FRAME_RING_SIZE) return 0;
-        if (this.frameActive[idx] !== 1) return 0;
-        return this.frameIdRing[idx] >>> 0;
+        const tid = System.getInstance().scheduler.getCurrentThreadId() >>> 0;
+        for (let i = this.frameStackDepth - 1; i >= 0; i--) {
+            const idx = this.frameStack[i];
+            if (idx < 0 || idx >= SUSPENDED_FRAME_RING_SIZE) continue;
+            if (this.frameActive[idx] !== 1) continue;
+            if ((this.frameThreadId[idx] >>> 0) !== tid) continue;
+            return this.frameIdRing[idx] >>> 0;
+        }
+        return 0;
     }
 
     private allocateSuspendedFrame(
@@ -758,6 +756,10 @@ export class CallbackManager {
         thunkCleanup: number,
         source: string
     ): number {
+        // The incoming frame's entry ESP proves which older frames on this thread the
+        // guest has already left; drop them before they can wedge the scheduler.
+        this.reapUnwoundFrames(threadId, espEntry);
+
         let slot = -1;
         for (let i = 0; i < SUSPENDED_FRAME_RING_SIZE; i++) {
             const idx = (this.frameWriteIdx + i) % SUSPENDED_FRAME_RING_SIZE;
@@ -793,14 +795,44 @@ export class CallbackManager {
         this.frameStack[this.frameStackDepth++] = slot;
         this.frameWriteIdx = (slot + 1) % SUSPENDED_FRAME_RING_SIZE;
 
-        // Pin the thread to prevent preemptive switching during callback chains.
-        // On real Windows, APIs like EnumTextureFormats/EnumWindows are synchronous —
-        // the callback runs on the calling thread with no preemption points.
+        // Keep host-driven callback plumbing on its owner between syscall boundaries.
         try {
-            System.getInstance().scheduler.pinCurrentThread();
+            System.getInstance().scheduler.pinCallbackFrame(threadId);
         } catch { /* scheduler not ready yet */ }
 
         return frameId;
+    }
+
+    /** Drop callbacks still pending against a frame that is going away. */
+    private releasePendingCallbacksForFrame(frameId: number): void {
+        for (const [cbId, cb] of this.pendingCallbacks.entries()) {
+            if ((cb.frameId ?? 0) === (frameId >>> 0)) {
+                const orphanStub = this.stubsById.get(cbId);
+                if (orphanStub) this.releaseCallback(cbId, orphanStub);
+                else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
+            }
+        }
+    }
+
+    /** Incoming ESP at or above an older entry proves that frame's stack slot was reused. */
+    private reapUnwoundFrames(threadId: number, espEntry: number): void {
+        const tid = threadId >>> 0;
+        const esp = espEntry >>> 0;
+        // Top-down: releaseFrame splices frameStack, which only shifts entries above i.
+        for (let i = this.frameStackDepth - 1; i >= 0; i--) {
+            const slot = this.frameStack[i];
+            if (slot < 0 || slot >= SUSPENDED_FRAME_RING_SIZE) continue;
+            if (this.frameActive[slot] !== 1) continue;
+            if ((this.frameThreadId[slot] >>> 0) !== tid) continue;
+            if ((this.frameEspEntry[slot] >>> 0) > esp) continue;
+
+            const staleId = this.frameIdRing[slot] >>> 0;
+            Logger.warn(LogCategory.CALLBACK,
+                `Reaping unwound suspended frame ${staleId} (${this.frameSource[slot]}) T${tid}: ` +
+                `entry ESP=0x${(this.frameEspEntry[slot] >>> 0).toString(16)} <= incoming 0x${esp.toString(16)}`);
+            this.releaseFrame(slot);
+            this.releasePendingCallbacksForFrame(staleId);
+        }
     }
 
     private releaseFrame(slot: number): void {
@@ -817,6 +849,7 @@ export class CallbackManager {
             }
         }
 
+        const ownerThreadId = this.frameThreadId[slot];
         this.frameActive[slot] = 0;
         this.frameIdRing[slot] = 0;
         this.frameThreadId[slot] = 0;
@@ -829,7 +862,7 @@ export class CallbackManager {
 
         // Unpin the thread (balanced with pin in allocateSuspendedFrame)
         try {
-            System.getInstance().scheduler.unpinCurrentThread();
+            System.getInstance().scheduler.unpinCallbackFrame(ownerThreadId);
         } catch { /* scheduler not ready yet */ }
 
         this.notifyIdleIfReady();
@@ -841,7 +874,7 @@ export class CallbackManager {
             const scheduler = System.getInstance().scheduler;
             for (let i = 0; i < SUSPENDED_FRAME_RING_SIZE; i++) {
                 if (this.frameActive[i] === 1) {
-                    scheduler.unpinCurrentThread();
+                    scheduler.unpinCallbackFrame(this.frameThreadId[i]);
                 }
             }
         } catch { /* scheduler not ready */ }
@@ -861,7 +894,7 @@ export class CallbackManager {
         this.frameStack.fill(-1);
     }
 
-    private snapshotSuspendedFrames(): SuspendedThunkFrame[] {
+    snapshotSuspendedFrames(): SuspendedThunkFrame[] {
         const out: SuspendedThunkFrame[] = [];
         for (let i = 0; i < this.frameStackDepth; i++) {
             const slot = this.frameStack[i];
@@ -1066,12 +1099,19 @@ export class CallbackManager {
             }
         }
 
-        // A suspended-frame chain dispatch may target a thread the spin-loop safety net
-        // parked WAITING while the pump idled (see hasLiveFrameForThread). Wake it before
-        // writing CPU state — the scheduler skips WAITING threads, so without this the
-        // callback would never execute.
+        // Only the owner may write the shared CPU register file for this frame.
         if (completeThunk) {
-            System.getInstance().scheduler.wakeCurrentThreadForCallbackDispatch();
+            const scheduler = System.getInstance().scheduler;
+            const currentThreadId = scheduler.getCurrentThreadId() >>> 0;
+            const ownerThreadId = this.frameThreadId[resolvedFrameIndex] >>> 0;
+            if (ownerThreadId !== currentThreadId || !scheduler.wakeCurrentThreadForCallbackDispatch()) {
+                Logger.error(LogCategory.CALLBACK,
+                    `invokeCallback: suspended frame dispatch rejected (frame=${resolvedFrameId}, ` +
+                    `owner=T${ownerThreadId}, current=T${currentThreadId}, source=${source})`);
+                stub.inUse = false;
+                scheduler.reportCallbackFrameFatal(stub.callbackId >>> 0, currentThreadId);
+                return { callbackId: 0 };
+            }
         }
 
         const cpu = this.v86.cpu || (this.v86.v86 && this.v86.v86.cpu);
@@ -1332,8 +1372,8 @@ export class CallbackManager {
         Logger.log(LogCategory.CALLBACK, 'CallbackManager reset');
     }
 
-    hasSavedThunkContext(): boolean {
-        return this.frameStackDepth > 0;
+    hasSavedThunkContextForThread(threadId: number): boolean {
+        return this.hasLiveFrameForThread(threadId);
     }
 
     getStubPoolRange(): { base: number; end: number } {

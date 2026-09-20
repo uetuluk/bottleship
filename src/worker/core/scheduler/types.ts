@@ -188,8 +188,9 @@ export interface Thread {
     // TEB guest memory address
     tebAddress: number;
 
-    // HLE kernel pin — prevents preemptive switch when > 0
+    // Total HLE pins; only suspended-frame pins permit preemption at sync syscalls.
     kernelPinCount: number;
+    callbackFramePinCount: number;
 
     // APC queue (inline, no separate store)
     apcQueue: PendingApc[];
