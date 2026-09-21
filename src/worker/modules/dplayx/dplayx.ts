@@ -49,6 +49,20 @@ const IID_DPLAY_FAMILY = new Set([
     "0ab1c530-4745-11d1-a7a1-0000f803abfc", // IDirectPlay4
     "0ab1c531-4745-11d1-a7a1-0000f803abfc", // IDirectPlay4A
 ]);
+/**
+ * The IDirectPlayLobby/2/3 family, ANSI and Unicode, answered by the one lobby object for the
+ * same reason as IID_DPLAY_FAMILY: each version appends methods, so the Lobby3A vtable is a
+ * superset. A game that QIs for Lobby2A and gets E_NOINTERFACE calls through the NULL it was
+ * handed, because native dplayx never refuses.
+ */
+const IID_DPLAY_LOBBY_FAMILY = new Set([
+    "af465c71-9588-11cf-a020-00aa006157ac", // IDirectPlayLobby
+    "26c66a70-b367-11cf-a024-00aa006157ac", // IDirectPlayLobbyA
+    "0194c220-a303-11d0-9c4f-00a0c905425e", // IDirectPlayLobby2
+    "1bb4af80-a303-11d0-9c4f-00a0c905425e", // IDirectPlayLobby2A
+    "2db72490-652c-11d1-a7a8-0000f803abfc", // IDirectPlayLobby3
+    "2db72491-652c-11d1-a7a8-0000f803abfc", // IDirectPlayLobby3A
+]);
 const IID_DPLAY_LOBBY = "af461240-a3a1-11cf-8602-00a0245d918b";
 const IID_DPLAY = "279afa83-4981-11ce-a521-0020af0be560";
 const IID_DPLAY8_LOBBY_CLIENT = "819074a3-016c-11d3-ae14-006097b01411";
@@ -92,6 +106,10 @@ class DirectPlayObjectV1 extends BaseComObject {
 class DirectPlayLobbyObject extends BaseComObject {
     constructor(vtableAddress: number) {
         super(IID_DPLAY_LOBBY3A, vtableAddress); // IDirectPlayLobby3A IID
+    }
+
+    protected queryAdditionalInterfaces(riid: string): string | null {
+        return IID_DPLAY_LOBBY_FAMILY.has(riid.replace(/[{}]/g, "").toLowerCase()) ? riid : null;
     }
 
     protected destroy(): void {
