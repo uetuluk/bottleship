@@ -28,6 +28,7 @@ import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
 import { registerDbgCommands } from "./cmds/dbg";
 import { registerNetCommands } from "./cmds/net";
+import { registerDplayCommands } from "./cmds/dplay";
 
 let installed = false;
 
@@ -53,6 +54,7 @@ export function installHarnessCommands(): void {
     registerAudioCommands(harnessService);
     registerDbgCommands(harnessService);
     registerNetCommands(harnessService);
+    registerDplayCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.

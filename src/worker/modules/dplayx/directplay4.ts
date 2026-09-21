@@ -124,6 +124,9 @@ const CLEANUP = {
 
 /** Per-object DirectPlay state; lives on the COM object and dies with it. */
 export class DirectPlayInstance {
+    /** Every live object, for the harness. */
+    static readonly live = new Set<DirectPlayInstance>();
+
     readonly engine: DPlayEngine;
     connected = false;
     joining = false;
@@ -134,6 +137,7 @@ export class DirectPlayInstance {
         this.engine = new DPlayEngine(getNetStack(), getVirtualNic(), {
             onQueued: (to) => this.signal(to),
         });
+        DirectPlayInstance.live.add(this);
     }
 
     private signal(to: number): void {
@@ -349,6 +353,7 @@ export class DirectPlay4Api {
     }
 
     release(inst: DirectPlayInstance): void {
+        DirectPlayInstance.live.delete(inst);
         inst.events.clear();
         this.watchEvents(inst);
         inst.engine.shutdown();
