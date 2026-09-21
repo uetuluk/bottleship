@@ -31,7 +31,8 @@ import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
-import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint } from './dialog';
+import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint, getDefWindowProcAddress } from './dialog';
+import { predefinedControlClassName } from './dialog-template';
 import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
 import { resetControlInteractionState } from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
@@ -39,6 +40,7 @@ import { PAINT_TRACE_ENABLED, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
 import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton } from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
+import { msgStats } from '../../harness/msg-stats';
 import {
     postInitialActivationMessages,
     activateTopLevelWindow,
@@ -421,6 +423,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classInfo = getWindowClassByName(className);
         }
 
+        // A predefined control class (EDIT, BUTTON, …) the app didn't register itself is
+        // the system class: its window proc is our JS class proc, reached through the
+        // DefWindowProcA thunk exactly like dialog-template children.
+        const predefinedClass = classInfo ? null : predefinedControlClassName(className);
+        if (predefinedClass) {
+            classInfo = { lpfnWndProc: getDefWindowProcAddress(), className: predefinedClass };
+        }
+
         if (!classInfo && typeof className === 'string') {
             Logger.warn(LogCategory.USER32, `CreateWindowEx: class "${className}" not found, using dummy`);
             classInfo = { lpfnWndProc: 0 };
@@ -487,6 +497,12 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             extraBytes: classInfo?.cbWndExtra ? new Uint32Array(Math.ceil(classInfo.cbWndExtra / 4)) : undefined,
             nativeClassName: resolvedClassName,
         };
+        if (predefinedClass) {
+            windowInfo.isSystemControl = true;
+            windowInfo.systemControlClass = predefinedClass;
+            // A child window's hMenu is its control id.
+            if (isChildWindow) windowInfo.controlId = hMenu & 0xFFFF;
+        }
 
         windows.set(windowInfo.handle, windowInfo);
 
@@ -521,7 +537,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const cbtHooks = callbackManager ? getHooksOfType(WH_CBT) : [];
         const totalCbtHooks = cbtHooks.length;
 
-        if (!callbackManager || (!windowInfo.wndProc && totalCbtHooks === 0)) {
+        // The JS class proc of a system control has no WM_NCCREATE/WM_CREATE work, so
+        // without CBT hooks there is nothing to run in the guest.
+        const noGuestCreateWork = !windowInfo.wndProc || !!windowInfo.isSystemControl;
+        if (!callbackManager || (noGuestCreateWork && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
             return windowInfo.handle;
         }
@@ -1330,12 +1349,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         Logger.log(LogCategory.USER32,
             `CallWindowProcA(prev=0x${lpPrevWndFunc.toString(16)}, hwnd=0x${hWnd.toString(16)}, msg=0x${Msg.toString(16)})`);
+        if (msgStats.active) msgStats.note('callproc', hWnd, Msg);
 
-        // Sentinel WndProc: system control (Button/Static/Edit etc.) — handle in JS, don't call x86
-        if ((lpPrevWndFunc & 0xFFFF0000) === 0xFFFF0000) {
-            Logger.verbose(LogCategory.USER32,
-                `CallWindowProcA: sentinel WndProc 0x${lpPrevWndFunc.toString(16)}, returning 0`);
-            return { value: 0, stackCleanup: 5 * 4 };
+        // Sentinel WndProc = a system class proc (Button/Static/Edit …). A subclass proc
+        // forwards here for the class's default behavior (text entry, EM_*, WM_PAINT
+        // validation), so run the JS class proc rather than dropping the message.
+        if (isSentinelWndProc(lpPrevWndFunc)) {
+            const win = windows.get(hWnd);
+            if (!win?.isSystemControl) return { value: 0, stackCleanup: 5 * 4 };
+            const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
+            if (isContentChangingMessage(Msg)) {
+                repaintDialogAfterContentChange(win.parent ?? hWnd);
+            }
+            return { value: result >>> 0, stackCleanup: 5 * 4 };
         }
 
         const system = System.getInstance();
