@@ -47,7 +47,7 @@ import { writePixelFormat, writeSurfaceDesc } from "./structs";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { ComObjectFactory } from "../../core/com/base-com-object";
 
-import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
+import { convertRGBAToSurface, convertRGBAToPalettizedSurface, resolvePalette, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
 import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
@@ -992,7 +992,12 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 if (isRenderSurface(state) && state.mode === "GPU_ONLY") {
                     state.mode = "CPU";
                 }
-                if (isRenderSurface(state)) {
+                // A palettized surface is deliberately NOT seeded. Its write-back only
+            // touches pixels GDI actually drew (see convertRGBAToPalettizedSurface), so
+            // an untouched — transparent — canvas is exactly right, and seeding would
+            // cost a full surface→RGBA conversion on every GetDC. Games that overlay
+            // text call GetDC/ReleaseDC once per string, several times a frame.
+            if (isRenderSurface(state) && state.format.bpp !== 8) {
                     state.everLocked = true;
                 }
                 lockTracker.startLock(thisPtr, dwFlags, true, readbackTime);
@@ -1902,21 +1907,25 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return DD_OK;
         }
 
-        // Check if this is a texture, SYSMEM, or BACKBUFFER surface - use surface-sized canvas
+        // Only the PRIMARY draws through the window overlay; every other surface gets a
+        // DC over its own pixels. Selecting by an allowlist of TEXTURE/SYSMEM/BACKBUFFER
+        // instead sent the commonest kind — a plain OFFSCREENPLAIN surface — to the
+        // primary's overlay canvas, which exclusive-mode DDraw suppresses, so everything
+        // GDI drew there was invisible AND never reached the surface (AoE2 renders its
+        // whole menu text this way).
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
         const isTexture = obj ? (obj.getState().caps & DDSCAPS_TEXTURE) !== 0 : false;
-        const isSysMem = obj ? (obj.getState().caps & DDSCAPS_SYSTEMMEMORY) !== 0 : false;
-        const isBackBuffer = obj ? (obj.getState().caps & DDSCAPS_BACKBUFFER) !== 0 : false;
+        const isPrimarySurface = obj ? (obj.getState().caps & DDSCAPS_PRIMARYSURFACE) !== 0 : false;
 
         let hdc: number;
         let state: DirectDrawSurfaceState | undefined;
-        if ((isTexture || isSysMem || isBackBuffer) && obj) {
+        if (obj && !isPrimarySurface) {
             // For SYSMEM/TEXTURE/BACKBUFFER surfaces, create a DC with canvas matching surface size
             state = obj.getState();
             hdc = system.gdiContext.createSurfaceDC(state.width, state.height);
             if (!hdc) return E_FAIL;
 
-            const surfaceType = isTexture ? 'TEXTURE' : (isSysMem ? 'SYSMEM' : 'BACKBUFFER');
+            const surfaceType = isTexture ? 'TEXTURE' : 'OFFSCREEN';
             const getDCMsg = `IDirectDrawSurface7_GetDC: ${surfaceType} surface=0x${thisPtr.toString(16)} ${state.width}x${state.height} surfacePtr=0x${state.surfacePtr.toString(16)} -> hdc=0x${hdc.toString(16)} (surface-sized canvas)`;
             Logger.log(LogCategory.SYSTEM, getDCMsg);
             Logger.log(LogCategory.DDRAW, getDCMsg);
@@ -1928,7 +1937,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             // keeps the surface CPU-authoritative, so a later Lock/Blt/Flip never triggers a
             // blocking GPU→CPU readback. If the GPU holds the latest data, skip seeding and fall
             // back to the existing GPU-upload path (seeding from stale CPU would be wrong).
-            if (isSysMem && isRenderSurface(state)) {
+            if (isRenderSurface(state)) {
                 const expectedRgba = state.width * state.height * 4;
                 const scratch = state.rgbaScratch;
                 if (!surfaceSyncManager.needsCPUSync(state).needed) {
@@ -1936,7 +1945,13 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     const bpp = Math.max(1, Math.floor(state.format.bpp / 8));
                     const pitch = Math.max(state.pitch, state.width * bpp);
                     if (state.surfacePtr > 0 && state.surfacePtr + pitch * state.height <= mem.length) {
-                        const rgba = convertSurfaceToRGBA(mem, state.surfacePtr, state.width, state.height, pitch, state.format);
+                        // The palette is REQUIRED for an 8bpp surface: without it the
+                        // conversion yields opaque black, so the DC is seeded black and
+                        // everything written back under the glyphs comes out as a black box.
+                        const rgba = convertSurfaceToRGBA(
+                            mem, state.surfacePtr, state.width, state.height, pitch, state.format,
+                            undefined, undefined, resolvePalette(state),
+                        );
                         system.gdiContext.seedSurfaceDC(hdc, rgba, state.width, state.height);
                     }
                 } else if (scratch && scratch.length >= expectedRgba) {
@@ -2007,8 +2022,14 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                         // next draw via needsGPUSync). Faithful to real DDraw SYSMEM GetDC semantics.
                         const seeded = gdiContext.wasSurfaceSeeded(hdc);
 
+                        // A palettized surface must go back to CPU: the rest of the 8bpp
+                        // pipeline (Blt, and the presenter's PALETTE8 upload) reads the
+                        // surface's index bytes, so parking the GDI result in an RGBA GPU
+                        // texture would drop it entirely.
+                        const isPalettized = state.format.bpp === 8;
+
                         // OPTIMIZATION: Fast Path for GPU-backed surfaces using direct GPU-to-GPU copy
-                        if (state.gpuTexture && context.executor && !seeded) {
+                        if (state.gpuTexture && context.executor && !seeded && !isPalettized) {
                             profiler.start('ReleaseDC:fastGpuUpload');
 
                             const canvas = gdiContext.getCanvasForHDC(hdc);
@@ -2095,7 +2116,24 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                 const pitch = state.pitch || (width * Math.max(1, state.format.bpp / 8));
 
                                 profiler.start('ReleaseDC:convertRGBA');
-                                convertRGBAToSurface(fallbackImageData.data, mem, state.surfacePtr, width, height, pitch, state.format, { clearAlphaBit: true });
+                                if (isPalettized) {
+                                    // Index bytes, and only where GDI actually drew — see
+                                    // convertRGBAToPalettizedSurface.
+                                    const palette = resolvePalette(state);
+                                    if (palette) {
+                                        const n = convertRGBAToPalettizedSurface(
+                                            fallbackImageData.data, mem, state.surfacePtr,
+                                            width, height, pitch, palette, gdiContext.getDirtyRect(hdc) ?? undefined,
+                                        );
+                                        Logger.verbose(LogCategory.DDRAW,
+                                            `IDirectDrawSurface7_ReleaseDC: palettized write-back wrote ${n} px to 0x${state.surfacePtr.toString(16)}`);
+                                    } else {
+                                        Logger.warn(LogCategory.DDRAW,
+                                            `IDirectDrawSurface7_ReleaseDC: 8bpp surface 0x${thisPtr.toString(16)} has no palette — GDI output dropped`);
+                                    }
+                                } else {
+                                    convertRGBAToSurface(fallbackImageData.data, mem, state.surfacePtr, width, height, pitch, state.format, { clearAlphaBit: true });
+                                }
                                 profiler.end('ReleaseDC:convertRGBA');
                                 profiler.increment('ReleaseDC:convertRGBA', 'pixels', width * height);
 

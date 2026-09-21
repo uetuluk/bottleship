@@ -42,6 +42,16 @@ export class Imm32 implements IModule {
             return DEFAULT_HIMC;
         };
 
+        // HWND ImmGetDefaultIMEWnd(HWND hWnd)
+        // No IME is installed (ImmIsIME reports FALSE), so the thread owns no
+        // default IME window and NULL is the correct answer — apps use it to
+        // route WM_IME_* and skip IME handling when it is absent.
+        this.exports["ImmGetDefaultIMEWnd"] = (ctx, mem, args) => {
+            const hWnd = args[0] >>> 0;
+            Logger.verbose(LogCategory.SYSTEM, `imm32:ImmGetDefaultIMEWnd(hWnd=0x${hWnd.toString(16)}) -> NULL`);
+            return 0;
+        };
+
         // BOOL ImmReleaseContext(HWND hWnd, HIMC hIMC)
         this.exports["ImmReleaseContext"] = (ctx, mem, args) => {
             const hWnd = args[0] >>> 0;

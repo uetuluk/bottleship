@@ -428,6 +428,8 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("FindWindowW", 2),
         makeFunc("EnumChildWindows", 3),
         makeFunc("SetWindowRgn", 3),
+        makeFunc("SendMessageCallbackA", 6),
+        makeFunc("SendMessageCallbackW", 6),
         makeFunc("SendMessageTimeoutA", 7),
         makeFunc("SendMessageTimeoutW", 7),
         makeFunc("EnumDesktopWindows", 3),

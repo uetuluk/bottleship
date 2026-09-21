@@ -7,6 +7,11 @@
  *  - watchLog(pattern): the inverse of streaming — subscribe to SIGNAL (an error
  *    class, a specific unimplemented stub, a state value) → emit a `logMatch`
  *    event the agent can waitForEvent() on, ignoring the noise.
+ *  - logCapture(pattern): the BURST case watchLog can't serve. A watcher emits one
+ *    event per hit, so "every TextOut for two seconds" is still a firehose across
+ *    the worker→page hop, and that hop starves the message pump long enough to
+ *    blow the harness RPC budget. A capture instead accumulates matches in a
+ *    capped ring INSIDE the worker and hands them back in one small read.
  *  - aggregation: full-session counters (levelHist + unimplemented/unknown-args +
  *    bounded template top-N) maintained live — valuable because the in-memory ring
  *    is tiny (50). On-demand logStats() (cmds/logs.ts) covers the recent ring;
@@ -45,6 +50,23 @@ interface Watcher {
     hits: number;
 }
 
+interface CapturedLine {
+    timestamp: number;
+    category: string;
+    level: number;
+    message: string;
+}
+
+interface Capture {
+    id: number;
+    pattern: string;
+    regex: RegExp;
+    limit: number;
+    /** Total matches seen; `entries.length` stops at `limit` so a runaway pattern is bounded. */
+    hits: number;
+    entries: CapturedLine[];
+}
+
 const TEMPLATE_CAP = 1000;
 
 function normalizeTemplate(msg: string): string {
@@ -58,6 +80,7 @@ function normalizeTemplate(msg: string): string {
 
 class LogHub {
     private watchers: Watcher[] = [];
+    private captures: Capture[] = [];
     private nextId = 1;
     private tapInstalled = false;
     private aggregating = false;
@@ -71,7 +94,7 @@ class LogHub {
     private total = 0;
 
     private ensureTap(): void {
-        const needed = this.watchers.length > 0 || this.aggregating;
+        const needed = this.watchers.length > 0 || this.captures.length > 0 || this.aggregating;
         if (needed && !this.tapInstalled) {
             loggerTaps.addLogTap?.(this.tap);
             this.tapInstalled = true;
@@ -96,6 +119,20 @@ class LogHub {
                 if (w.once) this.unwatch(w.id);
             }
         }
+        if (this.captures.length) {
+            for (const c of this.captures) {
+                if (!c.regex.test(e.message)) continue;
+                c.hits++;
+                if (c.entries.length < c.limit) {
+                    c.entries.push({
+                        timestamp: e.timestamp,
+                        category: (LogCategory as any)[e.category] ?? String(e.category),
+                        level: e.level,
+                        message: e.message,
+                    });
+                }
+            }
+        }
         if (this.aggregating) {
             this.total++;
             const lvl = String(e.level);
@@ -115,6 +152,32 @@ class LogHub {
         this.watchers.push({ id, pattern, regex: new RegExp(pattern, "i"), runId: opts.runId ?? null, once: opts.once ?? false, hits: 0 });
         this.ensureTap();
         return id;
+    }
+
+    /** Arm a capped worker-side capture. Returns its id. */
+    capture(pattern: string, limit = 500): number {
+        const id = this.nextId++;
+        this.captures.push({ id, pattern, regex: new RegExp(pattern, "i"), limit: Math.max(1, limit | 0), hits: 0, entries: [] });
+        this.ensureTap();
+        return id;
+    }
+
+    /** Read a capture (all of them when `id` is omitted); `clear` drops what was read. */
+    captureRead(id?: number, clear = true): Array<{ id: number; pattern: string; hits: number; dropped: number; entries: CapturedLine[] }> {
+        const sel = id === undefined ? this.captures : this.captures.filter((c) => c.id === id);
+        return sel.map((c) => {
+            const out = { id: c.id, pattern: c.pattern, hits: c.hits, dropped: Math.max(0, c.hits - c.entries.length), entries: c.entries };
+            if (clear) { c.entries = []; c.hits = 0; }
+            return out;
+        });
+    }
+
+    /** Disarm a capture (all of them when `id` is omitted). */
+    captureStop(id?: number): number {
+        const before = this.captures.length;
+        this.captures = id === undefined ? [] : this.captures.filter((c) => c.id !== id);
+        this.ensureTap();
+        return before - this.captures.length;
     }
 
     unwatch(id: number): void {

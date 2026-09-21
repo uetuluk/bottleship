@@ -11,7 +11,7 @@ import { isSerializedFn } from "./types";
 /** DSL methods rendered by name; anything else falls back to .call('cmd', ...). */
 const NAMED_VERBS = new Set([
     "reload", "openWgb", "loadPe", "audioGesture", "streamLogs", "logs", "logStats", "markLog", "logsSince",
-    "watchLog", "logAgg", "logAggStats", "waitForEvent", "waitUntil",
+    "watchLog", "logCapture", "logCaptureRead", "logCaptureStop", "logAgg", "logAggStats", "waitForEvent", "waitUntil",
     "tickFrames", "watchFrames", "sleep", "click", "key", "type", "move", "drag", "wheel",
     "state", "shot", "captureFrame", "textures", "dumpTexture", "dumpSurface", "time",
     "perfProfile", "perfSpikes", "perfStats", "profilerStats",

@@ -875,9 +875,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             };
             return scanToVk[uCode] ?? 0;
         } else if (uMapType === 2) {
-            // Virtual key to unshifted character
+            // MAPVK_VK_TO_CHAR: the character ON THE KEY, i.e. UPPERCASE for letters —
+            // "unshifted" refers to the layout's shift state, not to letter case. Games
+            // build their own VK→char translation on this and range-check the result
+            // against 'A'..'Z'; returning lowercase makes every letter fail that check
+            // and silently drop out of text entry.
             if (uCode >= 0x30 && uCode <= 0x39) return uCode; // 0-9
-            if (uCode >= 0x41 && uCode <= 0x5A) return uCode + 32; // a-z (lowercase)
+            if (uCode >= 0x41 && uCode <= 0x5A) return uCode; // A-Z
             if (uCode === 0x20) return 0x20; // Space
             const oemChar: Record<number, number> = {
                 0xBA: 0x3B, 0xBB: 0x3D, 0xBC: 0x2C, 0xBD: 0x2D,

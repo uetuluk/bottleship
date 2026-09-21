@@ -61,6 +61,11 @@ export class HarnessChain {
     logLevel(category: string, level: string): this { return this.push("logLevel", [category, level]); }
     /** Grow the worker log ring (default 50 lines) so logsSince can cover a whole boot. */
     logRing(size: number): this { return this.push("logRing", [size]); }
+    /** Capture matching log lines in a capped worker-side ring (no page hop). Pair with logCaptureRead(). */
+    logCapture(pattern: string, limit?: number): this { return this.push("logCapture", [pattern, limit]); }
+    /** Drain worker-side log captures — the firehose-safe alternative to streamLogs()+logs(). */
+    logCaptureRead(id?: number, keep?: boolean): this { return this.push("logCaptureRead", [id, keep]); }
+    logCaptureStop(id?: number): this { return this.push("logCaptureStop", [id]); }
     markLog(label: string): this { return this.push("markLog", [label]); }
     logsSince(label: string, opts?: { filter?: string; count?: number }): this { return this.push("logsSince", [label, opts]); }
     watchLog(pattern: string, opts?: { once?: boolean }): this { return this.push("watchLog", [pattern, opts]); }

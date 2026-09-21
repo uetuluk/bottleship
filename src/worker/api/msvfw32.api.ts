@@ -1,7 +1,8 @@
 /**
  * Video for Windows (msvfw32.dll) API Descriptor
  *
- * Provides DrawDib functions used by games to render AVI frames to screen.
+ * DrawDib (render an AVI frame to a DC), the ICM compressor query, and the
+ * MCIWnd control games use to host a movie in a child window.
  */
 
 import { ModuleDescriptor, FunctionDescriptor, ParameterDescriptor } from "./types";
@@ -28,5 +29,11 @@ export const msvfw32Module: ModuleDescriptor = {
         makeFunc("DrawDibOpen", 0),              // → HDRAWDIB
         makeFunc("DrawDibClose", 1),             // hdd
         makeFunc("DrawDibDraw", 13),             // hdd, hdc, xDst, yDst, dxDst, dyDst, lpbi, lpBits, xSrc, ySrc, dxSrc, dySrc, wFlags
+
+        // ICM (Installable Compression Manager)
+        makeFunc("ICInfo", 3),                   // fccType, fccHandler, lpicinfo → BOOL
+
+        // MCIWnd control
+        makeFunc("MCIWndCreateA", 4),            // hwndParent, hInstance, dwStyle, szFile → HWND
     ]
 };

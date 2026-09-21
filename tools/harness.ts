@@ -80,6 +80,12 @@ let _journalSeq = 0;
 
 /** CLI-side step executor: ship the step list to the page and return its POJO,
  *  then write a re-runnable journal artifact. */
+/** Chain RPC deadline; override with BS_RPC_TIMEOUT_MS for a slow/loaded host. */
+function rpcTimeoutMs(): number {
+    const v = Number(process.env.BS_RPC_TIMEOUT_MS);
+    return Number.isFinite(v) && v > 0 ? v : 300_000;
+}
+
 async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
     const session = await ensureSession();
     const pageSteps = steps.filter((s) => s.cmd !== "reload");
@@ -113,7 +119,11 @@ async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
     const payload = JSON.stringify(JSON.stringify(pageSteps));
     const expr = `window.__BS__ && window.__BS__.harness ? window.__BS__.harness.__runSteps(JSON.parse(${payload})) : Promise.reject(new Error('harness facade not installed (open ?game=dev)'))`;
     // Generous timeout: chains can include long waits (tickFrames, waitForEvent).
-    const result = (await pageEval(session, expr, { timeoutMs: 300_000 })) as HarnessRunResult;
+    // BS_RPC_TIMEOUT_MS raises it — on a loaded host the guest runs far slower than
+    // wall-clock sleeps assume, and a chain that normally finishes in 30s can exceed
+    // the default. A timeout here is indistinguishable from a hung guest, so make it
+    // tunable rather than guessing at the default.
+    const result = (await pageEval(session, expr, { timeoutMs: rpcTimeoutMs() })) as HarnessRunResult;
     if (preflight.steps.length > 0) {
         result.steps = [...preflight.steps, ...result.steps];
         result.named = { ...preflight.named, ...result.named };
