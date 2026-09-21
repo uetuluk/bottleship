@@ -15,7 +15,7 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { getVirtualNic } from "../core/net/virtual-nic";
 import {
-    NetStack,
+    getNetStack,
     SOCK_DGRAM,
     SOCK_STREAM,
     WSAEAFNOSUPPORT,
@@ -50,13 +50,6 @@ const FIONBIO = 0x8004667e;
 
 /** One packet's worth of staging, reused so recv/send do not allocate per call. */
 const scratch = new Uint8Array(64 * 1024);
-
-let stack: NetStack | null = null;
-
-export function getNetStack(): NetStack {
-    if (!stack) stack = new NetStack(getVirtualNic());
-    return stack;
-}
 
 /** True when a provider is attached and has given us an address. */
 export function netLinkUp(): boolean {
@@ -452,7 +445,7 @@ export function netPump(): void {
 }
 
 export function netReset(): void {
-    if (stack) stack.reset();
+    getNetStack().reset();
     Logger.log(LogCategory.SYSTEM, "[net] socket state reset");
 }
 
