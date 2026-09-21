@@ -28,6 +28,7 @@ export const imm32Module: ModuleDescriptor = {
         makeFunc("ImmGetOpenStatus", 1),
         makeFunc("ImmSetOpenStatus", 2),
         makeFunc("ImmGetContext", 1),
+        makeFunc("ImmGetDefaultIMEWnd", 1),
         makeFunc("ImmReleaseContext", 2),
 
         makeFunc("ImmGetCompositionStringA", 4),

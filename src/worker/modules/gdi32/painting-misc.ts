@@ -6,6 +6,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { encodeAnsi } from '../codepage-utils';
+import { registerGuestFontFile } from "./font-registry";
 
 let nextMetafileHandle = 0x50000;
 
@@ -154,7 +155,17 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
             return 0;
         }
 
-        // Browser uses bundled web fonts; report one font added so callers proceed.
+        // Really install it: parse the file's own family name and add it to the font
+        // set, so a later CreateFontIndirect for that face matches the game's file
+        // instead of falling back. The FontFace load is async while GDI's call is
+        // not — a game that draws with the face in the same breath as installing it
+        // would see one frame of fallback; every one seen so far installs at startup.
+        void registerGuestFontFile(resolved, async (p) => {
+            const size = vfs.getFileSize(p);
+            if (size <= 0) return null;
+            const handle = vfs.openSync(p, 0x80000000, 3);
+            return handle ? await vfs.read(handle, size) : null;
+        });
         return 1;
     };
 

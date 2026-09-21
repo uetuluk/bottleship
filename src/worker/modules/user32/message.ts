@@ -1409,6 +1409,27 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
     exports['SendMessageTimeoutW'] = exports['SendMessageTimeoutA'];
 
+    // BOOL SendMessageCallbackA(HWND, UINT, WPARAM, LPARAM, SENDASYNCPROC, ULONG_PTR)
+    // Asynchronous send: the message is queued to the target's thread and the call
+    // returns TRUE immediately. Like the EnumWindows family we do not re-enter the
+    // guest SENDASYNCPROC — the observable effect on the TARGET (it receives the
+    // message through its own loop) is what the API is for; the result callback
+    // would need a second guest re-entry from inside a thunk.
+    exports['SendMessageCallbackA'] = (ctx, mem, args) => {
+        const hWnd = args[0];
+        const msg = args[1];
+        const wParam = args[2];
+        const lParam = args[3];
+        const lpResultCallBack = args[4];
+        Logger.verbose(
+            LogCategory.USER32,
+            `SendMessageCallbackA(hwnd=0x${hWnd.toString(16)}, msg=0x${msg.toString(16)}, cb=0x${lpResultCallBack.toString(16)})`,
+        );
+        System.getInstance().windowManager.postMessage(hWnd, msg, wParam, lParam);
+        return 1; // TRUE — message queued
+    };
+    exports['SendMessageCallbackW'] = exports['SendMessageCallbackA'];
+
     exports['SendNotifyMessageA'] = (ctx, mem, args) => {
         const hWnd = args[0];
         const msg = args[1];

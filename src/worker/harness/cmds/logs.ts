@@ -156,6 +156,29 @@ export function registerLogCommands(svc: HarnessService): void {
         const id = logHub.watch(pattern, { runId: ctx.runId, once: !!opts.once });
         return { armed: true, id, pattern };
     });
+    /**
+     * logCapture(pattern, limit?) — accumulate matching lines in a capped ring INSIDE
+     * the worker; logCaptureRead() returns them in one small payload. Use this, not
+     * streamLogs + logs(), whenever a category has to run at VERBOSE: streaming the
+     * firehose through the page starves the message pump and the harness RPC times
+     * out long before the answer arrives.
+     */
+    svc.register("logCapture", (args) => {
+        const pattern = String(args[0] ?? "");
+        if (!pattern) throw new HarnessError("logCapture expects a pattern", HarnessErrorCode.BAD_ARGS);
+        const limit = typeof args[1] === "number" ? (args[1] as number) : 500;
+        return { id: logHub.capture(pattern, limit), pattern, limit };
+    });
+    /** logCaptureRead(id?, keep?) — drain captures (all when id is omitted). */
+    svc.register("logCaptureRead", (args) => {
+        const id = typeof args[0] === "number" ? (args[0] as number) : undefined;
+        return logHub.captureRead(id, args[1] === undefined ? true : !args[1]);
+    });
+    /** logCaptureStop(id?) — disarm captures (all when id is omitted). */
+    svc.register("logCaptureStop", (args) => ({
+        stopped: logHub.captureStop(typeof args[0] === "number" ? (args[0] as number) : undefined),
+    }));
+
     svc.register("unwatchLog", (args) => { logHub.unwatch(Number(args[0]) | 0); return { ok: true }; });
     svc.register("clearLogWatches", () => ({ cleared: logHub.clearWatches() }));
     svc.register("logWatches", () => logHub.listWatches());

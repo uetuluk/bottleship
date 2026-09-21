@@ -39,6 +39,21 @@ interface DPlayMessage {
 const IID_DPLAY_LOBBY3A = "2db72491-652c-11d1-a7a8-0000f803abfc";
 const IID_DPLAY_LOBBY_COMPAT = "5959df62-2911-11d1-b049-0020af30269a";
 const IID_DPLAY4A = "0ab1c531-4745-11d1-a7a1-0000f803abfc";
+/**
+ * The IDirectPlay2/3/4 family, ANSI and Unicode. dplayx hands out ONE object for all
+ * of them: each version only APPENDS methods, so a v2 or v3 vtable is a prefix of the
+ * v4 vtable we build, and the A/W pair are layout-identical (they differ only in the
+ * encoding of a few strings). Games pick whichever IID their SDK header names —
+ * AoE2 asks for IID_IDirectPlay4 and treats "no such interface" as "DirectX too old".
+ */
+const IID_DPLAY_FAMILY = new Set([
+    "2b74f7c0-9154-11cf-a9cd-00aa006886e3", // IDirectPlay2
+    "9d460580-a822-11cf-960c-0080c7534e82", // IDirectPlay2A
+    "133efe40-32dc-11d0-9cfb-00a0c90a43cb", // IDirectPlay3
+    "133efe41-32dc-11d0-9cfb-00a0c90a43cb", // IDirectPlay3A
+    "0ab1c530-4745-11d1-a7a1-0000f803abfc", // IDirectPlay4
+    "0ab1c531-4745-11d1-a7a1-0000f803abfc", // IDirectPlay4A
+]);
 const IID_DPLAY_LOBBY = "af461240-a3a1-11cf-8602-00a0245d918b";
 const IID_DPLAY = "279afa83-4981-11ce-a521-0020af0be560";
 const IID_DPLAY8_LOBBY_CLIENT = "819074a3-016c-11d3-ae14-006097b01411";
@@ -60,6 +75,10 @@ const DPADDRESS_HEADER_SIZE = 20; // GUID(16) + DWORD(4)
 class DirectPlayObject extends BaseComObject {
     constructor(vtableAddress: number) {
         super(IID_DPLAY4A, vtableAddress); // IDirectPlay4A IID
+    }
+
+    protected queryAdditionalInterfaces(riid: string): string | null {
+        return IID_DPLAY_FAMILY.has(riid.replace(/[{}]/g, "").toLowerCase()) ? riid : null;
     }
 
     protected destroy(): void {
@@ -147,6 +166,28 @@ export class DPlayX implements IModule {
         const space = this.process?.addressSpace;
         if (!space) return true;
         return space.validateRange(address, size, perms);
+    }
+
+    /**
+     * Create a COM object of `iid` with `vtableAddr` AND give it guest-visible
+     * storage. A BaseComObject only gets a JS-side handle; until the object is
+     * allocated in guest memory and mapped, `getAddressForHandle` returns null and
+     * there is no `this` pointer to hand back — which is why every creation entry
+     * point must go through here.
+     */
+    private createComInGuest(mem: Uint8Array, iid: string, vtableName: string): number | null {
+        const vtableAddr = this.vtables[vtableName]?.address;
+        if (!vtableAddr) return null;
+        const obj = ComObjectFactory.create<BaseComObject>(iid, vtableAddr);
+        if (!obj) return null;
+        const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
+        SystemResourceProvider.getInstance().mapAddressToHandle(objAddr, obj.handle);
+        return objAddr;
+    }
+
+    /** IDirectPlay4A is the interface every caller QIs to, so create with that vtable. */
+    private createDirectPlayInGuest(mem: Uint8Array): number | null {
+        return this.createComInGuest(mem, IID_DPLAY4A, "IDirectPlay4A");
     }
 
     private readGuidBytes(mem: Uint8Array, ptr: number): Uint8Array | null {
@@ -520,23 +561,13 @@ export class DPlayX implements IModule {
         this.exports["IDirectPlayLobby3A_CreateCompoundAddress"] = createCompoundAddressImpl;
         this.exports["IDirectPlayLobbyCompatA_CreateCompoundAddress"] = createCompoundAddressImpl;
 
-        // Shared helper: allocate a DirectPlay4A COM object in guest memory and return its address
-        const createDirectPlayInGuest = (mem: Uint8Array): number | null => {
-            const vtableAddr = this.vtables["IDirectPlay4A"].address;
-            const dp = ComObjectFactory.create<DirectPlayObject>(IID_DPLAY4A, vtableAddr);
-            if (!dp) return null;
-            const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
-            SystemResourceProvider.getInstance().mapAddressToHandle(objAddr, dp.handle);
-            return objAddr;
-        };
-
         const connectImpl = (iface: string): ThunkImplementation => (ctx, mem, args) => {
             const dwFlags = args[1] >>> 0;
             const lplpDP = args[2];
             Logger.log(LogCategory.SYSTEM, `${iface}_Connect called: flags=0x${dwFlags.toString(16)}, lplpDP=0x${lplpDP.toString(16)}`);
 
             if (lplpDP && this.validateRange(lplpDP, 4, "rw")) {
-                const objAddr = createDirectPlayInGuest(mem);
+                const objAddr = this.createDirectPlayInGuest(mem);
                 if (objAddr !== null) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(lplpDP, objAddr >>> 0, true);
@@ -558,7 +589,7 @@ export class DPlayX implements IModule {
             Logger.log(LogCategory.SYSTEM, `${iface}_ConnectEx called: flags=0x${dwFlags.toString(16)}, riid=0x${riid.toString(16)}, lplpDP=0x${lplpDP.toString(16)}`);
 
             if (lplpDP && this.validateRange(lplpDP, 4, "rw")) {
-                const objAddr = createDirectPlayInGuest(mem);
+                const objAddr = this.createDirectPlayInGuest(mem);
                 if (objAddr !== null) {
                     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                     view.setUint32(lplpDP, objAddr >>> 0, true);
@@ -1175,12 +1206,10 @@ export class DPlayX implements IModule {
     }
 
     private registerDirectExports(): void {
-        const resourceProvider = SystemResourceProvider.getInstance();
-
         // DirectPlayCreate (ordinal 1)
-        // Creates an IDirectPlay object. HoMM3's CNetManager immediately QIs to IDirectPlay4A,
-        // so we create the object with IDirectPlay4A vtable directly — QI returns the same
-        // guest address, and the vtable must match the interface the game actually uses.
+        // Creates an IDirectPlay object. Callers immediately QI to IDirectPlay4A, so the
+        // object is created with that vtable directly — QI then returns the same guest
+        // address, and the vtable matches the interface the game actually uses.
         const directPlayCreateImpl: ThunkImplementation = (ctx, mem, args) => {
             const lpGUID = args[0];
             const lplpDP = args[1];
@@ -1194,15 +1223,9 @@ export class DPlayX implements IModule {
                 return E_POINTER;
             }
 
-            const dp = ComObjectFactory.create<DirectPlayObject>(IID_DPLAY4A, this.vtables["IDirectPlay4A"].address);
-            if (!dp) {
-                Logger.warn(LogCategory.SYSTEM, "DirectPlayCreate: failed to create COM object");
-                return E_FAIL;
-            }
-
-            const addr = resourceProvider.getAddressForHandle(dp.handle);
+            const addr = this.createDirectPlayInGuest(mem);
             if (addr === null) {
-                Logger.warn(LogCategory.SYSTEM, "DirectPlayCreate: failed to get guest address");
+                Logger.warn(LogCategory.SYSTEM, "DirectPlayCreate: failed to create COM object");
                 return E_FAIL;
             }
 
@@ -1251,15 +1274,9 @@ export class DPlayX implements IModule {
                 return E_POINTER;
             }
 
-            const lobby = ComObjectFactory.create<DirectPlayLobbyObject>(IID_DPLAY_LOBBY3A, this.vtables["IDirectPlayLobby3A"].address);
-            if (!lobby) {
-                Logger.warn(LogCategory.SYSTEM, "DirectPlayLobbyCreateA: failed to create COM object");
-                return E_FAIL;
-            }
-
-            const addr = resourceProvider.getAddressForHandle(lobby.handle);
+            const addr = this.createComInGuest(mem, IID_DPLAY_LOBBY3A, "IDirectPlayLobby3A");
             if (addr === null) {
-                Logger.warn(LogCategory.SYSTEM, "DirectPlayLobbyCreateA: failed to get guest address");
+                Logger.warn(LogCategory.SYSTEM, "DirectPlayLobbyCreateA: failed to create COM object");
                 return E_FAIL;
             }
 

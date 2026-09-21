@@ -1,8 +1,14 @@
 /**
- * Windows → bundled-font name mapping for GDI text rendering. Maps common
- * Windows face names games request to the metric-compatible Liberation fonts
- * we ship (WINDOWS_FONT_MAP).
+ * Windows face name → the family GDI text rendering actually draws with.
+ *
+ * A face the GUEST installed always wins: when a game ships its own TTFs and the
+ * installer put them in the Windows font directory, that file IS the face the
+ * game means, and substituting for it renders the UI in the wrong typeface.
+ * Only when no such face is registered do we fall back to the metric-compatible
+ * Liberation fonts we ship for the standard Windows set.
  */
+
+import { isFontFamilyRegistered } from "./font-registry";
 
 const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'arial':                'Liberation Sans',
@@ -19,9 +25,10 @@ const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'impact':               'Liberation Sans',
 };
 
-/** Map a requested Windows face name to a bundled font; unknown names pass through. */
+/** Map a requested Windows face name to a family the canvas can resolve. */
 export function resolveWindowsFontName(faceName: string): string {
     if (!faceName) return 'Liberation Sans';
+    if (isFontFamilyRegistered(faceName)) return faceName;
     const mapped = WINDOWS_FONT_MAP[faceName.toLowerCase()];
     return mapped ?? faceName;
 }

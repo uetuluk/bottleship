@@ -13,7 +13,7 @@
  * Usage:
  *   bun tools/cab-extract.ts <archive.exe|.cab> <out-dir> [--list] [--quiet]
  *
- * Supported compression: NONE + MSZIP. QUANTUM/LZX are rejected.
+ * Supported compression: NONE, MSZIP and LZX. QUANTUM is rejected.
  */
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { inflateRawSync } from "zlib";
@@ -41,7 +41,8 @@ console.log(
 );
 for (const f of info.folders) {
     const m = ["NONE", "MSZIP", "QUANTUM", "LZX"][f.typeCompress & 0x0f] ?? "?";
-    console.log(`  folder: ${f.cCFData} blocks, compress=${m}`);
+    const win = (f.typeCompress & 0x0f) === 3 ? ` window=2^${f.typeCompress >> 8}` : "";
+    console.log(`  folder: ${f.cCFData} blocks, compress=${m}${win}`);
 }
 
 if (list) {
@@ -58,6 +59,12 @@ const files = await extractCabToMap(buf, {
     inflateBlock,
     onProgress: (done, total, name) => {
         if (!quiet && done % 3 === 0) console.log(`  [${done}/${total}] ${name}`);
+    },
+    onFolderProgress: (done, total) => {
+        // One LZX folder can be hundreds of MB and decodes before any file appears.
+        if (!quiet && (done % (8 << 20) < 32768 || done === total)) {
+            console.log(`  decompressing folder: ${(done / 1048576).toFixed(0)}/${(total / 1048576).toFixed(0)} MB`);
+        }
     },
 }, info);
 

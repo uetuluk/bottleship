@@ -321,6 +321,10 @@ export class Scheduler {
      *  Returns true if a restore was applied (CPU state modified). */
     public onPollAsyncRestores: ((cpu: V86Cpu, source?: string) => boolean) | null = null;
     public onHasPendingAsyncRestores: (() => boolean) | null = null;
+    /** True when a thread is parked in the blocking GetMessage/WaitMessage slow path.
+     *  That park registers as ASYNC_THUNK (the thunk machinery owns the wait) even
+     *  though the thread is idling on the message queue — see shouldPumpIdleVirtualTime. */
+    public onHasMessageQueueWaiters: (() => boolean) | null = null;
     /** True when the thread owns a live suspended-thunk frame (a JS-driven pump like
      *  DialogBoxParamA). Lets the spin-loop safety net park such a thread WAITING between
      *  pump callbacks — the pump's next invokeCallback wakes it via
@@ -3436,7 +3440,15 @@ export class Scheduler {
         // activeCount>0 to break it, so the hang would be silent. Pump wall-clock virtual
         // time so the wheel fires at native cadence — faithful, since these pumps are
         // wall-clock-paced on real Windows.
-        if (anyNonAsyncWaiter && this.timerWheel.activeCount > 0) {
+        // A thread parked in the ASYNC GetMessage slow path is skipped by the loop
+        // above (its wait reason is ASYNC_THUNK, set by the thunk machinery) yet it is
+        // idling on the message queue exactly like WaitMessage: the only thing that can
+        // wake it is a message, and a WM_TIMER only arrives once the wheel comes due.
+        // A game whose whole main loop hangs off SetTimer — AoE2's menu is a 50ms tick —
+        // would otherwise freeze forever: virtual time stops, the timer never fires, and
+        // nothing ever posts the message the waiter is blocked on.
+        const messageQueueIdle = this.onHasMessageQueueWaiters?.() ?? false;
+        if ((anyNonAsyncWaiter || messageQueueIdle) && this.timerWheel.activeCount > 0) {
             needsIdlePump = true;
         }
         return needsIdlePump;

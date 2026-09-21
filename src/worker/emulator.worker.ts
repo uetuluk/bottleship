@@ -16,6 +16,7 @@ import { Ole32 } from "./modules/ole32";
 import { Oleaut32 } from "./modules/oleaut32";
 import { DDraw } from "./modules/ddraw";
 import { shouldSuppress3DGdiOverlay } from "./modules/ddraw/gdi-visibility";
+import { registerBundledFonts, registerGuestFonts } from "./modules/gdi32/font-registry";
 import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from "./modules/user32/dialog-overlay";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
@@ -1014,6 +1015,27 @@ const decodeWriteFileSpec = (spec: WgbWriteFileSpec): Uint8Array | null => {
   return null;
 };
 
+/** Register the bundled substitute fonts + every font installed in the guest. */
+const installFonts = async (): Promise<void> => {
+  try {
+    const vfs = System.getInstance().fileSystem;
+    await registerBundledFonts();
+    const count = await registerGuestFonts(
+      (dir) => vfs.listDirectory(dir).map((e) => ({ name: e.name, kind: e.kind })),
+      async (path) => {
+        const size = vfs.getFileSize(path);
+        if (size <= 0) return null;
+        const handle = vfs.openSync(path, 0x80000000, 3);
+        if (!handle) return null;
+        return await vfs.read(handle, size);
+      },
+    );
+    Logger.log(LogCategory.GDI32, `fonts: ${count} guest font file(s) installed`);
+  } catch (err) {
+    Logger.warn(LogCategory.GDI32, `fonts: installation failed: ${err}`);
+  }
+};
+
 // Apply the manifest's data-driven writeFiles list: per-game config overrides that
 // previously lived as hardcoded compatibility patches (e.g. Blade of Darkness forcing
 // its D3D raster via Blade.config/D3d.cfg — now declared in that bundle's manifest).
@@ -1666,6 +1688,12 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
 
     // Always resize host canvas from config (ddraw may not be loaded yet → updateDisplayFromConfig no-op)
     await applyManifestWriteFiles();
+
+    // Install the fonts GDI can match: our metric-compatible substitutes for the
+    // standard Windows set, plus whatever the guest has in its own font directory
+    // (a game shipping its own faces has them installed there). Before the guest
+    // runs, so the first CreateFontIndirect already sees them.
+    await installFonts();
 
     // Generic UE1 first-run: detect engine + pin D3D render device in Default.ini.
     // After writeFiles so a manifest-shipped Default.ini override is the one we pin.

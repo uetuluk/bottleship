@@ -1123,6 +1123,75 @@ export function convertSurfaceToRGBA(
  * 
  * @param surfacePtr Absolute guest address of the surface memory
  */
+/**
+ * Nearest palette entry for an RGB triple, memoised across a whole write-back.
+ * A 256-entry scan per pixel is only affordable because the palettized path
+ * writes glyph pixels, not whole frames — the cache makes runs of one colour free.
+ */
+function nearestPaletteIndex(palette: Uint32Array, r: number, g: number, b: number, cache: Map<number, number>): number {
+    const key = (r << 16) | (g << 8) | b;
+    const hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    let best = 0;
+    let bestDist = Infinity;
+    const n = Math.min(256, palette.length);
+    for (let i = 0; i < n; i++) {
+        const p = palette[i]!;
+        // Palette entries are packed 0xAABBGGRR (see DirectDrawPaletteObject).
+        const dr = r - (p & 0xff);
+        const dg = g - ((p >>> 8) & 0xff);
+        const db = b - ((p >>> 16) & 0xff);
+        const dist = dr * dr + dg * dg + db * db;
+        if (dist < bestDist) { bestDist = dist; best = i; if (dist === 0) break; }
+    }
+    cache.set(key, best);
+    return best;
+}
+
+/**
+ * Write an RGBA image back into an 8bpp PALETTIZED surface.
+ *
+ * On real hardware a DC over a 256-colour surface writes palette INDICES straight
+ * into the surface bytes. We rasterise GDI to an RGBA canvas instead, so the index
+ * has to be recovered by matching each colour against the surface's palette.
+ *
+ * Only pixels the rasteriser actually touched (alpha != 0) are written, which is
+ * what GDI does — it modifies the pixels it draws and no others. Writing the whole
+ * canvas would blank every pixel the DC did not cover.
+ */
+export function convertRGBAToPalettizedSurface(
+    rgbaData: Uint8ClampedArray,
+    mem: Uint8Array,
+    surfacePtr: number,
+    width: number,
+    height: number,
+    pitch: number,
+    palette: Uint32Array,
+    rect?: { x: number; y: number; width: number; height: number },
+): number {
+    const x0 = Math.max(0, rect ? rect.x : 0);
+    const y0 = Math.max(0, rect ? rect.y : 0);
+    const x1 = Math.min(width, rect ? rect.x + rect.width : width);
+    const y1 = Math.min(height, rect ? rect.y + rect.height : height);
+    if (x1 <= x0 || y1 <= y0) return 0;
+    if (surfacePtr <= 0 || surfacePtr + pitch * height > mem.length) return 0;
+    if (overlapsThunkCode(surfacePtr, pitch * height)) return 0;
+
+    const cache = new Map<number, number>();
+    let written = 0;
+    for (let y = y0; y < y1; y++) {
+        const dstRow = surfacePtr + y * pitch;
+        const srcRow = y * width;
+        for (let x = x0; x < x1; x++) {
+            const si = (srcRow + x) * 4;
+            if (rgbaData[si + 3] === 0) continue;
+            mem[dstRow + x] = nearestPaletteIndex(palette, rgbaData[si]!, rgbaData[si + 1]!, rgbaData[si + 2]!, cache);
+            written++;
+        }
+    }
+    return written;
+}
+
 export function convertRGBAToSurface(
     rgbaData: Uint8ClampedArray,
     mem: Uint8Array,
