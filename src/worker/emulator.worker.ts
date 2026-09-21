@@ -131,6 +131,7 @@ import { handleAudioBridgeMessage } from "./worker-handlers/audio-bridge";
 import { handleLoggingMessage } from "./worker-handlers/logging";
 import { handleDebugMonitorMessage } from "./worker-handlers/debug-monitor";
 import { handleRegistryMessage } from "./worker-handlers/registry";
+import { handleNetMessage } from "./worker-handlers/net";
 
 bootMark("worker-script-start");
 
@@ -3007,4 +3008,6 @@ self.onmessage = (event: MessageEvent) => {
   // Registry Tool (registry_get_state/get_log/clear/set_value) — worker-handlers/registry.ts
   // registry_clear also cancels the worker-owned debounced autosave via the context.
   if (handleRegistryMessage(message, { cancelRegistryAutosave })) return;
+
+  if (handleNetMessage(message)) return;
 };

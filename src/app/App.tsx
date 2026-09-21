@@ -13,6 +13,7 @@ import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile } from "../utils/log-client";
 import { installHarnessFacade } from "../harness/facade";
+import { installNetwork } from "../net/net-controller";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
@@ -795,6 +796,10 @@ export default function App() {
       // forwarder over harness_rpc + the normalized event bus; logic lives in the
       // worker HarnessService. Coexists with the legacy window.dbg Proxy below.
       installHarnessFacade(globalWorker);
+
+      // Multiplayer: `?net=<router url>` attaches a virtual NIC to the guest and exposes
+      // window.net. Without that parameter nothing is loaded and nothing changes.
+      installNetwork(globalWorker);
 
       // Guest debugger bridge: window.dbg.<cmd>(...args) -> worker {type:"dbg"} ->
       // handleDbgCommand() -> wasm dbg_* primitives. Output flows back via console.
