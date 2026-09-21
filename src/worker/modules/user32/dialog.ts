@@ -23,6 +23,8 @@ import { handleSystemControlMouseAtScreen, resetControlInteractionState } from '
 import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize } from './dialog-control-messages';
+import { isEditControl } from './edit-control';
+import { translateKeyMessage } from './keyboard-translate';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
 import {
@@ -163,7 +165,7 @@ const COLOR_DLGFACE = 0x00C8D0D4;
  */
 let cachedDefWindowProcAddr = 0;
 
-function getDefWindowProcAddress(): number {
+export function getDefWindowProcAddress(): number {
     if (cachedDefWindowProcAddr) return cachedDefWindowProcAddr;
     const system = System.getInstance();
     const dispatcher = system.process?.dispatcher as any;
@@ -424,12 +426,27 @@ function postDialogDefaultCommand(hDlg: number): void {
 }
 
 /**
+ * An edit control keeps the keys its WM_GETDLGCODE claims: arrows (DLGC_WANTARROWS)
+ * move its caret, and Enter in an ES_WANTRETURN multiline edit starts a new line.
+ */
+function focusedEditWantsKey(hDlg: number, vk: number): boolean {
+    const focus = System.getInstance().windowManager.getFocusHwnd();
+    const win = focus ? windows.get(focus) : undefined;
+    if (!win || !isEditControl(win) || !isDescendantOfDialog(focus, hDlg)) return false;
+    if (vk === VK_LEFT || vk === VK_UP || vk === VK_RIGHT || vk === VK_DOWN) return true;
+    const ES_MULTILINE = 0x0004;
+    const ES_WANTRETURN = 0x1000;
+    return vk === VK_RETURN && (win.style & (ES_MULTILINE | ES_WANTRETURN)) === (ES_MULTILINE | ES_WANTRETURN);
+}
+
+/**
  * Shared keyboard handling for the modal pump and IsDialogMessage
  * (Tab / arrows / Enter-via-DEFID / Esc). Returns true if consumed.
  */
 function handleDialogKeyMessage(hDlg: number, message: number, wParam: number): boolean {
     if (message !== WM_KEYDOWN) return false;
     const system = System.getInstance();
+    if (focusedEditWantsKey(hDlg, wParam)) return false;
 
     if (wParam === VK_TAB) {
         const shiftDown = (system.inputManager.getKeyState(VK_SHIFT) & 0x8000) !== 0;
@@ -1018,6 +1035,8 @@ function runModalDialog(
             setTimeout(pumpStep, 0);
             return;
         }
+        // DialogBox's loop runs TranslateMessage on what IsDialogMessage leaves.
+        translateKeyMessage(hwnd, message, wParam, lParam);
 
         // --- Modal dialog mouse re-routing ---
         // Real modal dialogs are active owned top-level windows. If an already queued
@@ -1941,6 +1960,6 @@ export function createDialogExports(): Record<string, ThunkImplementation> {
  * Kept for safety: any wndProc in 0xFFFF0000-0xFFFFFFFF is definitely not valid x86 code.
  */
 export function isSentinelWndProc(wndProc: number): boolean {
-    return (wndProc & 0xFFFF0000) === 0xFFFF0000;
+    return ((wndProc & 0xFFFF0000) >>> 0) === 0xFFFF0000;
 }
 

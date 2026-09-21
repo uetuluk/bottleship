@@ -4,6 +4,7 @@
  * and merge to a bounding box when the list grows too large.
  */
 import { windows, type WindowInfo } from './shared-state';
+import { System } from '../../core/system';
 
 export interface ClientRect {
     left: number;
@@ -114,6 +115,7 @@ export function validateWindow(hwnd: number, lpRect: ClientRect | null): void {
 
     if (!lpRect) {
         updates.delete(hwnd);
+        withdrawPaint(hwnd);
         return;
     }
 
@@ -131,7 +133,10 @@ export function validateWindow(hwnd: number, lpRect: ClientRect | null): void {
     }
 
     state.rects = mergeUpdateRects(remaining);
-    if (state.rects.length === 0) updates.delete(hwnd);
+    if (state.rects.length === 0) {
+        updates.delete(hwnd);
+        withdrawPaint(hwnd);
+    }
 }
 
 export function hasPendingUpdate(hwnd: number): boolean {
@@ -162,6 +167,16 @@ export function consumeNeedsErase(hwnd: number): boolean {
 /** BeginPaint validates (clears) the update region. */
 export function clearWindowUpdate(hwnd: number): void {
     updates.delete(hwnd);
+    withdrawPaint(hwnd);
+}
+
+/**
+ * A validated window has nothing to paint: Win32 WM_PAINT exists only while the update
+ * region is non-empty, so a queued paint must not outlive validation (a loop that
+ * peeks PM_NOREMOVE and dispatches would otherwise replay it forever).
+ */
+function withdrawPaint(hwnd: number): void {
+    System.getInstance().windowManager?.clearPaintMessage(hwnd);
 }
 
 export function removeWindowUpdate(hwnd: number): void {

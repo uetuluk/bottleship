@@ -111,6 +111,7 @@ export function purgeControlState(hwnd: number): void {
     const h = hwnd >>> 0;
     buttonCheckStates.delete(h);
     listControlStates.delete(h);
+    editControlStates.delete(h);
     trackbarStates.delete(h);
     controlImageHandles.delete(h);
 }
@@ -323,6 +324,27 @@ export function getOrCreateListState(hwnd: number): ListControlState {
     return state;
 }
 
+// Edit control caret/selection state per control HWND (the text itself is WindowInfo.title)
+export interface EditControlState {
+    /** Selection anchor and caret (char indices); the selection spans [min, max). */
+    anchor: number;
+    caret: number;
+    /** Max characters the user may enter (EM_LIMITTEXT). */
+    limit: number;
+    modified: boolean;
+    passwordChar: number;
+}
+export const editControlStates: Map<number, EditControlState> = new Map();
+
+export function getOrCreateEditState(hwnd: number, passwordChar: number): EditControlState {
+    let state = editControlStates.get(hwnd);
+    if (!state) {
+        state = { anchor: 0, caret: 0, limit: 0x7FFF, modified: false, passwordChar };
+        editControlStates.set(hwnd, state);
+    }
+    return state;
+}
+
 // Trackbar (msctls_trackbar32) state per control HWND
 export interface TrackbarState {
     min: number;
@@ -402,6 +424,7 @@ export function resetUser32SharedState(): void {
     capturedHwnd = 0;
     buttonCheckStates.clear();
     listControlStates.clear();
+    editControlStates.clear();
     trackbarStates.clear();
     controlImageHandles.clear();
     clipboardDataByFormat.clear();

@@ -16,6 +16,7 @@ import { encodeAnsi, getCodePageDecoder, decodeAnsiString, writeAnsiToGuest, enc
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
+import { vkToChar } from '../../runtime/input/us-keyboard-layout';
 import {
     clipboardDataByFormat,
     isClipboardOpen,
@@ -910,46 +911,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
         if (!lpChar) return 0;
 
-        // Check shift state from keyboard state array
         const shiftDown = lpKeyState ? (mem[lpKeyState + 0x10] & 0x80) !== 0 : false;
+        const ctrlDown = lpKeyState ? (mem[lpKeyState + 0x11] & 0x80) !== 0 : false;
         const capsLock = lpKeyState ? (mem[lpKeyState + 0x14] & 0x01) !== 0 : false;
-
-        let ch = 0;
-        // Letters
-        if (uVirtKey >= 0x41 && uVirtKey <= 0x5A) {
-            const upper = shiftDown !== capsLock; // XOR
-            ch = upper ? uVirtKey : uVirtKey + 32;
-        }
-        // Digits 0-9
-        else if (uVirtKey >= 0x30 && uVirtKey <= 0x39) {
-            if (shiftDown) {
-                const shifted = ')!@#$%^&*(';
-                ch = shifted.charCodeAt(uVirtKey - 0x30);
-            } else {
-                ch = uVirtKey;
-            }
-        }
-        // Space, Enter, Tab, Escape
-        else if (uVirtKey === 0x20) ch = 0x20;
-        else if (uVirtKey === 0x0D) ch = 0x0D;
-        else if (uVirtKey === 0x09) ch = 0x09;
-        else if (uVirtKey === 0x1B) ch = 0x1B;
-        else if (uVirtKey === 0x08) ch = 0x08;
-        // OEM keys (US layout)
-        else {
-            const oemUnshifted: Record<number, number> = {
-                0xBA: 0x3B, 0xBB: 0x3D, 0xBC: 0x2C, 0xBD: 0x2D,
-                0xBE: 0x2E, 0xBF: 0x2F, 0xC0: 0x60,
-                0xDB: 0x5B, 0xDC: 0x5C, 0xDD: 0x5D, 0xDE: 0x27,
-            };
-            const oemShifted: Record<number, number> = {
-                0xBA: 0x3A, 0xBB: 0x2B, 0xBC: 0x3C, 0xBD: 0x5F,
-                0xBE: 0x3E, 0xBF: 0x3F, 0xC0: 0x7E,
-                0xDB: 0x7B, 0xDC: 0x7C, 0xDD: 0x7D, 0xDE: 0x22,
-            };
-            ch = shiftDown ? (oemShifted[uVirtKey] ?? 0) : (oemUnshifted[uVirtKey] ?? 0);
-        }
-
+        const ch = vkToChar(uVirtKey, shiftDown, capsLock, ctrlDown);
         if (ch === 0) return 0;
 
         mem[lpChar] = ch & 0xFF;

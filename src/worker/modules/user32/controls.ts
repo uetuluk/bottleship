@@ -7,7 +7,7 @@
  */
 
 import { System } from '../../core/system';
-import { windows, buttonCheckStates, listControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition } from './shared-state';
+import { windows, buttonCheckStates, listControlStates, editControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition } from './shared-state';
 import type { GDIContext } from '../gdi32/context';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
@@ -72,6 +72,8 @@ const COLOR_WINDOW = '#FFFFFF';
 const COLOR_WINDOWTEXT = '#000000';
 const COLOR_BTNTEXT = '#000000';
 const COLOR_GRAYTEXT = '#808080';
+const COLOR_HIGHLIGHT = '#0A246A';
+const COLOR_HIGHLIGHTTEXT = '#FFFFFF';
 
 // Font used for control labels
 const CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
@@ -776,10 +778,17 @@ function paintEdit(
     ctx.fillRect(x, y, w, h);
     drawSunkenEdge(ctx, x, y, w, h);
 
-    const text = child.title || '';
-    if (!text) return;
+    const ES_MULTILINE = 0x0004;
+    const ES_PASSWORD = 0x0020;
+    const edit = editControlStates.get(child.handle);
+    let text = child.title || '';
+    if ((child.style & ES_PASSWORD) !== 0 && text) {
+        text = String.fromCharCode(edit?.passwordChar || 0x2A).repeat(text.length);
+    }
+    const focused = System.getInstance().windowManager.getFocusHwnd() === child.handle;
+    const multiline = (child.style & ES_MULTILINE) !== 0;
+    if (!text && !focused) return;
 
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
     ctx.font = getWindowFont(child);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
@@ -787,8 +796,34 @@ function paintEdit(
     ctx.beginPath();
     ctx.rect(x + 2, y + 2, Math.max(1, w - 4), Math.max(1, h - 4));
     ctx.clip();
-    const ES_MULTILINE = 0x0004;
-    if ((child.style & ES_MULTILINE) !== 0) {
+    if (focused && !multiline) {
+        // Single-line selection highlight + caret, scrolled so the caret stays visible.
+        const caret = Math.min(edit?.caret ?? text.length, text.length);
+        const anchor = Math.min(edit?.anchor ?? caret, text.length);
+        const caretPx = ctx.measureText(text.slice(0, caret)).width;
+        const scroll = Math.max(0, caretPx - (w - 10));
+        const tx = x + 4 - scroll;
+        const [s0, s1] = anchor <= caret ? [anchor, caret] : [caret, anchor];
+        if (s1 > s0) {
+            const sx = tx + ctx.measureText(text.slice(0, s0)).width;
+            ctx.fillStyle = COLOR_HIGHLIGHT;
+            ctx.fillRect(sx, y + 3, ctx.measureText(text.slice(s0, s1)).width, h - 6);
+        }
+        ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+        ctx.fillText(text, tx, y + h / 2);
+        if (s1 > s0) {
+            ctx.fillStyle = COLOR_HIGHLIGHTTEXT;
+            ctx.fillText(text.slice(s0, s1), tx + ctx.measureText(text.slice(0, s0)).width, y + h / 2);
+        } else {
+            ctx.fillStyle = COLOR_WINDOWTEXT;
+            ctx.fillRect(Math.round(tx + caretPx), y + 3, 1, h - 6);
+        }
+        ctx.restore();
+        ctx.textBaseline = 'top';
+        return;
+    }
+    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
+    if (multiline) {
         ctx.textBaseline = 'top';
         const lineHeight = 14;
         const lines = text.split(/\r\n|\n|\r/g);
