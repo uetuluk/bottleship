@@ -10,6 +10,8 @@ import { SystemResourceProvider } from "../../core/resources/system-resource-pro
 import { allocateComObject } from "../../core/com/com-memory";
 import { readString } from "../../api/codegen";
 import { System } from "../../core/system";
+import { Mem } from "../../core/memory/mem-accessor";
+import { DirectPlay4Api, DirectPlayInstance, DPAID_SERVICEPROVIDER, DPAID_TOTALSIZE } from "./directplay4";
 
 // COM error codes
 const DP_OK = 0x00000000;
@@ -23,13 +25,6 @@ const DPERR_NOMESSAGES = 0x887700BE;
 const DPERR_INVALIDOBJECT = 0x88770082;
 const DPERR_UNINITIALIZED = 0x88770140;
 const E_FAIL = 0x80004005;
-
-// DirectPlay constants
-const DPID_ALLPLAYERS = 0;
-const DPRECEIVE_ALL = 0x00000001;
-const DPRECEIVE_TOPLAYER = 0x00000002;
-const DPRECEIVE_FROMPLAYER = 0x00000004;
-const DPRECEIVE_PEEK = 0x00000008;
 
 interface DPlayMessage {
     idFrom: number;
@@ -59,20 +54,14 @@ const IID_DPLAY = "279afa83-4981-11ce-a521-0020af0be560";
 const IID_DPLAY8_LOBBY_CLIENT = "819074a3-016c-11d3-ae14-006097b01411";
 
 const GUID_SIZE = 16;
-const DPAID_SERVICE_PROVIDER_GUID = new Uint8Array([
-    0xc0, 0x16, 0xd9, 0x07, 0xaf, 0xe0, 0xcf, 0x11, 0x9c, 0x4e, 0x00, 0xa0, 0xc9, 0x05, 0x42, 0x5e
-]);
-// {1318F560-912C-11d0-9DAA-00A0C90A43CB}
-const DPAID_TOTAL_SIZE = new Uint8Array([
-    0x60, 0xf5, 0x18, 0x13, 0x2c, 0x91, 0xd0, 0x11, 0x9d, 0xaa, 0x00, 0xa0, 0xc9, 0x0a, 0x43, 0xcb
-]);
 const DPCOMPOUNDADDRESSELEMENT_SIZE = 24; // GUID(16) + DWORD(4) + LPVOID(4)
 const DPADDRESS_HEADER_SIZE = 20; // GUID(16) + DWORD(4)
 
-/**
- * DirectPlay COM object implementation (minimal stub).
- */
+/** The IDirectPlay2/3/4 object; its session state lives and dies with it. */
 class DirectPlayObject extends BaseComObject {
+    session: DirectPlayInstance | null = null;
+    onRelease: ((session: DirectPlayInstance) => void) | null = null;
+
     constructor(vtableAddress: number) {
         super(IID_DPLAY4A, vtableAddress); // IDirectPlay4A IID
     }
@@ -82,6 +71,8 @@ class DirectPlayObject extends BaseComObject {
     }
 
     protected destroy(): void {
+        if (this.session) this.onRelease?.(this.session);
+        this.session = null;
         Logger.verbose(LogCategory.COM, "DirectPlayObject destroyed");
     }
 }
@@ -151,9 +142,20 @@ export class DPlayX implements IModule {
     private messageQueue: DPlayMessage[] = [];
     private localPlayerId: number = 0;
     private nextGroupId: number = 0x10001;
-    private sessionOpen: boolean = false;
     private directPlayV1Initialized: boolean = false;
     private directPlayV1Open: boolean = false;
+    private dp4!: DirectPlay4Api;
+
+    /** Session state for an IDirectPlay2+ `this`, created on first use. */
+    private directPlayInstance(thisPtr: number): DirectPlayInstance | null {
+        const obj = SystemResourceProvider.getInstance().getComObjectByAddress(thisPtr >>> 0);
+        if (!(obj instanceof DirectPlayObject)) return null;
+        if (!obj.session) {
+            obj.session = new DirectPlayInstance();
+            obj.onRelease = (session) => this.dp4.release(session);
+        }
+        return obj.session;
+    }
 
     private validateRange(address: number, size: number, perms: "r" | "rw" | "rx"): boolean {
         if (!Number.isFinite(address) || !Number.isFinite(size)) return false;
@@ -215,6 +217,13 @@ export class DPlayX implements IModule {
         ComObjectFactory.register(IID_DPLAY_LOBBY, DirectPlayLobbyObjectV1);
         ComObjectFactory.register(IID_DPLAY, DirectPlayObjectV1);
         ComObjectFactory.register(IID_DPLAY8_LOBBY_CLIENT, DirectPlay8LobbyObject);
+
+        this.dp4 = new DirectPlay4Api({
+            process,
+            memory: () => this.getMemory(),
+            validateRange: (address, size, perms) => this.validateRange(address, size, perms),
+            instance: (thisPtr) => this.directPlayInstance(thisPtr),
+        });
 
         this.registerIUnknown();
         this.registerMethodStubs();
@@ -381,9 +390,9 @@ export class DPlayX implements IModule {
 
         const createAddressLobby3Impl: ThunkImplementation = (ctx, mem, args) => {
 
-            // CreateAddress builds a 2-element compound address:
-            //   1) DPAID_ServiceProvider -> GUID service provider
-            //   2) guidDataType          -> caller-provided data blob
+            // CreateAddress is CreateCompoundAddress over two elements, so the result carries
+            // the leading DPAID_TotalSize chunk every DirectPlay address starts with:
+            //   DPAID_TotalSize -> DWORD, DPAID_ServiceProvider -> GUID, guidDataType -> data
             const thisPtr = args[0];
             const lpGuidSP = args[1];
             const lpGuidDataType = args[2];
@@ -416,9 +425,10 @@ export class DPlayX implements IModule {
             }
 
             const requestedSize = view.getUint32(lpdwAddressSize, true);
-            const spElementSize = GUID_SIZE + 4 + GUID_SIZE;
-            const dataElementSize = GUID_SIZE + 4 + dwDataSize;
-            const requiredSize = spElementSize + dataElementSize;
+            const totalSizeElementSize = DPADDRESS_HEADER_SIZE + 4;
+            const spElementSize = DPADDRESS_HEADER_SIZE + GUID_SIZE;
+            const dataElementSize = DPADDRESS_HEADER_SIZE + dwDataSize;
+            const requiredSize = totalSizeElementSize + spElementSize + dataElementSize;
 
             // Always report required size to caller.
             view.setUint32(lpdwAddressSize, requiredSize, true);
@@ -433,15 +443,20 @@ export class DPlayX implements IModule {
 
             let out = lpAddress;
 
-            // Element 1: DPAID_ServiceProvider -> GUID service provider value.
-            mem.set(DPAID_SERVICE_PROVIDER_GUID, out);
+            mem.set(DPAID_TOTALSIZE, out);
+            out += GUID_SIZE;
+            view.setUint32(out, 4, true);
+            out += 4;
+            view.setUint32(out, requiredSize, true);
+            out += 4;
+
+            mem.set(DPAID_SERVICEPROVIDER, out);
             out += GUID_SIZE;
             view.setUint32(out, GUID_SIZE, true);
             out += 4;
             mem.set(guidSpBytes, out);
             out += GUID_SIZE;
 
-            // Element 2: caller-guided data element.
             mem.set(guidDataTypeBytes, out);
             out += GUID_SIZE;
             view.setUint32(out, dwDataSize, true);
@@ -528,7 +543,7 @@ export class DPlayX implements IModule {
             let out = lpAddress;
 
             // TotalSize chunk: DPAID_TotalSize GUID + dwDataSize=4 + DWORD totalSize
-            mem.set(DPAID_TOTAL_SIZE, out);
+            mem.set(DPAID_TOTALSIZE, out);
             out += GUID_SIZE;
             view.setUint32(out, 4, true); // dwDataSize for the size value
             out += 4;
@@ -749,249 +764,7 @@ export class DPlayX implements IModule {
             return DP_OK;
         };
 
-        this.exports["IDirectPlay4A_Open"] = (ctx, mem, args) => {
-            const lpSessionDesc = args[1];
-            const dwFlags = args[2];
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_Open called: lpSessionDesc=0x${lpSessionDesc.toString(16)}, dwFlags=0x${dwFlags.toString(16)}`);
-            this.sessionOpen = true;
-            return DP_OK;
-        };
-
-        this.exports["IDirectPlay4A_CreatePlayer"] = (ctx, mem, args) => {
-            const lpidPlayer = args[1];
-            const lpPlayerName = args[2];
-            const hEvent = args[3];
-            const lpData = args[4];
-            const dwDataSize = args[5];
-            const dwFlags = args[6];
-
-            const syntheticPlayerId = 0xDEAFBEEF; // Synthetic Player ID
-
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_CreatePlayer called: lpidPlayer=0x${lpidPlayer.toString(16)}, namePtr=0x${lpPlayerName.toString(16)}, id=0x${syntheticPlayerId.toString(16)}`);
-
-            if (lpidPlayer && this.validateRange(lpidPlayer, 4, "rw")) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(lpidPlayer, syntheticPlayerId, true);
-            }
-
-            this.localPlayerId = syntheticPlayerId;
-            return DP_OK;
-        };
-
-        // CreateGroup: allocate a synthetic group DPID
-        this.exports["IDirectPlay4A_CreateGroup"] = (ctx, mem, args) => {
-            const lpidGroup = args[1] >>> 0;
-            const lpGroupName = args[2] >>> 0;
-            const lpData = args[3] >>> 0;
-            const dwDataSize = args[4] >>> 0;
-            const dwFlags = args[5] >>> 0;
-
-            const groupId = this.nextGroupId++;
-
-            if (lpidGroup && this.validateRange(lpidGroup, 4, "rw")) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(lpidGroup, groupId, true);
-            }
-
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_CreateGroup: groupId=0x${groupId.toString(16)}, flags=0x${dwFlags.toString(16)} → DP_OK`);
-            return DP_OK;
-        };
-
-        // --- Real implementations for loopback message queue ---
-
-        this.exports["IDirectPlay4A_Send"] = (ctx, mem, args) => {
-            const idFrom = args[1] >>> 0;
-            const idTo = args[2] >>> 0;
-            const dwFlags = args[3] >>> 0;
-            const lpData = args[4] >>> 0;
-            const dwDataSize = args[5] >>> 0;
-
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_Send: from=0x${idFrom.toString(16)}, to=0x${idTo.toString(16)}, flags=0x${dwFlags.toString(16)}, size=${dwDataSize}`);
-
-            if (dwDataSize > 0 && !this.validateRange(lpData, dwDataSize, "r")) {
-                Logger.warn(LogCategory.SYSTEM, "IDirectPlay4A_Send: invalid data pointer");
-                return E_INVALIDARG;
-            }
-
-            const data = dwDataSize > 0 ? mem.slice(lpData, lpData + dwDataSize) : new Uint8Array(0);
-            const targetId = idTo === DPID_ALLPLAYERS ? this.localPlayerId : idTo;
-
-            this.messageQueue.push({ idFrom, idTo: targetId, data });
-            return DP_OK;
-        };
-
-        this.exports["IDirectPlay4A_Receive"] = (ctx, mem, args) => {
-            const lpidFrom = args[1] >>> 0;
-            const lpidTo = args[2] >>> 0;
-            const dwFlags = args[3] >>> 0;
-            const lpData = args[4] >>> 0;
-            const lpdwDataSize = args[5] >>> 0;
-
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-            // Read filter IDs from guest pointers
-            const filterFrom = (dwFlags & DPRECEIVE_FROMPLAYER) && lpidFrom ? view.getUint32(lpidFrom, true) : 0;
-            const filterTo = (dwFlags & DPRECEIVE_TOPLAYER) && lpidTo ? view.getUint32(lpidTo, true) : 0;
-
-            // Find matching message (FIFO)
-            let matchIdx = -1;
-            for (let i = 0; i < this.messageQueue.length; i++) {
-                const msg = this.messageQueue[i];
-                if ((dwFlags & DPRECEIVE_FROMPLAYER) && msg.idFrom !== filterFrom) continue;
-                if ((dwFlags & DPRECEIVE_TOPLAYER) && msg.idTo !== filterTo) continue;
-                matchIdx = i;
-                break;
-            }
-
-            if (matchIdx === -1) {
-                return DPERR_NOMESSAGES;
-            }
-
-            const msg = this.messageQueue[matchIdx];
-
-            // Check buffer capacity
-            if (!this.validateRange(lpdwDataSize, 4, "rw")) {
-                return E_POINTER;
-            }
-            const capacity = view.getUint32(lpdwDataSize, true);
-
-            if (lpData === 0 || capacity < msg.data.length) {
-                view.setUint32(lpdwDataSize, msg.data.length, true);
-                return DPERR_BUFFERTOOSMALL;
-            }
-
-            if (!this.validateRange(lpData, msg.data.length, "rw")) {
-                return E_POINTER;
-            }
-
-            // Copy message data to guest memory
-            mem.set(msg.data, lpData);
-            view.setUint32(lpdwDataSize, msg.data.length, true);
-
-            // Write back idFrom/idTo
-            if (lpidFrom && this.validateRange(lpidFrom, 4, "rw")) {
-                view.setUint32(lpidFrom, msg.idFrom, true);
-            }
-            if (lpidTo && this.validateRange(lpidTo, 4, "rw")) {
-                view.setUint32(lpidTo, msg.idTo, true);
-            }
-
-            // Remove from queue unless peeking
-            if (!(dwFlags & DPRECEIVE_PEEK)) {
-                this.messageQueue.splice(matchIdx, 1);
-            }
-
-            Logger.verbose(LogCategory.SYSTEM, `IDirectPlay4A_Receive: delivered msg from=0x${msg.idFrom.toString(16)}, to=0x${msg.idTo.toString(16)}, size=${msg.data.length}`);
-            return DP_OK;
-        };
-
-        this.exports["IDirectPlay4A_GetMessageCount"] = (ctx, mem, args) => {
-            const idPlayer = args[1] >>> 0;
-            const lpdwCount = args[2] >>> 0;
-
-            if (!lpdwCount || !this.validateRange(lpdwCount, 4, "rw")) {
-                return E_POINTER;
-            }
-
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            let count: number;
-            if (idPlayer === 0) {
-                count = this.messageQueue.length;
-            } else {
-                count = 0;
-                for (const msg of this.messageQueue) {
-                    if (msg.idTo === idPlayer) count++;
-                }
-            }
-
-            view.setUint32(lpdwCount, count, true);
-            Logger.verbose(LogCategory.SYSTEM, `IDirectPlay4A_GetMessageCount: player=0x${idPlayer.toString(16)}, count=${count}`);
-            return DP_OK;
-        };
-
-        this.exports["IDirectPlay4A_GetCaps"] = (ctx, mem, args) => {
-            const lpDPCaps = args[1] >>> 0;
-            const dwFlags = args[2] >>> 0;
-
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_GetCaps called: lpDPCaps=0x${lpDPCaps.toString(16)}, flags=0x${dwFlags.toString(16)}`);
-
-            if (!lpDPCaps || !this.validateRange(lpDPCaps, 4, "r")) {
-                return E_INVALIDARG;
-            }
-
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const dwSize = view.getUint32(lpDPCaps, true);
-
-            if (dwSize < 4 || !this.validateRange(lpDPCaps, dwSize, "rw")) {
-                return E_INVALIDARG;
-            }
-
-            // Zero the struct, then fill known fields
-            for (let i = 4; i < dwSize; i++) {
-                mem[lpDPCaps + i] = 0;
-            }
-
-            // DPCAPS: dwSize(4), dwFlags(4), dwMaxBufferSize(4), dwMaxQueueSize(4),
-            //         dwMaxPlayers(4), dwHundredBaud(4), dwLatency(4), dwMaxLocalPlayers(4), ...
-            if (dwSize >= 8) view.setUint32(lpDPCaps + 4, 0x02, true);      // dwFlags = DPCAPS_ISHOST
-            if (dwSize >= 12) view.setUint32(lpDPCaps + 8, 0x10000, true); // dwMaxBufferSize (64KB)
-            if (dwSize >= 20) view.setUint32(lpDPCaps + 16, 1, true);      // dwMaxPlayers
-            if (dwSize >= 32) view.setUint32(lpDPCaps + 28, 1, true);      // dwMaxLocalPlayers
-
-            return DP_OK;
-        };
-
-        // EnumSessions: for single-player, the game creates its own session
-        // via Open(DPOPEN_CREATE). Just return DP_OK ("no sessions found").
-        this.exports["IDirectPlay4A_EnumSessions"] = (ctx, mem, args) => {
-            const lpsd = args[1] >>> 0;
-            const dwFlags = args[5] >>> 0;
-
-            Logger.log(LogCategory.SYSTEM,
-                `IDirectPlay4A_EnumSessions: lpsd=0x${lpsd.toString(16)}, flags=0x${dwFlags.toString(16)} → DP_OK (no sessions)`);
-
-            return DP_OK;
-        };
-
-        this.exports["IDirectPlay4A_Close"] = (ctx, mem, args) => {
-            Logger.log(LogCategory.SYSTEM, `IDirectPlay4A_Close called, clearing ${this.messageQueue.length} queued messages`);
-            this.messageQueue.length = 0;
-            this.sessionOpen = false;
-            this.localPlayerId = 0;
-            return DP_OK;
-        };
-
-        // GetMessageQueue: returns count/bytes of pending messages in send queue.
-        // For loopback, the send queue is always empty (messages are delivered instantly).
-        this.exports["IDirectPlay4A_GetMessageQueue"] = (ctx, mem, args) => {
-            const idFrom = args[1] >>> 0;
-            const idTo = args[2] >>> 0;
-            const dwFlags = args[3] >>> 0;
-            const lpdwNumMsgs = args[4] >>> 0;
-            const lpdwNumBytes = args[5] >>> 0;
-
-            Logger.log(LogCategory.SYSTEM,
-                `IDirectPlay4A_GetMessageQueue: from=0x${idFrom.toString(16)}, to=0x${idTo.toString(16)}, flags=0x${dwFlags.toString(16)}, pNumMsgs=0x${lpdwNumMsgs.toString(16)}, pNumBytes=0x${lpdwNumBytes.toString(16)}`);
-
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            if (lpdwNumMsgs && this.validateRange(lpdwNumMsgs, 4, "rw")) {
-                view.setUint32(lpdwNumMsgs, 0, true);
-            }
-            if (lpdwNumBytes && this.validateRange(lpdwNumBytes, 4, "rw")) {
-                view.setUint32(lpdwNumBytes, 0, true);
-            }
-            return DP_OK;
-        };
-
-        // InitializeConnection: accept the compound address for loopback.
-        // In real DirectPlay this loads the SP DLL; for us it's a no-op.
-        this.exports["IDirectPlay4A_InitializeConnection"] = (ctx, mem, args) => {
-            const lpConnection = args[1] >>> 0;
-            const dwFlags = args[2] >>> 0;
-            Logger.log(LogCategory.SYSTEM,
-                `IDirectPlay4A_InitializeConnection: lpConnection=0x${lpConnection.toString(16)}, flags=0x${dwFlags.toString(16)} → DP_OK`);
-            return DP_OK;
-        };
+        this.dp4.register(this.exports);
 
         const dplayStubMethods = [
             // IDirectPlay2 methods
@@ -1055,9 +828,8 @@ export class DPlayX implements IModule {
             "SetSessionDesc", "GetSessionDesc", "SetPlayerData", "SetGroupData",
             "AddPlayerToGroup", "DeletePlayerFromGroup", "SetPlayerName",
         ]);
-        const dplayImplementedMethods = new Set(["Initialize", "Open", "CreatePlayer", "CreateGroup", "Send", "Receive", "GetMessageCount", "GetCaps", "EnumSessions", "Close", "GetMessageQueue", "InitializeConnection"]);
         for (const method of dplayStubMethods) {
-            if (dplayImplementedMethods.has(method)) continue;
+            if (this.exports[`IDirectPlay4A_${method}`]) continue;
             const returnOk = dplayNoOpSuccess.has(method);
             this.exports[`IDirectPlay4A_${method}`] = (ctx, mem, args) => {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1231,6 +1003,8 @@ export class DPlayX implements IModule {
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             view.setUint32(lplpDP, addr >>> 0, true);
+            const session = this.directPlayInstance(addr);
+            if (session) this.dp4.connectOnCreate(session, this.readGuidBytes(mem, lpGUID));
 
             Logger.log(LogCategory.SYSTEM,
                 `DirectPlayCreate: created IDirectPlay at 0x${(addr >>> 0).toString(16)}`);
@@ -1240,21 +1014,18 @@ export class DPlayX implements IModule {
         this.exports["directplaycreate"] = directPlayCreateImpl;
         this.exports["ord_1"] = directPlayCreateImpl;
 
-        // DirectPlayEnumerateA (ordinal 2)
-        // Enumerates service providers. For HLE standalone mode, return DP_OK without
-        // calling the callback (no providers = standalone/loopback).
-        const directPlayEnumerateAImpl: ThunkImplementation = (ctx, mem, args) => {
-            const lpEnumCallback = args[0];
-            const lpContext = args[1];
-
-            Logger.log(LogCategory.SYSTEM,
-                `DirectPlayEnumerateA called: callback=0x${lpEnumCallback.toString(16)}, context=0x${lpContext.toString(16)}`);
-
-            return DP_OK;
-        };
+        // DirectPlayEnumerateA (ordinal 2) / DirectPlayEnumerate (ordinal 9): service providers.
+        const directPlayEnumerateAImpl: ThunkImplementation = (ctx, _mem, args) =>
+            this.dp4.enumerateProviders(ctx, args[0] >>> 0, args[1] >>> 0, false);
+        const directPlayEnumerateWImpl: ThunkImplementation = (ctx, _mem, args) =>
+            this.dp4.enumerateProviders(ctx, args[0] >>> 0, args[1] >>> 0, true);
 
         this.exports["directplayenumeratea"] = directPlayEnumerateAImpl;
         this.exports["ord_2"] = directPlayEnumerateAImpl;
+        this.exports["directplayenumeratew"] = directPlayEnumerateWImpl;
+        this.exports["ord_3"] = directPlayEnumerateWImpl;
+        this.exports["directplayenumerate"] = directPlayEnumerateAImpl;
+        this.exports["ord_9"] = directPlayEnumerateAImpl;
 
         // DirectPlayLobbyCreateA (ordinal 4)
         // Creates an IDirectPlayLobby object. Games QI to IDirectPlayLobby3A,
@@ -1313,7 +1084,6 @@ export class DPlayX implements IModule {
     reset(): void {
         this.messageQueue.length = 0;
         this.localPlayerId = 0;
-        this.sessionOpen = false;
         this.directPlayV1Initialized = false;
         this.directPlayV1Open = false;
     }
