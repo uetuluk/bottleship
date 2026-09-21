@@ -12,7 +12,7 @@
 
 import type { HarnessService } from "../service";
 import { getVirtualNic } from "../../core/net/virtual-nic";
-import { getNetStack } from "../../modules/wsa-net";
+import { getNetStack } from "../../core/net/net-stack";
 import { hostToIp, ipToHost, ipToString } from "../../../net/nic-contract";
 
 /** Accepts "10.77.0.2" or a bare octet as text. */

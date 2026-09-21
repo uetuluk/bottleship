@@ -33,7 +33,7 @@ import {
     type NicHeader,
 } from "../../../net/nic-contract";
 import { Logger, LogCategory } from "../logger";
-import type { NicDevice } from "./virtual-nic";
+import { getVirtualNic, type NicDevice } from "./virtual-nic";
 
 export const SOCK_STREAM = 1;
 export const SOCK_DGRAM = 2;
@@ -751,4 +751,15 @@ export class NetStack {
         }
         return 0;
     }
+}
+
+let instance: NetStack | null = null;
+
+/**
+ * The guest's one stack, shared by every consumer — Winsock and DirectPlay alike — because a
+ * guest is one host: a port bound through one API is taken for the other, as on real Windows.
+ */
+export function getNetStack(): NetStack {
+    if (!instance) instance = new NetStack(getVirtualNic());
+    return instance;
 }
