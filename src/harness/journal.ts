@@ -14,7 +14,7 @@ const NAMED_VERBS = new Set([
     "watchLog", "logCapture", "logCaptureRead", "logCaptureStop", "logAgg", "logAggStats", "waitForEvent", "waitUntil",
     "tickFrames", "watchFrames", "sleep", "click", "key", "type", "move", "drag", "wheel",
     "state", "shot", "captureFrame", "textures", "dumpTexture", "dumpSurface", "time",
-    "perfProfile", "perfSpikes", "perfStats", "profilerStats",
+    "perfProfile", "perfSpikes", "perfStats", "profilerStats", "msgStats",
     "breakOn", "breakOnExport", "breakOnSymbol", "breakOnApi", "watchMem", "pause", "resume",
     "fsRead", "fsList", "fsStat", "regGet", "expectDialog", "expectSurfaceNonBlack",
     "expectThread", "expectFileExists",

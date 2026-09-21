@@ -137,6 +137,8 @@ export class HarnessChain {
     perfStats(): this { return this.push("perfStats", []); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
+    /** Window-message histogram: 'start' arms, 'read' ranks (path, hwnd, msg) by count, 'stop' disarms. */
+    msgStats(opts?: { action?: "start" | "stop" | "read"; top?: number }): this { return this.push("msgStats", [opts]); }
 
     // ── time ──
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }
