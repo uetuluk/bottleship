@@ -279,7 +279,9 @@ export class DPlayX implements IModule {
                     iidBytes[i] = mem[riidPtr + i];
                 }
                 const iidStr = this.bytesToGuid(iidBytes);
-                return obj.queryInterface(iidStr, ppvObject, mem);
+                const hr = obj.queryInterface(iidStr, ppvObject, mem);
+                if (hr === E_NOINTERFACE) Logger.warn(LogCategory.COM, `[dplay] ${ifacePrefix}::QueryInterface ${iidStr} -> E_NOINTERFACE`);
+                return hr;
             };
 
             this.exports[`${ifacePrefix}_AddRef`] = (ctx, mem, args) => {

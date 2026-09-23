@@ -22,6 +22,7 @@ import {
     DPENUMSESSIONS_ALL,
     DPID_ALLPLAYERS,
     DPlayEngine,
+    formatGuid,
     type QueuedMessage,
 } from "../src/worker/modules/dplayx/dplay-sp";
 
@@ -47,11 +48,6 @@ function parseGuid(text: string | undefined): Uint8Array {
     [3, 2, 1, 0, 5, 4, 7, 6].forEach((src, dst) => { out[dst] = b(src); });
     for (let i = 8; i < 16; i++) out[i] = b(i);
     return out;
-}
-
-function formatGuid(g: Uint8Array): string {
-    const h = (i: number) => g[i]!.toString(16).padStart(2, "0");
-    return `{${h(3)}${h(2)}${h(1)}${h(0)}-${h(5)}${h(4)}-${h(7)}${h(6)}-${h(8)}${h(9)}-${[10, 11, 12, 13, 14, 15].map(h).join("")}}`;
 }
 
 function describe(m: QueuedMessage): string {

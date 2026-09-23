@@ -211,6 +211,11 @@ const guidKey = (g: Uint8Array): string => {
 };
 const isNullGuid = (g: Uint8Array): boolean => g.every((b) => b === 0);
 const sameGuid = (a: Uint8Array, b: Uint8Array): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
+/** Registry-form GUID text: the first three fields are little-endian on the wire. */
+export function formatGuid(g: Uint8Array): string {
+    const h = (i: number) => (g[i] ?? 0).toString(16).padStart(2, "0");
+    return `{${h(3)}${h(2)}${h(1)}${h(0)}-${h(5)}${h(4)}-${h(7)}${h(6)}-${h(8)}${h(9)}-${[10, 11, 12, 13, 14, 15].map(h).join("")}}`;
+}
 
 function snapshot(e: Entity): EntitySnapshot {
     return {
@@ -325,14 +330,15 @@ export class DPlayEngine {
             lost: this.lost,
             slot: this.slot,
             port: this.sock ? this.stack.localPort(this.sock) : 0,
-            session: this.desc ? { name: this.desc.name, flags: this.desc.flags, maxPlayers: this.desc.maxPlayers, currentPlayers: this.desc.currentPlayers } : null,
+            session: this.desc ? { name: this.desc.name, app: formatGuid(this.desc.guidApplication), flags: this.desc.flags, maxPlayers: this.desc.maxPlayers, currentPlayers: this.desc.currentPlayers } : null,
+            enumApp: this.enumRequest ? formatGuid(this.enumRequest.guidApplication) : null,
             peers: [...this.peers.values()].map((p) => ({ slot: p.slot, host: p.host, port: p.port })),
             players: [...this.entities.values()].map((e) => ({
                 id: `0x${e.id.toString(16)}`, group: e.isGroup, local: e.local, name: e.shortName, slot: e.slot,
             })),
             queued: this.queue.length,
             backlog: this.backlog.length,
-            found: [...this.found.values()].map((f) => ({ name: f.desc.name, host: f.host, port: f.port, players: f.desc.currentPlayers })),
+            found: [...this.found.values()].map((f) => ({ name: f.desc.name, host: f.host, port: f.port, players: f.desc.currentPlayers, app: formatGuid(f.desc.guidApplication) })),
         };
     }
 
