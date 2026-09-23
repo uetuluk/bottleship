@@ -17,7 +17,6 @@ import {
     makeSelect,
     makeFdIsSet,
     WSAEFAULT,
-    WSAENOTSOCK,
 } from "./wsa-stub-shared";
 
 const SOCKET_ERROR = -1;
@@ -60,15 +59,7 @@ export class Wsock32 implements IModule {
         const selectImpl = makeSelect(this.socketTable, setError);
         const fdIsSet = makeFdIsSet();
 
-        const wsaAsyncSelect: ThunkImplementation = (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            setError(0);
-            return 0;
-        };
+        const wsaAsyncSelect = socketExports.WSAAsyncSelect!;
 
         this.exports["WSAStartup"] = startup;
         this.exports["WSACleanup"] = ok;

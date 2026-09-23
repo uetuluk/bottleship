@@ -34,6 +34,11 @@ Guests share a `10.77.0.0/24` virtual LAN. Each gets a host octet on join, so a 
 whole room, which is how LAN-era games discover each other. Loopback and the guest's own
 address route back into the guest, so a game that talks to `127.0.0.1` keeps working.
 
+The same room is also one **IPX network**. Its network number is the LAN prefix (`0a 4d 00 00`)
+and each guest's node address is a locally administered MAC carrying its LAN address
+(`02:00:0a:4d:00:HH`), so `IPX_ADDRESS` and `getsockname` report an address every peer can
+answer, and a node of `ff:ff:ff:ff:ff:ff` broadcasts to the room.
+
 `gethostbyname` reports the guest's LAN address once a link is up — games resolve their own
 name to decide what address to advertise to peers, and answering `127.0.0.1` there makes a
 host that nobody can join.
@@ -56,10 +61,14 @@ net.disconnect()
 | Tool | Answers |
 | --- | --- |
 | `harness().net()` | Is the link up, what is our address, how many frames moved, is the ring dropping? |
-| `harness().netSockets()` | What has the guest actually bound, and is anything readable it is not reading? |
+| `harness().netSockets()` | What has the guest actually bound, and is anything readable it is not reading? Each row carries its `WSAAsyncSelect` registration and which events are still armed |
 | `bun tools/net-loopback.ts [router]` | Does the whole chain work — two guests, real stack, real router — outside the browser? |
 | `harness().call("dplay")` | Per DirectPlay object: provider connected, sessions enumeration found, open session, peers, roster, queued messages |
 | `bun tools/dplay-peer.ts <room> --host/--enum/--join` | A headless DirectPlay host, enumerator or joiner to test a guest's DirectPlay against |
+
+`bun tools/net-peer.ts <room> --ipx <socket>` logs every IPX datagram the room sends to that
+socket number (`--ipx-hello` also broadcasts one a second), which shows whether an IPX game is
+announcing itself before a second instance is involved.
 
 `netPing()` is the call that separates "the link is broken" from "the game is not using it":
 it is answered by the peer's stack, not by any game, so it works before a socket is opened.
@@ -81,12 +90,31 @@ so the problem is above the device, in the game's own network code or in Winsock
   just the caller's. Games driven by `select`/`WSAAsyncSelect` are unaffected; a game that
   expects a blocking `recv` to sleep will spin instead. Parking the calling guest thread
   through the async-thunk path (CLAUDE.md §3.5) is the faithful fix.
-- **`WSAAsyncSelect` posts no events.** It is accepted and ignored, so a game that relies on
-  `FD_READ` window messages rather than polling will not see traffic.
 - **Streams are not TCP.** The link under them delivers reliably and in order, so connection
   setup and teardown are implemented and retransmission, windowing and congestion control are
   not. The one place ordering can break — a stream switching between relay and direct path —
   is handled by a sequence number and a small reorder window.
+
+## WSAAsyncSelect
+
+A registered socket gets its `FD_*` notifications as window messages
+(`src/worker/core/net/async-select.ts`), following Winsock's record-and-re-enable rules: each
+event posts once and waits for its re-enabling call — `recv`/`recvfrom` for `FD_READ`, `accept`
+for `FD_ACCEPT`, a send that failed with `WSAEWOULDBLOCK` for `FD_WRITE` — and a re-enabling call
+on a socket that is still ready posts again at once. Registration itself reports conditions that
+already hold (a bound datagram socket gets its `FD_WRITE`), `FD_CONNECT` carries a refused
+connection's error, and `FD_CLOSE` waits until the data in front of it has been read. Sockets are
+re-examined every 5 ms while any registration exists, so traffic arriving while the game sits in
+its message loop still wakes it.
+
+## IPX
+
+`socket(AF_IPX, SOCK_DGRAM, NSPROTO_IPX + n)` opens an IPX datagram socket sending packet type
+`n`; its frames travel as NIC protocol 111 with the packet type in the header, in a socket-number
+space of their own. Implemented: `SOCKADDR_IPX` everywhere an address crosses the ABI, dynamic
+socket numbers from 0x4000, `SO_BROADCAST`, `IPX_PTYPE`, `IPX_FILTERTYPE`/`IPX_STOPFILTERPTYPE`,
+`IPX_ADDRESS` (one adapter), `IPX_MAXSIZE` and `IPX_MAX_ADAPTER_NUM`. A datagram for a node or
+network nobody in the room owns is sent and lost, as on a real segment. SPX is not offered.
 
 ## DirectPlay
 

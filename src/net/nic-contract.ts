@@ -59,6 +59,12 @@ export const NIC_KIND_DATAGRAM = 1;
 /** IANA protocol numbers, so guest-visible semantics stay recognisable in a packet dump. */
 export const NIC_PROTO_UDP = 17;
 export const NIC_PROTO_STREAM = 6;
+/**
+ * Novell IPX datagrams (IANA 111, IPX-in-IP). The IPX packet type rides in the header's flags
+ * byte and the 16-bit IPX socket number in the port fields; the node address is derived from
+ * the host octet, so a room is one IPX network.
+ */
+export const NIC_PROTO_IPX = 111;
 /** Reserved for the provider's own peer-to-peer chatter; never reaches the guest. */
 export const NIC_PROTO_CONTROL = 0;
 /**

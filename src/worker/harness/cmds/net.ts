@@ -13,6 +13,7 @@
 import type { HarnessService } from "../service";
 import { getVirtualNic } from "../../core/net/virtual-nic";
 import { getNetStack } from "../../core/net/net-stack";
+import { netAsyncSelectState } from "../../modules/wsa-net";
 import { hostToIp, ipToHost, ipToString } from "../../../net/nic-contract";
 
 /** Accepts "10.77.0.2" or a bare octet as text. */
@@ -78,12 +79,15 @@ export function registerNetCommands(svc: HarnessService): void {
         }));
     });
 
-    /** netSockets() — every live guest socket: type, bound port, peer and readiness.
+    /** netSockets() — every live guest socket: type, bound port, peer and readiness, plus its
+     *  WSAAsyncSelect registration (`select`: window, message, events, still-armed events).
      *  A game that binds nothing has not reached its network code; a socket that is
-     *  readable while the game keeps polling points at the Winsock layer, not the link. */
+     *  readable while the game keeps polling points at the Winsock layer, not the link; a
+     *  readable socket whose FD_READ is disarmed means the game never re-read it. */
     svc.register("netSockets", async () => {
         const stack = getNetStack();
         stack.pump();
-        return stack.describe();
+        const selects = netAsyncSelectState();
+        return stack.describe().map((row) => ({ ...row, select: selects.find((r) => r.socket === row.id) ?? null }));
     });
 }

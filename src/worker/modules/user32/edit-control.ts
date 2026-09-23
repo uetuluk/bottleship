@@ -9,6 +9,7 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { type WindowInfo, editControlStates, getOrCreateEditState, type EditControlState } from './shared-state';
 import { repaintDialogAfterContentChange } from './dialog-paint';
 import { markCtlColorStale } from './ctl-color-brush';
+import { getWindowFont } from './controls';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder } from '../codepage-utils';
 
 const ES_MULTILINE = 0x0004;
@@ -289,7 +290,7 @@ export function handleEditMessage(
             onKeyDown(win, state(win), wParam & 0xFF);
             return 0;
         case WM_LBUTTONDOWN:
-            focusEditOnClick(win);
+            onLButtonDown(win, wParam, lParam);
             return 0;
         case WM_SETFOCUS:
             notifyParent(win, EN_SETFOCUS);
@@ -422,13 +423,68 @@ export function onEditTextSet(win: WindowInfo, msg: number): void {
     }
 }
 
-/** Mouse press on an edit: it takes the keyboard focus, caret at the end of the text. */
-function focusEditOnClick(win: WindowInfo): void {
+const MK_SHIFT = 0x0004;
+/** Where the painter starts the text and how tall a multiline row is (controls.ts paintEdit). */
+const TEXT_LEFT = 4;
+const TEXT_TOP = 4;
+const LINE_HEIGHT = 14;
+const CARET_MARGIN = 10;
+const FALLBACK_CHAR_PX = 6;
+
+let measureContext: OffscreenCanvasRenderingContext2D | null | undefined;
+
+/** Width of `text` in the edit's font — the metric its painter lays the text out with. */
+function textWidth(win: WindowInfo, text: string): number {
+    if (measureContext === undefined) {
+        measureContext = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(1, 1).getContext('2d') : null;
+    }
+    if (!measureContext) return text.length * FALLBACK_CHAR_PX;
+    measureContext.font = getWindowFont(win);
+    return measureContext.measureText(text).width;
+}
+
+/** The character boundary nearest a client-area x within one line of text. */
+function nearestBoundary(win: WindowInfo, line: string, x: number): number {
+    let best = 0;
+    let bestDistance = Infinity;
+    for (let i = 0; i <= line.length; i++) {
+        const distance = Math.abs(textWidth(win, line.slice(0, i)) - x);
+        if (distance < bestDistance) {
+            best = i;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+/** EM_CHARFROMPOS: the text index under a client point, as the edit currently lays it out. */
+function charFromPoint(win: WindowInfo, st: EditControlState, x: number, y: number): number {
+    const text = win.title;
+    if (win.style & ES_MULTILINE) {
+        const starts = lineStarts(text);
+        const line = Math.min(starts.length - 1, Math.max(0, Math.floor((y - TEXT_TOP) / LINE_HEIGHT)));
+        return starts[line] + nearestBoundary(win, text.slice(starts[line], starts[line] + lineLength(text, starts, line)), x - TEXT_LEFT);
+    }
+    const shown = st.passwordChar ? String.fromCharCode(st.passwordChar).repeat(text.length) : text;
+    // A single line scrolls so the caret stays in view; hit-test against that same offset.
+    const scroll = Math.max(0, textWidth(win, shown.slice(0, st.caret)) - (win.width - CARET_MARGIN));
+    return nearestBoundary(win, shown, x - TEXT_LEFT + scroll);
+}
+
+/**
+ * Mouse press on an edit: it takes the keyboard focus and puts the caret under the pointer
+ * (Shift+click extends the selection to it), whether or not it already had the focus.
+ */
+function onLButtonDown(win: WindowInfo, keys: number, lParam: number): void {
     const system = System.getInstance();
+    const st = state(win);
+    const x = (lParam << 16) >> 16;
+    const y = lParam >> 16;
+    st.caret = charFromPoint(win, st, x, y);
+    if ((keys & MK_SHIFT) === 0) st.anchor = st.caret;
     if (system.windowManager.getFocusHwnd() !== win.handle) {
-        const st = state(win);
-        st.anchor = st.caret = win.title.length;
         system.windowManager.setFocus(win.handle);
         system.scheduler.wakeMessageWaiters();
     }
+    repaint(win);
 }

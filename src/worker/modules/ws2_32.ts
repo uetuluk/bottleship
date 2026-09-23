@@ -21,7 +21,6 @@ import {
     createAsyncLookupStubs,
     makeSelect,
     makeFdIsSet,
-    WSAENOTSOCK,
 } from "./wsa-stub-shared";
 
 const WSA_INVALID_EVENT = 0xffffffff;
@@ -104,15 +103,7 @@ export class Ws2_32 implements IModule {
         this.exports["getservbyport"] = protoServ.getservbyport;
         this.exports["select"] = selectImpl;
         this.exports["__WSAFDIsSet"] = fdIsSet;
-        this.exports["WSAAsyncSelect"] = (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            setError(0);
-            return 0;
-        };
+        this.exports["WSAAsyncSelect"] = socketExports.WSAAsyncSelect!;
         this.exports["WSAAsyncGetHostByAddr"] = asyncLookup.WSAAsyncGetHostByAddr;
         this.exports["WSAAsyncGetHostByName"] = asyncLookup.WSAAsyncGetHostByName;
         this.exports["WSAAsyncGetProtoByNumber"] = asyncLookup.WSAAsyncGetProtoByNumber;
