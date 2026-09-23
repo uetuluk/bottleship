@@ -107,9 +107,11 @@ const CALLBACK_ID_BASE = 0x80000000;
 // Common stack cleanup amounts for stdcall APIs
 const CLEANUP_AMOUNTS = [0, 4, 8, 12, 16, 20, 24, 32];
 
-// Maximum callback nesting depth to prevent exhaust of return stub pool
-const MAX_CALLBACK_NESTING = 8;
-const SUSPENDED_FRAME_RING_SIZE = 64;
+// Windows bounds WndProc re-entry only by the thread's stack, and dialog code routinely
+// nests SendMessage → subclass → CallWindowProc chains a dozen deep. The cap only has to
+// keep every live frame inside the suspended-frame ring, with room for other threads' frames.
+const SUSPENDED_FRAME_RING_SIZE = 256;
+const MAX_CALLBACK_NESTING = 128;
 const MAX_PENDING_CALLBACK_SLOTS = 256;
 
 export class CallbackManager {

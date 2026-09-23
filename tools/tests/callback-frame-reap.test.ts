@@ -148,3 +148,17 @@ describe('suspended-frame ownership', () => {
         });
     }
 });
+
+describe('callback nesting depth', () => {
+    it('accepts a guest callback a dozen suspended frames deep (dialog SendMessage chains)', () => {
+        const cm = mkManager();
+        const reg32 = new Int32Array(8);
+        reg32[4] = 0x11fe000;
+        cm.v86 = { cpu: { reg32, instruction_pointer: new Int32Array(1) } };
+        cm.initialize();
+        for (let i = 0; i < 12; i++) push(cm, 0x11ff000 - i * 0x100, `nest${i}`);
+        expect(depth(cm)).toBe(12);
+        const { callbackId } = cm.invokeCallback(0x594660, [0x10062, 0x465, 0, 0], 16, undefined, false, 'CallWindowProcA');
+        expect(callbackId).not.toBe(0);
+    });
+});
