@@ -360,7 +360,11 @@ const gdiPresentLoop = () => {
     const shouldComposite = !renderActive || gdiDirty || videoDirty;
     const shouldClear = !renderActive; // Only clear for GDI-only games (no 3D renderer)
 
-    if (shouldComposite) {
+    // A fresh canvas texture does not hold the renderer's last frame: have the renderer
+    // redraw it under the changed overlay instead of compositing the overlay onto black.
+    if (renderActive && (gdiDirty || videoDirty) && renderActive.repaintWithOverlays?.()) {
+      if (gdi.isOverlayDirty()) gdi.clearOverlayDirty();
+    } else if (shouldComposite) {
       let composedAny = false;
 
       if (videoCanvas && (videoDirty || gdiDirty)) {

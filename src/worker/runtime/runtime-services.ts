@@ -49,6 +49,13 @@ export interface RenderActive {
      * refresh rate instead of going black between the renderer's sparse presents.
      */
     repaintLastFrame?(): void;
+    /**
+     * Re-present the last frame with the current GDI/video overlays on top, applying the
+     * same composite rules as a real present. The GDI present loop uses this when only the
+     * overlay changed (a Win32 child window repainting over a 2D primary the game is not
+     * re-presenting). Returns false when there is no frame to repaint.
+     */
+    repaintWithOverlays?(): boolean;
 }
 
 export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl";
