@@ -27,3 +27,48 @@ describe("DirectPlayLobbyCreateW import compatibility", () => {
         expect(ordinal(ctx, new Uint8Array(4096), [0, 0, 0, 0, 0])).toBe(0x80004003);
     });
 });
+
+describe("TCP/IP connection address", () => {
+    test("EnumConnections hands out DPAID_TotalSize followed by the TCP/IP service provider", async () => {
+        const { DirectPlay4Api, DPAID_TOTALSIZE, DPAID_SERVICEPROVIDER, DPSPGUID_TCPIP } =
+            await import("../../src/worker/modules/dplayx/directplay4");
+        const address = DirectPlay4Api.tcpipConnection();
+        const view = new DataView(address.buffer);
+        expect([...address.subarray(0, 16)]).toEqual([...DPAID_TOTALSIZE]);
+        expect(view.getUint32(16, true)).toBe(4);
+        expect(view.getUint32(20, true)).toBe(address.length);
+        expect([...address.subarray(24, 40)]).toEqual([...DPAID_SERVICEPROVIDER]);
+        expect(view.getUint32(40, true)).toBe(16);
+        expect([...address.subarray(44, 60)]).toEqual([...DPSPGUID_TCPIP]);
+    });
+
+    test("DirectPlayEnumerate is exported by name and ordinal, ANSI and Unicode", () => {
+        const module = new DPlayX();
+        (module as unknown as { registerDirectExports(): void }).registerDirectExports();
+        for (const name of ["directplayenumeratea", "ord_2", "directplayenumeratew", "ord_3", "directplayenumerate", "ord_9"]) {
+            expect(typeof module.exports[name]).toBe("function");
+        }
+        expect(module.exports["ord_9"]).toBe(module.exports["ord_2"]);
+    });
+});
+
+describe("DPSESSIONDESC2 read", () => {
+    test("the GUIDs are copied out, so a reused guest stack slot does not rewrite a hosted session", async () => {
+        const { Mem } = await import("../../src/worker/core/memory/mem-accessor");
+        const { DirectPlay4Api } = await import("../../src/worker/modules/dplayx/directplay4");
+        const mem = new Uint8Array(0x1000);
+        Mem.bind(() => mem);
+        const api = new DirectPlay4Api({
+            process: {} as never,
+            memory: () => mem,
+            validateRange: () => true,
+            instance: () => null,
+        });
+        const lpsd = 0x100;
+        new DataView(mem.buffer).setUint32(lpsd, 80, true);
+        for (let i = 0; i < 16; i++) mem[lpsd + 24 + i] = 0xa0 + i;
+        const desc = (api as unknown as { readSessionDesc(p: number): { guidApplication: Uint8Array } }).readSessionDesc(lpsd);
+        mem.fill(0x55, lpsd, lpsd + 80);
+        expect([...desc.guidApplication]).toEqual(Array.from({ length: 16 }, (_, i) => 0xa0 + i));
+    });
+});

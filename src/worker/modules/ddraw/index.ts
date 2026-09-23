@@ -445,6 +445,20 @@ export class DDraw implements IModule {
         return cached;
     }
 
+    /** A surface by its pixel pointer or its COM object address (context.surfaces.* hold the latter). */
+    private findSurfaceState(ptr: number): DirectDrawSurfaceState | null {
+        if (!this.context) return null;
+        const byObject = (this.context.resourceProvider.getComObjectByAddress(ptr) as any)?.getState?.();
+        if (byObject && typeof byObject.surfacePtr === "number") return byObject;
+        for (const obj of this.context.resourceProvider.getAllComObjects()) {
+            const getState = (obj as any).getState;
+            if (typeof getState !== "function") continue;
+            const s = getState.call(obj);
+            if (s && (s.surfacePtr >>> 0) === ptr) return s;
+        }
+        return null;
+    }
+
     /** DIAG: snapshot every DirectDraw surface (pixel ptr, dims, caps, GPU state). */
     dbgListSurfaces(): any[] {
         const out: any[] = [];
@@ -461,7 +475,7 @@ export class DDraw implements IModule {
                 mode: s.mode ?? null, ver: s.version ?? null, gpuVer: s.gpuWrittenVersion ?? null,
                 gpuTex: !!s.gpuTexture, gpuDirty: s.gpuDirty ?? null,
                 fmt: s.gpuTextureFormat ?? null,
-                isPrimary: s.surfacePtr === this.context.surfaces.primary || undefined,
+                isPrimary: s === this.findSurfaceState(this.context.surfaces.primary >>> 0) || undefined,
             });
         }
         return out;
@@ -474,13 +488,7 @@ export class DDraw implements IModule {
     async dbgReadSurfacePixels(ptrLike: number | string): Promise<any> {
         const want = (typeof ptrLike === "string" ? parseInt(ptrLike, 16) : ptrLike) >>> 0;
         if (!this.context?.backend) return { err: "no backend" };
-        let state: DirectDrawSurfaceState | null = null;
-        for (const obj of this.context.resourceProvider.getAllComObjects()) {
-            const getState = (obj as any).getState;
-            if (typeof getState !== "function") continue;
-            const s = getState.call(obj);
-            if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
-        }
+        const state = this.findSurfaceState(want);
         if (!state) return { err: `surface 0x${want.toString(16)} not found` };
         if (!state.gpuTexture) return { err: "no gpuTexture", mode: (state as any).mode };
         const device = this.context.backend.getDevice();
@@ -548,13 +556,7 @@ export class DDraw implements IModule {
     async readSurfaceRGBA(ptrLike: number | string): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
         const want = (typeof ptrLike === "string" ? parseInt(ptrLike, 16) : ptrLike) >>> 0;
         if (!this.context) return { err: "no ddraw context" };
-        let state: DirectDrawSurfaceState | null = null;
-        for (const obj of this.context.resourceProvider.getAllComObjects()) {
-            const getState = (obj as any).getState;
-            if (typeof getState !== "function") continue;
-            const s = getState.call(obj);
-            if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
-        }
+        const state = this.findSurfaceState(want);
         if (!state) return { err: `surface 0x${want.toString(16)} not found` };
         return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush());
     }

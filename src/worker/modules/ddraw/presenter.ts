@@ -51,8 +51,8 @@ export class DDrawPresenter implements RenderActive {
     private blendFrameUnreg: (() => void) | null = null;
     private lastBlendWidth = 0;
     private lastBlendHeight = 0;
-    /** Surface of the last normal present, redrawn under overlay-only changes. */
-    private lastPresented: DirectDrawSurfaceState | null = null;
+    /** The surface last drawn to the canvas; repaintLastFrame re-presents it. */
+    private lastPresentedSurface: DirectDrawSurfaceState | null = null;
 
     constructor(process: Process) {
         this.process = process;
@@ -103,7 +103,7 @@ export class DDrawPresenter implements RenderActive {
         this.pendingMem = null;
         this.pendingOptions = null;
         this.pumpRunning = false;
-        this.lastPresented = null;
+        this.lastPresentedSurface = null;
 
         // Tear down phase-blend (interpolator holds device-bound GPU textures + an rAF callback).
         this.setBlendEnabled(false);
@@ -365,26 +365,8 @@ export class DDrawPresenter implements RenderActive {
                     const _gt = performance.now();
                     const canvasTex = gpuContext.getCurrentTexture();
                     _pdGetTex += performance.now() - _gt;
-                    const targetView = canvasTex.createView();
-
-                    const clearColor = EmulatorConfig.getInstance().screenBackgroundColor;
-                    webgpu.drawTexture(
-                        presentTextureView,
-                        targetView,
-                        encoder,
-                        true,
-                        undefined,
-                        undefined,
-                        clearColor,
-                        undefined,
-                        // Source (guest) + output (canvas) dims → post-fx chain does
-                        // integer/aspect scaling + FXAA texel sizing.
-                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height }
-                    );
-
-                    // Composite overlays (video plane → GDI → worker FPS). Shared with presentBlend.
-                    this.compositeFrameOverlays(webgpu, targetView, encoder, surface.width, surface.height);
-                    this.lastPresented = surface;
+                    this.encodeFrame(webgpu, encoder, canvasTex, presentTextureView, surface.width, surface.height);
+                    this.lastPresentedSurface = surface;
 
                     const submitStart = frameProfiler.startTimer();
                     const _ds = performance.now();
@@ -547,6 +529,64 @@ export class DDrawPresenter implements RenderActive {
         }
     }
 
+    /** Draw the guest frame to the canvas texture, then its overlays (video plane → GDI → worker FPS). */
+    private encodeFrame(
+        webgpu: WebGPUBackend,
+        encoder: GPUCommandEncoder,
+        canvasTex: GPUTexture,
+        frameView: GPUTextureView,
+        width: number,
+        height: number,
+    ): void {
+        const targetView = canvasTex.createView();
+        const clearColor = EmulatorConfig.getInstance().screenBackgroundColor;
+        webgpu.drawTexture(
+            frameView,
+            targetView,
+            encoder,
+            true,
+            undefined,
+            undefined,
+            clearColor,
+            undefined,
+            // Source (guest) + output (canvas) dims → post-fx chain does
+            // integer/aspect scaling + FXAA texel sizing.
+            { srcW: width, srcH: height, outW: canvasTex.width, outH: canvasTex.height }
+        );
+        this.compositeFrameOverlays(webgpu, targetView, encoder, width, height);
+    }
+
+    /**
+     * Re-present the last guest frame with fresh overlays. A WebGPU canvas texture starts
+     * cleared after every present, so a GDI change (an edit caret, a child control repaint)
+     * between the guest's sparse Blts to the primary must be drawn over the frame, not alone.
+     * Phase-blend already re-presents every animation frame.
+     */
+    repaintLastFrame(): boolean {
+        // Blend mode and an in-flight present both draw the overlays themselves.
+        if (this.blendEnabled || this.pumpRunning) return true;
+        const surface = this.lastPresentedSurface;
+        const frameView = surface?.gpuTextureView;
+        if (!surface || !frameView) return false;
+        const backend = System.getInstance().services.render.getBackend();
+        if (backend?.kind !== "webgpu") return false;
+        const webgpu = backend as WebGPUBackend;
+        const device = webgpu.getDevice();
+        const queue = webgpu.getQueue();
+        const gpuContext = webgpu.getContext();
+        if (!device || !queue || !gpuContext) return false;
+        let canvasTex: GPUTexture;
+        try {
+            canvasTex = gpuContext.getCurrentTexture();
+        } catch {
+            return false;
+        }
+        const encoder = device.createCommandEncoder();
+        this.encodeFrame(webgpu, encoder, canvasTex, frameView, surface.width, surface.height);
+        queue.submit([encoder.finish()]);
+        return true;
+    }
+
     /**
      * Composite the per-frame overlays (video plane → GDI → worker FPS) onto an already-drawn
      * target view. Recomputes overlay sources/visibility internally so it can be called from both
@@ -636,36 +676,6 @@ export class DDrawPresenter implements RenderActive {
             system.services.render.setActive(this);
         }
         system.services.render.notifyPresent("ddraw");
-    }
-
-    repaintWithOverlays(): boolean {
-        const surface = this.lastPresented;
-        if (this.blendEnabled || !surface?.gpuTextureView) return false;
-        const system = System.getInstance();
-        const backend = system.services.render.getBackend();
-        if (backend?.kind !== "webgpu") return false;
-        const webgpu = backend as WebGPUBackend;
-        const device = webgpu.getDevice();
-        const queue = webgpu.getQueue();
-        const gpuContext = webgpu.getContext();
-        if (!device || !queue || !gpuContext) return false;
-
-        let canvasTex: GPUTexture;
-        try {
-            canvasTex = gpuContext.getCurrentTexture();
-        } catch {
-            return false; // canvas not configured / lost this frame
-        }
-        const targetView = canvasTex.createView();
-        const encoder = device.createCommandEncoder();
-        webgpu.drawTexture(
-            surface.gpuTextureView, targetView, encoder, true, undefined, undefined,
-            EmulatorConfig.getInstance().screenBackgroundColor, undefined,
-            { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height },
-        );
-        this.compositeFrameOverlays(webgpu, targetView, encoder, surface.width, surface.height);
-        queue.submit([encoder.finish()]);
-        return true;
     }
 
     private ensureCanvas(width: number, height: number): void {
