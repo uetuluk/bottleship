@@ -283,7 +283,7 @@ function applyWindowPosGeometry(
             `→ ${cx}x${cy} (was ${window.width}x${window.height})`);
     }
 
-    if ((moving || resizing) && window.visible && window.nativeClassName === '#32770') {
+    if ((moving || resizing) && window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
         eraseDialogOverlay(hWnd);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
@@ -507,6 +507,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
 
         windows.set(windowInfo.handle, windowInfo);
+        if (predefinedClass) noteDialogOverlayCandidate(windowInfo);
 
         // Add to parent's children list
         if (hWndParent) {
@@ -794,9 +795,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // Erase the dialog's pixels from the GDI overlay BEFORE teardown, while its
         // rect is still known — otherwise a closed dialog lingers as a ghost over the
-        // game (the overlay is a persistent screen-space canvas). Only #32770 dialogs
-        // paint into the overlay; skip for other windows (no-op rect).
-        if (windowInfo.nativeClassName === '#32770') {
+        // game (the overlay is a persistent screen-space canvas). Only dialogs and live
+        // overlay controls paint into the overlay; skip other windows (no-op rect).
+        if (windowInfo.nativeClassName === '#32770' || windowInfo.overlayOnFlipScreen) {
             eraseDialogOverlay(hWnd);
             resetControlInteractionState();
         }
@@ -908,7 +909,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // Hiding a dialog: erase its pixels from the persistent overlay (while its
             // rect is still known) so it doesn't linger as a ghost. TS hides the
             // campaign dialog (ShowWindow(hWnd,0)) when opening a sub-dialog.
-            if (wasVisible && !window.visible && window.nativeClassName === '#32770') {
+            if (wasVisible && !window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
                 eraseDialogOverlay(hWnd);
             }
 
