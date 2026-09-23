@@ -45,6 +45,7 @@ import {
     DPSYS_SETPLAYERORGROUPNAME,
     DPSYS_SETSESSIONDESC,
     DPlayEngine,
+    formatGuid,
     type Entity,
     type NameSnapshot,
     type SessionDesc,
@@ -192,15 +193,15 @@ export class DirectPlay4Api {
     private readData(ptr: number, size: number): Uint8Array | null {
         if (size === 0) return new Uint8Array(0);
         if (!ptr || !this.deps.validateRange(ptr, size, "r")) return null;
-        return Mem.readBytes(ptr, size);
+        return Mem.readBytes(ptr, size)?.slice() ?? null;
     }
 
     private readSessionDesc(lpsd: number): SessionDesc | null {
         if (!lpsd || !this.deps.validateRange(lpsd, DPSESSIONDESC2_SIZE, "r")) return null;
         return {
             flags: rd(lpsd + 4),
-            guidInstance: Mem.readBytes(lpsd + 8, 16) ?? new Uint8Array(16),
-            guidApplication: Mem.readBytes(lpsd + 24, 16) ?? new Uint8Array(16),
+            guidInstance: Mem.readBytes(lpsd + 8, 16)?.slice() ?? new Uint8Array(16),
+            guidApplication: Mem.readBytes(lpsd + 24, 16)?.slice() ?? new Uint8Array(16),
             maxPlayers: rd(lpsd + 40),
             currentPlayers: rd(lpsd + 44),
             name: this.str(rd(lpsd + 48)),
@@ -388,7 +389,7 @@ export class DirectPlay4Api {
             const guid = Mem.readBytes(at, 16)!;
             const size = rd(at + 16);
             if (at + 20 + size > ptr + total) break;
-            chunks.set(key(guid), Mem.readBytes(at + 20, size) ?? new Uint8Array(0));
+            chunks.set(key(guid), Mem.readBytes(at + 20, size)?.slice() ?? new Uint8Array(0));
             at += 20 + size;
         }
         return chunks;
@@ -602,8 +603,19 @@ export class DirectPlay4Api {
                 }, 20);
             });
         };
-        exports[`${P}Open`] = withInst((inst, _ctx, args) => open(inst, args[1]! >>> 0, args[2]! >>> 0));
-        exports[`${P}SecureOpen`] = withInst((inst, _ctx, args) => open(inst, args[1]! >>> 0, args[2]! >>> 0));
+        const traceOpen = (inst: DirectPlayInstance, ctx: Ctx, lpsd: number, flags: number): void => {
+            const d = inst.joining ? null : this.readSessionDesc(lpsd);
+            if (!d) return;
+            Logger.log(LogCategory.SYSTEM, `[dplay] Open flags=0x${flags.toString(16)} size=${rd(lpsd)} app=${formatGuid(d.guidApplication)} instance=${formatGuid(d.guidInstance)} name="${d.name}" caller=0x${(ctx.returnAddr ?? rd(ctx.esp)).toString(16)}`);
+        };
+        exports[`${P}Open`] = withInst((inst, ctx, args) => {
+            traceOpen(inst, ctx, args[1]! >>> 0, args[2]! >>> 0);
+            return open(inst, args[1]! >>> 0, args[2]! >>> 0);
+        });
+        exports[`${P}SecureOpen`] = withInst((inst, ctx, args) => {
+            traceOpen(inst, ctx, args[1]! >>> 0, args[2]! >>> 0);
+            return open(inst, args[1]! >>> 0, args[2]! >>> 0);
+        });
 
         exports[`${P}Close`] = withInst((inst) => {
             inst.engine.close();
@@ -808,6 +820,7 @@ export class DirectPlay4Api {
         exports[`${P}SetSessionDesc`] = withInst((inst, _ctx, a) => {
             const d = this.readSessionDesc(a[1]! >>> 0);
             if (!d) return DPERR_INVALIDPARAMS;
+            Logger.log(LogCategory.SYSTEM, `[dplay] SetSessionDesc app=${formatGuid(d.guidApplication)} name="${d.name}"`);
             return inst.engine.setSessionDesc(d);
         });
 
