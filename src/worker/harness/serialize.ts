@@ -132,6 +132,8 @@ export function serializeSurfaces(): unknown {
     try {
         primaryPtr = u32(getModule("ddraw")?.context?.surfaces?.primary);
     } catch { /* no ddraw */ }
+    // context.surfaces.primary is the surface's COM object address, not its pixel pointer.
+    const primaryState = primaryPtr ? provider?.getComObjectByAddress?.(primaryPtr)?.getState?.() : null;
     const out: unknown[] = [];
     for (const o of objs) {
         const st = o?.getState?.();
@@ -153,7 +155,7 @@ export function serializeSurfaces(): unknown {
             mipMapCount: st.mipMapCount ?? null,
             activeLeaseId: st.activeLeaseId ?? null,
             everLocked: st.everLocked ?? null,
-            isPrimary: primaryPtr !== 0 && (st.surfacePtr >>> 0) === primaryPtr,
+            isPrimary: primaryPtr !== 0 && (st === primaryState || (st.surfacePtr >>> 0) === primaryPtr),
         });
     }
     return out;
