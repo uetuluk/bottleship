@@ -3,7 +3,7 @@
  * SendDlgItemMessage, …). Find a dialog's child control by id and read/write its
  * state.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, type ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -11,6 +11,7 @@ import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
 import { windows, buttonCheckStates } from './shared-state';
 import { findChildByControlId, repaintDialogAfterContentChange, handleSystemControlMessage, isContentChangingMessage } from './dialog';
+import { trySendCtlColor } from './ctl-color';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
     exports['GetDlgItem'] = (ctx, mem, args) => {
@@ -255,7 +256,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         return 1; // TRUE
     };
 
-    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number => {
+    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
         const hDlg = args[0];
         const nIDDlgItem = args[1];
         const Msg = args[2];
@@ -272,7 +273,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
             if (isContentChangingMessage(Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
-            return result;
+            return trySendCtlColor(ctx, mem, child, result, 20, 'SendDlgItemMessage') ?? result;
         }
 
         // Guest-owned child: post for async delivery (sync re-enter would need a suspended thunk).
@@ -311,7 +312,7 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
             if (isContentChangingMessage(Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
-            return result;
+            return trySendCtlColor(ctx, mem, child, result, 20, 'SendDlgItemMessage') ?? result;
         }
         if (Msg === WM_SETTEXT && lParam) {
             child.title = Marshaler.readWideString(mem, lParam);

@@ -562,27 +562,29 @@ export class DDrawPresenter implements RenderActive {
      * between the guest's sparse Blts to the primary must be drawn over the frame, not alone.
      * Phase-blend already re-presents every animation frame.
      */
-    repaintLastFrame(): void {
-        if (this.blendEnabled || this.pumpRunning) return;
+    repaintLastFrame(): boolean {
+        // Blend mode and an in-flight present both draw the overlays themselves.
+        if (this.blendEnabled || this.pumpRunning) return true;
         const surface = this.lastPresentedSurface;
         const frameView = surface?.gpuTextureView;
-        if (!surface || !frameView) return;
+        if (!surface || !frameView) return false;
         const backend = System.getInstance().services.render.getBackend();
-        if (backend?.kind !== "webgpu") return;
+        if (backend?.kind !== "webgpu") return false;
         const webgpu = backend as WebGPUBackend;
         const device = webgpu.getDevice();
         const queue = webgpu.getQueue();
         const gpuContext = webgpu.getContext();
-        if (!device || !queue || !gpuContext) return;
+        if (!device || !queue || !gpuContext) return false;
         let canvasTex: GPUTexture;
         try {
             canvasTex = gpuContext.getCurrentTexture();
         } catch {
-            return;
+            return false;
         }
         const encoder = device.createCommandEncoder();
         this.encodeFrame(webgpu, encoder, canvasTex, frameView, surface.width, surface.height);
         queue.submit([encoder.finish()]);
+        return true;
     }
 
     /**

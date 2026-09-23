@@ -8,6 +8,7 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { type WindowInfo, editControlStates, getOrCreateEditState, type EditControlState } from './shared-state';
 import { repaintDialogAfterContentChange } from './dialog-paint';
+import { markCtlColorStale } from './ctl-color-brush';
 import { encodeAnsi, getAnsiCodePage, getCodePageDecoder } from '../codepage-utils';
 
 const ES_MULTILINE = 0x0004;
@@ -95,6 +96,7 @@ function notifyParent(win: WindowInfo, code: number): void {
 }
 
 function repaint(win: WindowInfo): void {
+    markCtlColorStale(win.handle);
     if (win.parent !== undefined) repaintDialogAfterContentChange(win.parent);
 }
 

@@ -56,6 +56,8 @@ import {
     isDialogInitInProgress,
     isWindowInitInProgress,
 } from './activation-messages';
+import { trySendCtlColor } from './ctl-color';
+import { defWindowProcCtlColor, WM_CTLCOLORMSGBOX, WM_CTLCOLORSTATIC } from './ctl-color-brush';
 
 export function getWindowByHandle(handle: number): WindowInfo | undefined {
     return windows.get(handle);
@@ -281,7 +283,7 @@ function applyWindowPosGeometry(
             `→ ${cx}x${cy} (was ${window.width}x${window.height})`);
     }
 
-    if ((moving || resizing) && window.visible && window.nativeClassName === '#32770') {
+    if ((moving || resizing) && window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
         eraseDialogOverlay(hWnd);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
@@ -505,6 +507,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         }
 
         windows.set(windowInfo.handle, windowInfo);
+        if (predefinedClass) noteDialogOverlayCandidate(windowInfo);
 
         // Add to parent's children list
         if (hWndParent) {
@@ -792,9 +795,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // Erase the dialog's pixels from the GDI overlay BEFORE teardown, while its
         // rect is still known — otherwise a closed dialog lingers as a ghost over the
-        // game (the overlay is a persistent screen-space canvas). Only #32770 dialogs
-        // paint into the overlay; skip for other windows (no-op rect).
-        if (windowInfo.nativeClassName === '#32770') {
+        // game (the overlay is a persistent screen-space canvas). Only dialogs and live
+        // overlay controls paint into the overlay; skip other windows (no-op rect).
+        if (windowInfo.nativeClassName === '#32770' || windowInfo.overlayOnFlipScreen) {
             eraseDialogOverlay(hWnd);
             resetControlInteractionState();
         }
@@ -857,6 +860,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return result;
         }
 
+        if (Msg >= WM_CTLCOLORMSGBOX && Msg <= WM_CTLCOLORSTATIC) {
+            return defWindowProcCtlColor(Msg, wParam >>> 0, System.getInstance().gdiContext);
+        }
+
         if (Msg === WM_CLOSE) {
             // Default: DestroyWindow(hWnd) which posts WM_DESTROY
             Logger.log(LogCategory.USER32, `DefWindowProcA: WM_CLOSE -> DestroyWindow(0x${hWnd.toString(16)})`);
@@ -902,7 +909,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // Hiding a dialog: erase its pixels from the persistent overlay (while its
             // rect is still known) so it doesn't linger as a ghost. TS hides the
             // campaign dialog (ShowWindow(hWnd,0)) when opening a sub-dialog.
-            if (wasVisible && !window.visible && window.nativeClassName === '#32770') {
+            if (wasVisible && !window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
                 eraseDialogOverlay(hWnd);
             }
 
@@ -1361,7 +1368,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (isContentChangingMessage(Msg)) {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
             }
-            return { value: result >>> 0, stackCleanup: 5 * 4 };
+            return trySendCtlColor(ctx, mem, win, result, 5 * 4, 'CallWindowProcA')
+                ?? { value: result >>> 0, stackCleanup: 5 * 4 };
         }
 
         const system = System.getInstance();

@@ -1615,7 +1615,7 @@ interface WriterCacheEntry {
     flushInFlight: Promise<void> | null;
 }
 
-class OpfsOverlay {
+export class OpfsOverlay {
     private root: FileSystemDirectoryHandle | null = null;
     /** Container dir (parent of overlay/) — where the shadow-index sidecar lives. */
     private container: FileSystemDirectoryHandle | null = null;
@@ -1964,8 +1964,9 @@ class OpfsOverlay {
     }
 
     listDirectory(path: string): VfsEntry[] {
-        const normalizedPrefix = normalizePath(path);
-        const prefix = toKey(normalizedPrefix);
+        // A drive root normalizes to "C:\"; drop the separator so it joins like any other dir.
+        const normalizedPrefix = normalizePath(path).replace(/\\$/, "");
+        const prefix = normalizedPrefix.toLowerCase();
         const prefixParts = normalizedPrefix.split("\\");
         const out: VfsEntry[] = [];
         const seen = new Set<string>();

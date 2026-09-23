@@ -11,6 +11,10 @@ import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtabl
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
+import {
+    resetStructuredStorage, stgCreateDocfile, stgOpenStorage, stgIsStorageFile,
+    writeClassStm, readClassStm, oleSaveToStream, oleLoadFromStream,
+} from "./ole32-storage";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -54,6 +58,7 @@ export class Ole32 implements IModule {
 
         // Create universal IUnknown stubs that can be used by any COM object
         this.createIUnknownStubs();
+        resetStructuredStorage();
 
         // CoInitialize - initialize COM library
         this.exports["CoInitialize"] = (ctx, mem, args) => {
@@ -377,27 +382,11 @@ export class Ole32 implements IModule {
             return S_OK;
         };
 
-        // HRESULT StgCreateDocfile(LPCOLESTR pwcsName, DWORD grfMode, DWORD reserved, IStorage **ppstgOpen)
-        this.exports["StgCreateDocfile"] = (ctx, mem, args) => {
-            const ppstgOpen = args[3] >>> 0;
-            Logger.warn(LogCategory.COM, `StgCreateDocfile — stub, returning E_NOTIMPL`);
-            if (ppstgOpen) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppstgOpen, 0, true);
-            }
-            return 0x80004001; // E_NOTIMPL
-        };
-
-        // HRESULT StgOpenStorage(LPCOLESTR pwcsName, IStorage *pstgPriority, DWORD grfMode, SNB snbExclude, DWORD reserved, IStorage **ppstgOpen)
-        this.exports["StgOpenStorage"] = (ctx, mem, args) => {
-            const ppstgOpen = args[5] >>> 0;
-            Logger.warn(LogCategory.COM, `StgOpenStorage — stub, returning STG_E_FILENOTFOUND`);
-            if (ppstgOpen) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppstgOpen, 0, true);
-            }
-            return 0x80030002; // STG_E_FILENOTFOUND
-        };
+        this.exports["StgCreateDocfile"] = (ctx, mem, args) => stgCreateDocfile(this.process, mem, args);
+        this.exports["StgOpenStorage"] = (ctx, mem, args) => stgOpenStorage(this.process, mem, args);
+        this.exports["StgIsStorageFile"] = (ctx, mem, args) => stgIsStorageFile(mem, args);
+        this.exports["WriteClassStm"] = (ctx, mem, args) => writeClassStm(ctx, mem, args);
+        this.exports["ReadClassStm"] = (ctx, mem, args) => readClassStm(this.process, ctx, mem, args);
 
         // HRESULT CoFileTimeNow(FILETIME *lpFileTime)
         this.exports["CoFileTimeNow"] = (ctx, mem, args) => {
@@ -436,22 +425,9 @@ export class Ole32 implements IModule {
             return S_OK;
         };
 
-        // HRESULT OleSaveToStream(LPPERSISTSTREAM pPStm, LPSTREAM pStm)
-        this.exports["OleSaveToStream"] = (ctx, mem, args) => {
-            Logger.warn(LogCategory.COM, `OleSaveToStream — stub, returning E_NOTIMPL`);
-            return 0x80004001; // E_NOTIMPL
-        };
-
-        // HRESULT OleLoadFromStream(LPSTREAM pStm, REFIID iidInterface, LPVOID *ppvObj)
-        this.exports["OleLoadFromStream"] = (ctx, mem, args) => {
-            const ppvObj = args[2] >>> 0;
-            Logger.warn(LogCategory.COM, `OleLoadFromStream — stub, returning E_NOTIMPL`);
-            if (ppvObj) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(ppvObj, 0, true);
-            }
-            return 0x80004001; // E_NOTIMPL
-        };
+        this.exports["OleSaveToStream"] = (ctx, mem, args) => oleSaveToStream(this.process, ctx, mem, args);
+        this.exports["OleLoadFromStream"] = (ctx, mem, args) =>
+            oleLoadFromStream(this.process, ctx, mem, args, (clsid) => this.registeredClassFactory(clsid));
 
         // HRESULT PropVariantClear(PROPVARIANT *pvar)
         //
@@ -691,6 +667,15 @@ export class Ole32 implements IModule {
             .join('');
 
         return `{${data1.toString(16).padStart(8, '0')}-${data2.toString(16).padStart(4, '0')}-${data3.toString(16).padStart(4, '0')}-${data4.slice(0, 4)}-${data4.slice(4)}}`;
+    }
+
+    /** Guest IClassFactory registered for `clsid` via CoRegisterClassObject, or 0. */
+    private registeredClassFactory(clsid: string): number {
+        const want = this.normalizeGuid(clsid);
+        for (const reg of this.classRegistrations.values()) {
+            if (this.normalizeGuid(reg.clsid) === want) return reg.punk;
+        }
+        return 0;
     }
 
     private normalizeGuid(value: string): string {

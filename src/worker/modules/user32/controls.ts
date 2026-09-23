@@ -7,8 +7,10 @@
  */
 
 import { System } from '../../core/system';
-import { windows, buttonCheckStates, listControlStates, editControlStates, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition } from './shared-state';
+import { windows, buttonCheckStates, listControlStates, editControlStates, ctlColorAnswers, controlImageHandles, getOrCreateTrackbarState, getChildrenInPaintOrder, getAbsoluteWindowPosition } from './shared-state';
 import type { GDIContext } from '../gdi32/context';
+import { colorToCss } from '../gdi32/gdi-objects';
+import { resolveBrushFill } from './ctl-color-brush';
 import type { WindowInfo } from './shared-state';
 import { resolveBitmapRgba, resolveIconRgba, layoutStaticControlImage, blitStaticControlImage } from '../gdi32/bitmap-resolve';
 import { Logger, LogCategory } from '../../core/logger';
@@ -74,6 +76,10 @@ const COLOR_BTNTEXT = '#000000';
 const COLOR_GRAYTEXT = '#808080';
 const COLOR_HIGHLIGHT = '#0A246A';
 const COLOR_HIGHLIGHTTEXT = '#FFFFFF';
+const COLOR_WINDOWFRAME = '#000000';
+const WS_BORDER = 0x00800000;
+const WS_EX_CLIENTEDGE = 0x00000200;
+const OPAQUE = 2;
 
 // Font used for control labels
 const CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
@@ -178,7 +184,7 @@ export function paintSystemControl(
         case 'sysanimate32_class':
             return false;
         case 'edit':
-            paintEdit(ctx, child, absX, absY, w, h);
+            paintEdit(ctx, gdi, child, absX, absY, w, h);
             break;
         case 'combobox':
             paintComboBox(ctx, child, absX, absY, w, h);
@@ -764,8 +770,25 @@ function paintStatic(
     ctx.textBaseline = 'top';
 }
 
+/** Colours the parent chose via WM_CTLCOLOR*; null = the class defaults. */
+function editColors(gdi: GDIContext, child: WindowInfo, disabled: boolean): {
+    fill: string | OffscreenCanvas | null; text: string; textBk: string | null;
+} {
+    const answer = ctlColorAnswers.get(child.handle);
+    const fill = answer?.brush ? resolveBrushFill(gdi, answer.brush) : null;
+    if (!answer?.brush || fill === null) {
+        return { fill: disabled ? COLOR_BTNFACE : COLOR_WINDOW, text: disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT, textBk: null };
+    }
+    return {
+        fill,
+        text: colorToCss(gdi, answer.textColor),
+        textBk: answer.bkMode === OPAQUE ? colorToCss(gdi, answer.bkColor) : null,
+    };
+}
+
 function paintEdit(
     ctx: OffscreenCanvasRenderingContext2D,
+    gdi: GDIContext,
     child: WindowInfo,
     x: number,
     y: number,
@@ -773,10 +796,27 @@ function paintEdit(
     h: number,
 ): void {
     const disabled = isControlDisabled(child);
+    const colors = editColors(gdi, child, disabled);
 
-    ctx.fillStyle = disabled ? COLOR_BTNFACE : COLOR_WINDOW;
-    ctx.fillRect(x, y, w, h);
-    drawSunkenEdge(ctx, x, y, w, h);
+    if (colors.fill instanceof OffscreenCanvas) {
+        ctx.fillStyle = ctx.createPattern(colors.fill, 'repeat') ?? COLOR_WINDOW;
+        ctx.fillRect(x, y, w, h);
+    } else if (colors.fill !== 'transparent') {
+        ctx.fillStyle = colors.fill ?? COLOR_WINDOW;
+        ctx.fillRect(x, y, w, h);
+    }
+    // The edit draws a frame only when asked: WS_EX_CLIENTEDGE (dialog templates turn
+    // WS_BORDER into it) is the sunken 3D edge, a bare WS_BORDER a 1px window frame.
+    let inset = 0;
+    if (((child.exStyle ?? 0) & WS_EX_CLIENTEDGE) !== 0) {
+        drawSunkenEdge(ctx, x, y, w, h);
+        inset = 2;
+    } else if ((child.style & WS_BORDER) !== 0) {
+        ctx.strokeStyle = COLOR_WINDOWFRAME;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        inset = 1;
+    }
 
     const ES_MULTILINE = 0x0004;
     const ES_PASSWORD = 0x0020;
@@ -794,8 +834,17 @@ function paintEdit(
     ctx.textBaseline = 'middle';
     ctx.save();
     ctx.beginPath();
-    ctx.rect(x + 2, y + 2, Math.max(1, w - 4), Math.max(1, h - 4));
+    ctx.rect(x + inset, y + inset, Math.max(1, w - inset * 2), Math.max(1, h - inset * 2));
     ctx.clip();
+    // OPAQUE background mode fills each text run's cell with the DC background colour.
+    const drawRun = (run: string, tx: number, ty: number, cellTop: number, cellH: number, color: string): void => {
+        if (colors.textBk && run) {
+            ctx.fillStyle = colors.textBk;
+            ctx.fillRect(tx, cellTop, ctx.measureText(run).width, cellH);
+        }
+        ctx.fillStyle = color;
+        ctx.fillText(run, tx, ty);
+    };
     if (focused && !multiline) {
         // Single-line selection highlight + caret, scrolled so the caret stays visible.
         const caret = Math.min(edit?.caret ?? text.length, text.length);
@@ -804,25 +853,22 @@ function paintEdit(
         const scroll = Math.max(0, caretPx - (w - 10));
         const tx = x + 4 - scroll;
         const [s0, s1] = anchor <= caret ? [anchor, caret] : [caret, anchor];
+        drawRun(text, tx, y + h / 2, y + 3, h - 6, colors.text);
         if (s1 > s0) {
             const sx = tx + ctx.measureText(text.slice(0, s0)).width;
+            const sel = text.slice(s0, s1);
             ctx.fillStyle = COLOR_HIGHLIGHT;
-            ctx.fillRect(sx, y + 3, ctx.measureText(text.slice(s0, s1)).width, h - 6);
-        }
-        ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
-        ctx.fillText(text, tx, y + h / 2);
-        if (s1 > s0) {
+            ctx.fillRect(sx, y + 3, ctx.measureText(sel).width, h - 6);
             ctx.fillStyle = COLOR_HIGHLIGHTTEXT;
-            ctx.fillText(text.slice(s0, s1), tx + ctx.measureText(text.slice(0, s0)).width, y + h / 2);
+            ctx.fillText(sel, sx, y + h / 2);
         } else {
-            ctx.fillStyle = COLOR_WINDOWTEXT;
+            ctx.fillStyle = colors.text;
             ctx.fillRect(Math.round(tx + caretPx), y + 3, 1, h - 6);
         }
         ctx.restore();
         ctx.textBaseline = 'top';
         return;
     }
-    ctx.fillStyle = disabled ? COLOR_GRAYTEXT : COLOR_WINDOWTEXT;
     if (multiline) {
         ctx.textBaseline = 'top';
         const lineHeight = 14;
@@ -830,11 +876,11 @@ function paintEdit(
         let ty = y + 4;
         for (const line of lines) {
             if (ty + lineHeight > y + h - 2) break;
-            ctx.fillText(line, x + 4, ty);
+            drawRun(line, x + 4, ty, ty, lineHeight, colors.text);
             ty += lineHeight;
         }
     } else {
-        ctx.fillText(text, x + 4, y + h / 2);
+        drawRun(text, x + 4, y + h / 2, y + 3, h - 6, colors.text);
     }
     ctx.restore();
     ctx.textBaseline = 'top';

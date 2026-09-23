@@ -77,7 +77,9 @@ export function isGameScreenOwned(): boolean {
  */
 export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     if (!win || !win.visible || win.pendingDestroy) return;
-    if (win.nativeClassName !== '#32770') return;
+    // Standard dialogs, and system controls the game creates straight on its fullscreen
+    // window (an EDIT for typed input): both are GDI windows drawn over the primary.
+    if (win.nativeClassName !== '#32770' && !win.isSystemControl) return;
     if (!isGameScreenOwned()) return;
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;

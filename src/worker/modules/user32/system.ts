@@ -29,20 +29,8 @@ import {
     noteLoadStringForDialog,
     windows,
     getAbsoluteWindowPosition,
+    sysColors,
 } from './shared-state';
-
-// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
-const sysColors = new Map<number, number>([
-    [0,  0xC0C0C0],  // COLOR_SCROLLBAR
-    [1,  0xC0DCC0],  // COLOR_BACKGROUND / COLOR_DESKTOP
-    [5,  0xFFFFFF],  // COLOR_WINDOW
-    [8,  0x000000],  // COLOR_WINDOWTEXT
-    [15, 0xC0C0C0],  // COLOR_BTNFACE
-    [16, 0x808080],  // COLOR_BTNSHADOW
-    [17, 0xFFFFFF],  // COLOR_GRAYTEXT (disabled text)
-    [18, 0x000080],  // COLOR_HIGHLIGHT
-    [19, 0xFFFFFF],  // COLOR_HIGHLIGHTTEXT
-]);
 
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
