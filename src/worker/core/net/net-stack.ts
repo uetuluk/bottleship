@@ -22,6 +22,7 @@ import {
     ICMP_ECHO_REPLY,
     ICMP_ECHO_REQUEST,
     NIC_PROTO_ICMP,
+    NIC_PROTO_IPX,
     NIC_PROTO_STREAM,
     NIC_PROTO_UDP,
     NIC_SF_ACK,
@@ -37,6 +38,10 @@ import { getVirtualNic, type NicDevice } from "./virtual-nic";
 
 export const SOCK_STREAM = 1;
 export const SOCK_DGRAM = 2;
+
+/** Address families a datagram socket can speak; each has its own port (IPX: socket) space. */
+export const FAMILY_INET = 2;
+export const FAMILY_IPX = 6;
 
 export const WSAEACCES = 10013;
 export const WSAEFAULT = 10014;
@@ -57,6 +62,13 @@ export const WSAESHUTDOWN = 10058;
 export const WSAECONNREFUSED = 10061;
 export const WSAEHOSTUNREACH = 10065;
 
+/** NetStack.selectState bits. */
+export const SELECT_DATA = 0x01;
+export const SELECT_PENDING = 0x02;
+export const SELECT_WRITABLE = 0x04;
+export const SELECT_CONNECTING = 0x08;
+export const SELECT_CLOSED = 0x10;
+
 /** Errors travel as negative codes so a single number can carry either a length or a failure. */
 export function isError(result: number): boolean {
     return result < 0;
@@ -68,6 +80,9 @@ const fail = (code: number): number => -code;
 
 const EPHEMERAL_MIN = 49152;
 const EPHEMERAL_MAX = 65535;
+/** Novell's dynamic socket range: what bind(socket 0) hands out on an IPX stack. */
+const IPX_DYNAMIC_MIN = 0x4000;
+const IPX_DYNAMIC_MAX = 0x7fff;
 /** Per-socket receive budget; a flooding peer fills its own queue and is dropped, not us. */
 const MAX_DGRAM_QUEUE = 512;
 const MAX_STREAM_BUFFER = 256 * 1024;
@@ -90,6 +105,12 @@ interface PendingConnection {
 interface Socket {
     id: number;
     type: number;
+    family: number;
+    /** The NIC protocol this socket's frames travel as; also keys its port namespace. */
+    wire: number;
+    /** IPX packet type stamped on sends, and the only type received while filtering (-1: all). */
+    ipxType: number;
+    ipxFilter: number;
     localPort: number;
     remoteHost: number;
     remotePort: number;
@@ -170,13 +191,20 @@ export class NetStack {
         this.nic.poll((header, payload) => this.deliver(header, payload));
     }
 
-    open(type: number): number {
+    /** Open a socket. IPX exists only as datagrams (SPX, its stream sibling, is not offered). */
+    open(type: number, family = FAMILY_INET): number {
         if (type !== SOCK_DGRAM && type !== SOCK_STREAM) return fail(WSAEAFNOSUPPORT);
+        if (family !== FAMILY_INET && family !== FAMILY_IPX) return fail(WSAEAFNOSUPPORT);
+        if (family === FAMILY_IPX && type !== SOCK_DGRAM) return fail(WSAEAFNOSUPPORT);
         if (this.sockets.size >= 1024) return fail(WSAEMFILE);
         const id = this.nextId++;
         this.sockets.set(id, {
             id,
             type,
+            family,
+            wire: family === FAMILY_IPX ? NIC_PROTO_IPX : type === SOCK_STREAM ? NIC_PROTO_STREAM : NIC_PROTO_UDP,
+            ipxType: 0,
+            ipxFilter: -1,
             localPort: 0,
             remoteHost: 0,
             remotePort: 0,
@@ -216,6 +244,14 @@ export class NetStack {
         return this.sockets.has(id);
     }
 
+    family(id: number): number {
+        return this.sockets.get(id)?.family ?? 0;
+    }
+
+    type(id: number): number {
+        return this.sockets.get(id)?.type ?? 0;
+    }
+
     // ─── addressing ──────────────────────────────────────────────────────────
 
     bind(id: number, port: number): number {
@@ -225,12 +261,12 @@ export class NetStack {
 
         const wanted = port & 0xffff;
         if (wanted === 0) {
-            const assigned = this.allocEphemeral(socket.type);
+            const assigned = this.allocEphemeral(socket.wire);
             if (assigned === 0) return fail(WSAEADDRINUSE);
             socket.localPort = assigned;
             return 0;
         }
-        if (!socket.reuseAddr && this.portTaken(socket.type, wanted)) return fail(WSAEADDRINUSE);
+        if (!socket.reuseAddr && this.portTaken(socket.wire, wanted)) return fail(WSAEADDRINUSE);
         socket.localPort = wanted;
         return 0;
     }
@@ -253,7 +289,7 @@ export class NetStack {
         if (socket.type !== SOCK_DGRAM) return fail(WSAEINVAL);
         if (!this.nic.linkUp) return fail(WSAENETDOWN);
         if (socket.localPort === 0) {
-            const assigned = this.allocEphemeral(socket.type);
+            const assigned = this.allocEphemeral(socket.wire);
             if (assigned === 0) return fail(WSAEADDRINUSE);
             socket.localPort = assigned;
         }
@@ -262,12 +298,12 @@ export class NetStack {
         if (host === VLAN_BROADCAST_HOST && !socket.broadcast) return fail(WSAEACCES);
 
         const header: NicHeader = {
-            proto: NIC_PROTO_UDP,
+            proto: socket.wire,
             src: this.nic.localHost,
             dst: host,
             srcPort: socket.localPort,
             dstPort: port & 0xffff,
-            flags: 0,
+            flags: socket.family === FAMILY_IPX ? socket.ipxType : 0,
             seq: 0,
         };
 
@@ -315,13 +351,13 @@ export class NetStack {
             // A connected datagram socket just pins the default destination.
             socket.remoteHost = host;
             socket.remotePort = port & 0xffff;
-            if (socket.localPort === 0) socket.localPort = this.allocEphemeral(socket.type);
+            if (socket.localPort === 0) socket.localPort = this.allocEphemeral(socket.wire);
             return 0;
         }
 
         if (socket.stream.state === "established") return fail(WSAEISCONN);
         if (socket.stream.state === "syn-sent") return fail(WSAEWOULDBLOCK);
-        if (socket.localPort === 0) socket.localPort = this.allocEphemeral(socket.type);
+        if (socket.localPort === 0) socket.localPort = this.allocEphemeral(socket.wire);
         socket.remoteHost = host;
         socket.remotePort = port & 0xffff;
         socket.stream.state = "syn-sent";
@@ -461,6 +497,33 @@ export class NetStack {
         return socket ? socket.stream.resetError !== 0 : false;
     }
 
+    /**
+     * Readiness as SELECT_* bits, or -1 when the socket is gone. One call and no allocation,
+     * because WSAAsyncSelect re-evaluates every registered socket on a short period.
+     */
+    selectState(id: number): number {
+        const socket = this.sockets.get(id);
+        if (!socket) return -1;
+        let bits = 0;
+        if (socket.type === SOCK_DGRAM) {
+            if (socket.queue.length > 0) bits |= SELECT_DATA;
+            if (this.nic.linkUp) bits |= SELECT_WRITABLE;
+            return bits;
+        }
+        const stream = socket.stream;
+        if (stream.bytes > 0) bits |= SELECT_DATA;
+        if (stream.state === "listen" && stream.pending.length > 0) bits |= SELECT_PENDING;
+        if (stream.state === "established" && this.nic.linkUp) bits |= SELECT_WRITABLE;
+        if (stream.state === "syn-sent") bits |= SELECT_CONNECTING;
+        if (stream.state === "peer-closed") bits |= SELECT_CLOSED;
+        return bits;
+    }
+
+    /** The error a failed or reset connection reports (SO_ERROR), 0 when there is none. */
+    socketError(id: number): number {
+        return this.sockets.get(id)?.stream.resetError ?? 0;
+    }
+
     /** FIONREAD: what a single recv can return — one datagram, or the whole stream buffer. */
     available(id: number): number {
         const socket = this.sockets.get(id);
@@ -486,6 +549,22 @@ export class NetStack {
 
     getBroadcast(id: number): boolean {
         return this.sockets.get(id)?.broadcast ?? false;
+    }
+
+    /** IPX_PTYPE: the packet type this socket stamps on what it sends. */
+    setIpxPacketType(id: number, type: number): void {
+        const socket = this.sockets.get(id);
+        if (socket) socket.ipxType = type & 0xff;
+    }
+
+    getIpxPacketType(id: number): number {
+        return this.sockets.get(id)?.ipxType ?? 0;
+    }
+
+    /** IPX_FILTERTYPE / IPX_STOPFILTERPTYPE: receive only one packet type, or all (-1). */
+    setIpxFilter(id: number, type: number): void {
+        const socket = this.sockets.get(id);
+        if (socket) socket.ipxFilter = type < 0 ? -1 : type & 0xff;
     }
 
     /** Send an echo request to a peer. Returns the sequence number to poll for a reply. */
@@ -519,7 +598,7 @@ export class NetStack {
         for (const socket of this.sockets.values()) {
             rows.push({
                 id: socket.id,
-                type: socket.type === SOCK_DGRAM ? "dgram" : "stream",
+                type: socket.family === FAMILY_IPX ? "ipx" : socket.type === SOCK_DGRAM ? "dgram" : "stream",
                 localPort: socket.localPort,
                 peer: socket.remoteHost ? `10.77.0.${socket.remoteHost}:${socket.remotePort}` : null,
                 state: socket.type === SOCK_STREAM ? socket.stream.state : "-",
@@ -541,7 +620,7 @@ export class NetStack {
             this.deliverEcho(header);
             return;
         }
-        if (header.proto === NIC_PROTO_UDP) {
+        if (header.proto === NIC_PROTO_UDP || header.proto === NIC_PROTO_IPX) {
             this.deliverDatagram(header, payload);
             return;
         }
@@ -578,20 +657,26 @@ export class NetStack {
     private deliverLocal(header: NicHeader, payload: Uint8Array, exceptSocket: number): void {
         for (const socket of this.sockets.values()) {
             if (socket.id === exceptSocket) continue;
-            if (socket.type !== SOCK_DGRAM || socket.localPort !== header.dstPort) continue;
+            if (!this.acceptsDatagram(socket, header)) continue;
             this.enqueue(socket, header.src, header.srcPort, payload);
         }
     }
 
     private deliverDatagram(header: NicHeader, payload: Uint8Array): void {
         for (const socket of this.sockets.values()) {
-            if (socket.type !== SOCK_DGRAM || socket.localPort !== header.dstPort) continue;
+            if (!this.acceptsDatagram(socket, header)) continue;
             // A connected datagram socket ignores traffic from anyone else, as Windows does.
             if (socket.remoteHost !== 0 && (socket.remoteHost !== header.src || socket.remotePort !== header.srcPort)) {
                 continue;
             }
             this.enqueue(socket, header.src, header.srcPort, payload);
         }
+    }
+
+    private acceptsDatagram(socket: Socket, header: NicHeader): boolean {
+        if (socket.type !== SOCK_DGRAM || socket.wire !== header.proto) return false;
+        if (socket.localPort !== header.dstPort) return false;
+        return socket.ipxFilter < 0 || socket.ipxFilter === header.flags;
     }
 
     private enqueue(socket: Socket, host: number, port: number, payload: Uint8Array): void {
@@ -736,18 +821,24 @@ export class NetStack {
         return this.scratch;
     }
 
-    private portTaken(type: number, port: number): boolean {
+    private portTaken(wire: number, port: number): boolean {
         for (const socket of this.sockets.values()) {
-            if (socket.type === type && socket.localPort === port) return true;
+            if (socket.wire === wire && socket.localPort === port) return true;
         }
         return false;
     }
 
-    private allocEphemeral(type: number): number {
+    private allocEphemeral(wire: number): number {
+        if (wire === NIC_PROTO_IPX) {
+            for (let port = IPX_DYNAMIC_MIN; port <= IPX_DYNAMIC_MAX; port++) {
+                if (!this.portTaken(wire, port)) return port;
+            }
+            return 0;
+        }
         for (let i = 0; i <= EPHEMERAL_MAX - EPHEMERAL_MIN; i++) {
             const port = this.nextEphemeral;
             this.nextEphemeral = this.nextEphemeral >= EPHEMERAL_MAX ? EPHEMERAL_MIN : this.nextEphemeral + 1;
-            if (!this.portTaken(type, port)) return port;
+            if (!this.portTaken(wire, port)) return port;
         }
         return 0;
     }

@@ -1125,6 +1125,12 @@ export function makeSocketExports(
             setLastError(0);
             return id;
         },
+        // Offline sockets never become ready, so there is nothing to notify.
+        WSAAsyncSelect: (_ctx, _mem, args) => {
+            if (!requireSocket(args[0] >>> 0)) return SOCKET_ERROR;
+            setLastError(0);
+            return 0;
+        },
     };
 
     const live = makeNetSocketExports(setLastError);

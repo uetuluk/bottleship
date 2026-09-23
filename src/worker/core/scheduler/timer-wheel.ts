@@ -25,7 +25,7 @@ export interface TimerEntry {
 
 /** Minimum timer resolution — prevents timer storms */
 const COALESCE_MS = 1;
-const TIMER_KIND_COUNT = TimerKind.QUARTZ_VIDEO + 1;
+const TIMER_KIND_COUNT = TimerKind.NET_POLL + 1;
 /**
  * Coarser floor for winmm timeSetEvent timers (TimerKind.WINMM_TIMER).
  *

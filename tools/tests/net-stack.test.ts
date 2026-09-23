@@ -8,6 +8,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+    FAMILY_IPX,
     NetStack,
     SOCK_DGRAM,
     SOCK_STREAM,
@@ -21,7 +22,15 @@ import {
     isError,
 } from "../../src/worker/core/net/net-stack";
 import type { FrameSink, NicDevice } from "../../src/worker/core/net/virtual-nic";
-import { VLAN_BROADCAST_HOST, hostToIp, type NicHeader } from "../../src/net/nic-contract";
+import {
+    AsyncSelect,
+    FD_ACCEPT,
+    FD_CLOSE,
+    FD_CONNECT,
+    FD_READ,
+    FD_WRITE,
+} from "../../src/worker/core/net/async-select";
+import { NIC_PROTO_IPX, NIC_PROTO_UDP, VLAN_BROADCAST_HOST, hostToIp, type NicHeader } from "../../src/net/nic-contract";
 
 /** Stands in for the router: routes by destination octet, never looks at a payload. */
 class Switch {
@@ -463,5 +472,235 @@ describe("link state", () => {
         a.stack.sendTo(sender, 2, 2300, text("678"));
         b.stack.pump();
         expect(b.stack.available(receiver)).toBe(5);   // the first datagram, not the total
+    });
+});
+
+describe("IPX datagram sockets", () => {
+    test("carries a broadcast to every guest's socket of that number, stamped with the packet type", () => {
+        const { wire, a, b } = makePair();
+        const seen: NicHeader[] = [];
+        const forward = wire.forward.bind(wire);
+        wire.forward = (from, header, payload) => {
+            seen.push(header);
+            forward(from, header, payload);
+        };
+        const sender = a.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        const receiver = b.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        a.stack.setIpxPacketType(sender, 4);
+        a.stack.setBroadcast(sender, true);
+        expect(a.stack.bind(sender, 0x5000)).toBe(0);
+        expect(b.stack.bind(receiver, 0x5000)).toBe(0);
+
+        expect(a.stack.sendTo(sender, VLAN_BROADCAST_HOST, 0x5000, text("game"))).toBe(4);
+        b.stack.pump();
+
+        expect(seen[0]!.proto).toBe(NIC_PROTO_IPX);
+        expect(seen[0]!.flags).toBe(4);
+        const result = b.stack.recvFrom(receiver, new Uint8Array(16));
+        if (typeof result === "number") throw new Error("expected a datagram");
+        expect(result.host).toBe(1);
+        expect(result.port).toBe(0x5000);
+    });
+
+    test("keeps IPX socket numbers apart from UDP ports", () => {
+        const { a, b } = makePair();
+        const ipx = b.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        const udp = b.stack.open(SOCK_DGRAM);
+        expect(b.stack.bind(ipx, 2300)).toBe(0);
+        expect(b.stack.bind(udp, 2300)).toBe(0);
+
+        const sender = a.stack.open(SOCK_DGRAM);
+        a.stack.sendTo(sender, 2, 2300, bytes(1));
+        b.stack.pump();
+        expect(b.stack.readable(udp)).toBe(true);
+        expect(b.stack.readable(ipx)).toBe(false);
+    });
+
+    test("hands out dynamic socket numbers from Novell's 0x4000-0x7FFF range", () => {
+        const { a } = makePair();
+        const first = a.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        const second = a.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        a.stack.bind(first, 0);
+        a.stack.bind(second, 0);
+        expect(a.stack.localPort(first)).toBe(0x4000);
+        expect(a.stack.localPort(second)).toBe(0x4001);
+    });
+
+    test("IPX_FILTERTYPE admits only the filtered packet type until it is stopped", () => {
+        const { a, b } = makePair();
+        const sender = a.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        const receiver = b.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        b.stack.bind(receiver, 0x4545);
+        b.stack.setIpxFilter(receiver, 4);
+
+        a.stack.setIpxPacketType(sender, 0);
+        a.stack.sendTo(sender, 2, 0x4545, bytes(0));
+        a.stack.setIpxPacketType(sender, 4);
+        a.stack.sendTo(sender, 2, 0x4545, bytes(4));
+        b.stack.pump();
+        expect(b.stack.available(receiver)).toBe(1);
+        const out = new Uint8Array(1);
+        b.stack.recvFrom(receiver, out);
+        expect(out[0]).toBe(4);
+        expect(b.stack.readable(receiver)).toBe(false);
+
+        b.stack.setIpxFilter(receiver, -1);
+        a.stack.setIpxPacketType(sender, 0);
+        a.stack.sendTo(sender, 2, 0x4545, bytes(0));
+        b.stack.pump();
+        expect(b.stack.readable(receiver)).toBe(true);
+    });
+
+    test("refuses an IPX stream socket: SPX is not offered", () => {
+        const { a } = makePair();
+        expect(errorOf(a.stack.open(SOCK_STREAM, FAMILY_IPX))).toBe(10047);
+    });
+
+    test("an IPX socket never receives UDP traffic for the same number", () => {
+        const { a, b } = makePair();
+        const receiver = b.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        b.stack.bind(receiver, 0x5000);
+        b.nic.inbound.push({
+            header: { proto: NIC_PROTO_UDP, src: 1, dst: 2, srcPort: 1, dstPort: 0x5000, flags: 0, seq: 0 },
+            payload: bytes(1),
+        });
+        b.stack.pump();
+        expect(b.stack.readable(receiver)).toBe(false);
+        void a;
+    });
+});
+
+describe("WSAAsyncSelect event record", () => {
+    const WM_SOCKET = 0x0400 + 115;
+    const HWND = 0x10001;
+
+    function recorder(stack: NetStack) {
+        const posted: Array<{ socket: number; event: number; error: number }> = [];
+        const select = new AsyncSelect(stack, (hwnd, msg, socket, lParam) => {
+            expect(hwnd).toBe(HWND);
+            expect(msg).toBe(WM_SOCKET);
+            posted.push({ socket, event: lParam & 0xffff, error: lParam >>> 16 });
+        });
+        return { posted, select };
+    }
+
+    test("a bound datagram socket is reported writable once, on registration", () => {
+        const { a } = makePair();
+        const socket = a.stack.open(SOCK_DGRAM, FAMILY_IPX);
+        a.stack.bind(socket, 0x5000);
+        const { posted, select } = recorder(a.stack);
+        select.select(socket, HWND, WM_SOCKET, FD_READ | FD_WRITE);
+        select.poll();
+        select.poll();
+        expect(posted).toEqual([{ socket, event: FD_WRITE, error: 0 }]);
+    });
+
+    test("FD_READ posts once per arrival burst and again after each re-enabling read while data remains", () => {
+        const { a, b } = makePair();
+        const receiver = b.stack.open(SOCK_DGRAM);
+        b.stack.bind(receiver, 2300);
+        const { posted, select } = recorder(b.stack);
+        select.select(receiver, HWND, WM_SOCKET, FD_READ);
+
+        const sender = a.stack.open(SOCK_DGRAM);
+        a.stack.sendTo(sender, 2, 2300, bytes(1));
+        a.stack.sendTo(sender, 2, 2300, bytes(2));
+        b.stack.pump();
+        select.poll();
+        select.poll();
+        expect(posted.map((p) => p.event)).toEqual([FD_READ]);
+
+        // recvfrom re-enables; one datagram is still queued, so FD_READ posts again at once.
+        b.stack.recvFrom(receiver, new Uint8Array(8));
+        select.reenable(receiver, FD_READ);
+        expect(posted.map((p) => p.event)).toEqual([FD_READ, FD_READ]);
+
+        // The last read empties the queue: re-enabled, but nothing to report until new data.
+        b.stack.recvFrom(receiver, new Uint8Array(8));
+        select.reenable(receiver, FD_READ);
+        select.poll();
+        expect(posted.length).toBe(2);
+        a.stack.sendTo(sender, 2, 2300, bytes(3));
+        b.stack.pump();
+        select.poll();
+        expect(posted.length).toBe(3);
+    });
+
+    test("FD_WRITE comes back only after a send failed with WSAEWOULDBLOCK", () => {
+        const { a } = makePair();
+        const socket = a.stack.open(SOCK_DGRAM);
+        a.stack.bind(socket, 2300);
+        const { posted, select } = recorder(a.stack);
+        select.select(socket, HWND, WM_SOCKET, FD_WRITE);
+        select.poll();
+        expect(posted.length).toBe(1);
+
+        a.nic.sendFails = true;
+        expect(errorOf(a.stack.sendTo(socket, 2, 2300, bytes(1)))).toBe(WSAEWOULDBLOCK);
+        a.nic.sendFails = false;
+        select.reenable(socket, FD_WRITE);
+        expect(posted.map((p) => p.event)).toEqual([FD_WRITE, FD_WRITE]);
+    });
+
+    test("stream sockets report FD_ACCEPT, FD_CONNECT then FD_CLOSE once the data before it is read", () => {
+        const { a, b } = makePair();
+        const listener = b.stack.open(SOCK_STREAM);
+        b.stack.bind(listener, 4000);
+        b.stack.listen(listener, 5);
+        const server = recorder(b.stack);
+        server.select.select(listener, HWND, WM_SOCKET, FD_ACCEPT | FD_READ | FD_CLOSE);
+
+        const client = a.stack.open(SOCK_STREAM);
+        const clientSide = recorder(a.stack);
+        clientSide.select.select(client, HWND, WM_SOCKET, FD_CONNECT | FD_WRITE | FD_READ | FD_CLOSE);
+        a.stack.connect(client, 2, 4000);
+        clientSide.select.reenable(client, FD_CONNECT | FD_WRITE);
+        b.stack.pump();
+        server.select.poll();
+        expect(server.posted.map((p) => p.event)).toEqual([FD_ACCEPT]);
+
+        a.stack.pump();
+        clientSide.select.poll();
+        expect(clientSide.posted.map((p) => p.event)).toEqual([FD_CONNECT, FD_WRITE]);
+
+        const accepted = b.stack.accept(listener);
+        if (typeof accepted === "number") throw new Error("expected a connection");
+        server.select.inherit(listener, accepted.id);
+        b.stack.send(accepted.id, text("bye"));
+        b.stack.close(accepted.id);
+        a.stack.pump();
+        clientSide.select.poll();
+        // Data first; FD_CLOSE waits until the guest has drained it.
+        expect(clientSide.posted.map((p) => p.event)).toEqual([FD_CONNECT, FD_WRITE, FD_READ]);
+        a.stack.recv(client, new Uint8Array(8));
+        clientSide.select.reenable(client, FD_READ);
+        clientSide.select.poll();
+        clientSide.select.poll();
+        expect(clientSide.posted.map((p) => p.event)).toEqual([FD_CONNECT, FD_WRITE, FD_READ, FD_CLOSE]);
+    });
+
+    test("a refused connect reports its error through FD_CONNECT and never FD_CLOSE", () => {
+        const { a, b } = makePair();
+        const client = a.stack.open(SOCK_STREAM);
+        const { posted, select } = recorder(a.stack);
+        select.select(client, HWND, WM_SOCKET, FD_CONNECT | FD_CLOSE);
+        a.stack.connect(client, 2, 4999);
+        select.reenable(client, FD_CONNECT);
+        b.stack.pump();
+        a.stack.pump();
+        select.poll();
+        select.poll();
+        expect(posted).toEqual([{ socket: client, event: FD_CONNECT, error: WSAECONNREFUSED }]);
+    });
+
+    test("events 0 cancels the registration", () => {
+        const { a } = makePair();
+        const socket = a.stack.open(SOCK_DGRAM);
+        a.stack.bind(socket, 2300);
+        const { posted, select } = recorder(a.stack);
+        select.select(socket, HWND, WM_SOCKET, 0);
+        select.poll();
+        expect(posted.length).toBe(0);
+        expect(select.active).toBe(false);
     });
 });
