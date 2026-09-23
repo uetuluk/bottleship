@@ -344,7 +344,7 @@ export function registerStateCommands(svc: HarnessService): void {
     /** silentStubs() — shorthand for apiCensus(true): only the called methods flagged
      *  as likely silent stubs (the "pretend to work" handlers). */
     svc.register("silentStubs", () => apiCensus.suspectStubs().map((s) => ({
-        api: s.name, count: s.count, arity: s.arity,
+        api: s.name, count: s.count, arity: s.arity, notImpl: s.notImpl,
         lastCaller: "0x" + s.lastCaller.toString(16), lastCallerSym: symbolize(s.lastCaller),
     })));
 

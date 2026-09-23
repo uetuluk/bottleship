@@ -18,6 +18,8 @@
  *                (the `() => D3D_OK` pattern). Strong auto-signal, zero annotation.
  *   - curated  : SILENT_STUBS holds keys for handlers that DECLARE (ctx,mem,args)
  *                but still don't do the work (can't be caught by arity). Add as found.
+ *   - E_NOTIMPL: a handler that returned E_NOTIMPL says so itself; the caller usually
+ *                treats it as a plain failure and bails quietly (an error box, no write).
  *
  * Zero-alloc on the hot repeat: a repeated call just bumps a counter. Recording is a
  * single Map lookup on the thunk hot path — same cost class as the WinAPI ring.
@@ -29,8 +31,10 @@ export interface ApiCallRecord {
     count: number;
     /** Declared parameter count of the JS handler (0 ⇒ ignores ctx/mem/args). */
     arity: number;
-    /** True if flagged a likely silent stub (arity 0 or curated). */
+    /** True if flagged a likely silent stub (arity 0, curated, or returned E_NOTIMPL). */
     suspectStub: boolean;
+    /** The handler returned E_NOTIMPL at least once. */
+    notImpl: boolean;
     firstCaller: number;
     lastCaller: number;
     /** Monotonic sequence of the last hit (ordering only; no Date/time on the hot path). */
@@ -68,10 +72,17 @@ class ApiCensus {
             count: 1,
             arity: arity | 0,
             suspectStub: arity === 0 || SILENT_STUBS.has(name),
+            notImpl: false,
             firstCaller: caller >>> 0,
             lastCaller: caller >>> 0,
             lastSeq: ++this.seq,
         });
+    }
+
+    /** The sync result of `name` was E_NOTIMPL (called right after record()). */
+    noteNotImplemented(name: string): void {
+        const rec = this.map.get(name);
+        if (rec) rec.suspectStub = rec.notImpl = true;
     }
 
     /** All recorded calls, most-recently-hit first. */

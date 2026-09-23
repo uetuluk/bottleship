@@ -163,6 +163,8 @@ interface SehDispatchContext {
 // Configuration
 const MAX_THUNK_ID = 65536; // Adjust based on your max expected ID
 const DEFAULT_ARGS_COUNT = 16;
+/** HRESULT a handler returns to say "not implemented" — surfaced by the API census. */
+const E_NOTIMPL_HRESULT = 0x80004001;
 const SPIN_LOOP_ADDR_DEFAULT = 0x01F80000;
 
 // Memory region constants for validation (fail-fast diagnostics)
@@ -1627,6 +1629,8 @@ export class ThunkDispatcher {
             const dur = frameProfiler.endTimer("thunk", thunkStart);
             if ((this.thunkCount & 0xF) === 0) frameProfiler.recordThunk(thunkName, dur * 16);
             frameProfiler.markThunkEnd();
+            const syncValue = typeof result === 'number' ? result : (result as ThunkResult | undefined)?.value;
+            if (syncValue !== undefined && (syncValue >>> 0) === E_NOTIMPL_HRESULT) apiCensus.noteNotImplemented(thunkName);
             this._handleSyncResult(result, functionId, thunkName, cpu, this.reusableContext, argCount, espAtEntry);
 
             // Sync virtual time with wall-clock after each sync thunk.
