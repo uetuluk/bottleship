@@ -176,6 +176,7 @@ export class Mem {
         return mem[address]!;
     }
 
+    /** A live view of guest memory, not a copy: slice() anything kept past the current thunk. */
     static readBytes(address: number, length: number): Uint8Array | null {
         const mem = this.ensure(address, length, "r", "Mem.readBytes", "read");
         if (!mem) return null;

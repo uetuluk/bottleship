@@ -58,6 +58,8 @@ net.disconnect()
 | `harness().net()` | Is the link up, what is our address, how many frames moved, is the ring dropping? |
 | `harness().netSockets()` | What has the guest actually bound, and is anything readable it is not reading? |
 | `bun tools/net-loopback.ts [router]` | Does the whole chain work — two guests, real stack, real router — outside the browser? |
+| `harness().call("dplay")` | Per DirectPlay object: provider connected, sessions enumeration found, open session, peers, roster, queued messages |
+| `bun tools/dplay-peer.ts <room> --host/--enum/--join` | A headless DirectPlay host, enumerator or joiner to test a guest's DirectPlay against |
 
 `netPing()` is the call that separates "the link is broken" from "the game is not using it":
 it is answered by the peer's stack, not by any game, so it works before a socket is opened.
@@ -81,11 +83,30 @@ so the problem is above the device, in the game's own network code or in Winsock
   through the async-thunk path (CLAUDE.md §3.5) is the faithful fix.
 - **`WSAAsyncSelect` posts no events.** It is accepted and ignored, so a game that relies on
   `FD_READ` window messages rather than polling will not see traffic.
-- **DirectPlay is not on the NIC yet.** `dplayx` still uses its local loopback message queue,
-  so DirectPlay titles do not cross the network even with a link up. It is the next layer to
-  re-home onto the device, which is why the router forwards opaque frames and does not parse
-  payloads.
 - **Streams are not TCP.** The link under them delivers reliably and in order, so connection
   setup and teardown are implemented and retransmission, windowing and congestion control are
   not. The one place ordering can break — a stream switching between relay and direct path —
   is handled by a sequence number and a small reorder window.
+
+## DirectPlay
+
+`dplayx` carries DirectPlay over the same device, as its TCP/IP service provider
+(`src/worker/modules/dplayx/`): `dplay-wire.ts` is the MS-DPDX framing, `dplay-sp.ts` the
+session engine (name server, roster, message queue) and `directplay4.ts` the `IDirectPlay4A`
+marshalling. Each DirectPlay object is an independent peer.
+
+- **Discovery.** A host's name server answers `EnumSessions` on UDP 47624; enumeration
+  broadcasts to the room, or unicasts when the connection carries a `DPAID_INet` address.
+  `DPENUMSESSIONS_ASYNC` returns the cache and re-polls; a synchronous enumeration parks the
+  calling thread for the timeout through the async-thunk path.
+- **Sessions.** Peer-to-peer, as DirectPlay's default: the host admits joiners and hands out
+  slots, then every peer talks to every other directly on one socket in 2300–2400.
+  `Open(DPOPEN_JOIN)` parks the caller until the host answers (or returns `DPERR_CONNECTING`
+  under `DPOPEN_RETURNSTATUS`).
+- **Messages.** Anything past the 1400-byte MTU is fragmented with `DPSP_MSG_PACKET` and
+  reassembled in any order. A full transmit ring defers datagrams in order rather than dropping
+  them; there is no retransmission, because the link below is reliable.
+- **Limits.** No host migration: a host leaving (or vanishing from the room) ends the session
+  with `DPSYS_SESSIONLOST`. Lobby launching, secure sessions, chat and group-in-group
+  membership are not implemented. EnumConnections lists only the TCP/IP provider; a game that
+  initializes another provider's GUID gets the same LAN transport.
