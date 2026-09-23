@@ -41,6 +41,9 @@ export const ole32Module: ModuleDescriptor = {
         // Storage
         makeFunc("StgCreateDocfile", 4),
         makeFunc("StgOpenStorage", 6),
+        makeFunc("StgIsStorageFile", 1),
+        makeFunc("WriteClassStm", 2),
+        makeFunc("ReadClassStm", 2),
         // Time
         makeFunc("CoFileTimeNow", 1),
         // String/GUID
