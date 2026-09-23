@@ -78,76 +78,183 @@ export interface InnoHeader {
     uninstallDisplaySize: bigint;
 }
 
+/**
+ * Header option bits — innoextract setup/header.hpp FLAGS(flags, ...) order. Live flags
+ * occupy 0-51, obsolete ones 52-64; an obsolete flag still has to be READ in the versions
+ * that stored it or every later flag (and the stream position after them) shifts.
+ */
+export const HeaderOption = {
+    DisableStartupPrompt: 0,
+    CreateAppDir: 1,
+    AllowNoIcons: 2,
+    AlwaysRestart: 3,
+    AlwaysUsePersonalGroup: 4,
+    WindowVisible: 5,
+    WindowShowCaption: 6,
+    WindowResizable: 7,
+    WindowStartMaximized: 8,
+    EnableDirDoesntExistWarning: 9,
+    Password: 10,
+    AllowRootDirectory: 11,
+    DisableFinishedPage: 12,
+    ChangesAssociations: 13,
+    UsePreviousAppDir: 14,
+    BackColorHorizontal: 15,
+    UsePreviousGroup: 16,
+    UpdateUninstallLogAppName: 17,
+    UsePreviousSetupType: 18,
+    DisableReadyMemo: 19,
+    AlwaysShowComponentsList: 20,
+    FlatComponentsList: 21,
+    ShowComponentSizes: 22,
+    UsePreviousTasks: 23,
+    DisableReadyPage: 24,
+    AlwaysShowDirOnReadyPage: 25,
+    AlwaysShowGroupOnReadyPage: 26,
+    AllowUNCPath: 27,
+    UserInfoPage: 28,
+    UsePreviousUserInfo: 29,
+    UninstallRestartComputer: 30,
+    RestartIfNeededByRun: 31,
+    ShowTasksTreeLines: 32,
+    AllowCancelDuringInstall: 33,
+    WizardImageStretch: 34,
+    AppendDefaultDirName: 35,
+    AppendDefaultGroupName: 36,
+    EncryptionUsed: 37,
+    ChangesEnvironment: 38,
+    ShowUndisplayableLanguages: 39,
+    SetupLogging: 40,
+    SignedUninstaller: 41,
+    UsePreviousLanguage: 42,
+    DisableWelcomePage: 43,
+    CloseApplications: 44,
+    RestartApplications: 45,
+    AllowNetworkDrive: 46,
+    ForceCloseApplications: 47,
+    AppNameHasConsts: 48,
+    UsePreviousPrivileges: 49,
+    WizardResizable: 50,
+    UninstallLogging: 51,
+    // Obsolete
+    Uninstallable: 52,
+    DisableDirPage: 53,
+    DisableProgramGroupPage: 54,
+    DisableAppendDir: 55,
+    AdminPrivilegesRequired: 56,
+    AlwaysCreateUninstallIcon: 57,
+    CreateUninstallRegKey: 58,
+    BzipUsed: 59,
+    ShowLanguageDialog: 60,
+    DetectLanguageUsingLocale: 61,
+    DisableDirExistsWarning: 62,
+    BackSolid: 63,
+    OverwriteUninstRegEntries: 64,
+} as const;
+
+/** Test one {@link HeaderOption} bit — `&` is 32-bit in JS, these go past bit 31. */
+export function hasHeaderOption(options: number, bit: number): boolean {
+    if (bit < 32) return (options & (1 << bit)) !== 0;
+    return Math.floor(options / 2 ** bit) % 2 === 1;
+}
+
+/** header.cpp:569-733 — the flag ladder, in stored order. */
 function loadFlags(r: BinaryReader, version: InnoVersion): number {
-    const padBits = version.bits();
-    const fr = r.storedFlagReader(padBits);
-    let options = 0;
-    const bit = (i: number) => 1 << i;
-    const add = (i: number, cond = true) => {
-        if (!cond) return;
-        fr.add(bit(i));
-    };
-    // header.hpp:51-104 + header.cpp:569-733
-    add(0); // DisableStartupPrompt
-    add(1); // CreateAppDir
-    add(2); // AllowNoIcons
-    add(3, version.atLeast(3, 0, 3)); // AlwaysRestart
-    add(4); // AlwaysUsePersonalGroup
-    if (version.value < INNO_VERSION_EXT(6, 4, 0, 1)) {
-        add(5);
-        add(6);
-        add(7);
-        add(8);
+    const fr = r.storedFlagReader(version.bits());
+    const F = HeaderOption;
+    let preset = 0;
+    const under = (a: number, b: number, c: number, d = 0) => version.value < INNO_VERSION_EXT(a, b, c, d);
+
+    fr.addBit(F.DisableStartupPrompt);
+    if (under(5, 3, 10)) fr.addBit(F.Uninstallable);
+    fr.addBit(F.CreateAppDir);
+    if (under(5, 3, 3)) fr.addBit(F.DisableDirPage);
+    if (under(1, 3, 6)) fr.addBit(F.DisableDirExistsWarning);
+    if (under(5, 3, 3)) fr.addBit(F.DisableProgramGroupPage);
+    fr.addBit(F.AllowNoIcons);
+    if (under(3, 0, 0) || version.atLeast(3, 0, 3)) fr.addBit(F.AlwaysRestart);
+    if (under(1, 3, 3)) fr.addBit(F.BackSolid);
+    fr.addBit(F.AlwaysUsePersonalGroup);
+    if (under(6, 4, 0, 1)) {
+        fr.addBit(F.WindowVisible);
+        fr.addBit(F.WindowShowCaption);
+        fr.addBit(F.WindowResizable);
+        fr.addBit(F.WindowStartMaximized);
     }
-    add(9); // EnableDirDoesntExistWarning
-    add(10); // Password
-    add(11, version.atLeast(1, 2, 6));
-    add(12, version.atLeast(1, 2, 14));
-    add(13, version.bits() !== 16 && version.value < INNO_VERSION_EXT(5, 6, 1, 0));
-    add(14, version.atLeast(1, 3, 1));
-    add(15, version.atLeast(1, 3, 3) && version.value < INNO_VERSION_EXT(6, 4, 0, 1));
-    add(16, version.atLeast(1, 3, 10));
-    add(17, version.atLeast(1, 3, 20));
-    add(18, version.atLeast(2, 0, 0));
-    if (version.atLeast(2, 0, 0)) for (let i = 19; i <= 24; i++) add(i);
+    fr.addBit(F.EnableDirDoesntExistWarning);
+    if (under(4, 1, 2)) fr.addBit(F.DisableAppendDir);
+    fr.addBit(F.Password);
+    if (version.atLeast(1, 2, 6)) fr.addBit(F.AllowRootDirectory);
+    if (version.atLeast(1, 2, 14)) fr.addBit(F.DisableFinishedPage);
+    if (version.bits() !== 16) {
+        if (under(3, 0, 4)) fr.addBit(F.AdminPrivilegesRequired);
+        if (under(3, 0, 0)) fr.addBit(F.AlwaysCreateUninstallIcon);
+        if (under(1, 3, 6)) fr.addBit(F.OverwriteUninstRegEntries);
+        if (under(5, 6, 1)) fr.addBit(F.ChangesAssociations);
+    }
+    if (version.atLeast(1, 3, 0) && under(5, 3, 8)) fr.addBit(F.CreateUninstallRegKey);
+    if (version.atLeast(1, 3, 1)) fr.addBit(F.UsePreviousAppDir);
+    if (version.atLeast(1, 3, 3) && under(6, 4, 0, 1)) fr.addBit(F.BackColorHorizontal);
+    if (version.atLeast(1, 3, 10)) fr.addBit(F.UsePreviousGroup);
+    if (version.atLeast(1, 3, 20)) fr.addBit(F.UpdateUninstallLogAppName);
+    if (version.atLeast(2, 0, 0) || (version.isIsx() && version.atLeast(1, 3, 10))) {
+        fr.addBit(F.UsePreviousSetupType);
+    }
+    if (version.atLeast(2, 0, 0)) {
+        fr.addBit(F.DisableReadyMemo);
+        fr.addBit(F.AlwaysShowComponentsList);
+        fr.addBit(F.FlatComponentsList);
+        fr.addBit(F.ShowComponentSizes);
+        fr.addBit(F.UsePreviousTasks);
+        fr.addBit(F.DisableReadyPage);
+    }
     if (version.atLeast(2, 0, 7)) {
-        add(25);
-        add(26);
+        fr.addBit(F.AlwaysShowDirOnReadyPage);
+        fr.addBit(F.AlwaysShowGroupOnReadyPage);
     }
-    add(27, version.atLeast(2, 0, 18));
+    if (version.atLeast(2, 0, 17) && under(4, 1, 5)) fr.addBit(F.BzipUsed);
+    if (version.atLeast(2, 0, 18)) fr.addBit(F.AllowUNCPath);
     if (version.atLeast(3, 0, 0)) {
-        add(28);
-        add(29);
+        fr.addBit(F.UserInfoPage);
+        fr.addBit(F.UsePreviousUserInfo);
     }
-    add(30, version.atLeast(3, 0, 1));
-    add(31, version.atLeast(3, 0, 3));
-    add(32, version.atLeast(4, 0, 0));
-    if (version.atLeast(4, 0, 9)) add(33);
-    else options |= bit(33);
-    add(34, version.atLeast(4, 1, 3));
+    if (version.atLeast(3, 0, 1)) fr.addBit(F.UninstallRestartComputer);
+    if (version.atLeast(3, 0, 3)) fr.addBit(F.RestartIfNeededByRun);
+    if (version.atLeast(4, 0, 0) || (version.isIsx() && version.atLeast(3, 0, 3))) {
+        fr.addBit(F.ShowTasksTreeLines);
+    }
+    if (version.atLeast(4, 0, 0) && under(4, 0, 10)) fr.addBit(F.ShowLanguageDialog);
+    if (version.atLeast(4, 0, 1) && under(4, 0, 10)) fr.addBit(F.DetectLanguageUsingLocale);
+    if (version.atLeast(4, 0, 9)) fr.addBit(F.AllowCancelDuringInstall);
+    else preset += 2 ** F.AllowCancelDuringInstall;
+    if (version.atLeast(4, 1, 3)) fr.addBit(F.WizardImageStretch);
     if (version.atLeast(4, 1, 8)) {
-        add(35);
-        add(36);
+        fr.addBit(F.AppendDefaultDirName);
+        fr.addBit(F.AppendDefaultGroupName);
     }
-    add(37, version.atLeast(4, 2, 2));
-    add(40, version.atLeast(5, 1, 13));
-    add(41, version.atLeast(5, 2, 1));
-    add(42, version.atLeast(5, 3, 8));
-    add(43, version.atLeast(5, 3, 9));
+    if (version.atLeast(4, 2, 2)) fr.addBit(F.EncryptionUsed);
+    if (version.atLeast(5, 0, 4) && under(5, 6, 1)) fr.addBit(F.ChangesEnvironment);
+    if (version.atLeast(5, 1, 7) && !version.isUnicode()) fr.addBit(F.ShowUndisplayableLanguages);
+    if (version.atLeast(5, 1, 13)) fr.addBit(F.SetupLogging);
+    if (version.atLeast(5, 2, 1)) fr.addBit(F.SignedUninstaller);
+    if (version.atLeast(5, 3, 8)) fr.addBit(F.UsePreviousLanguage);
+    if (version.atLeast(5, 3, 9)) fr.addBit(F.DisableWelcomePage);
     if (version.atLeast(5, 5, 0)) {
-        add(44);
-        add(45);
-        add(46);
-    } else options |= bit(46);
-    add(47, version.atLeast(5, 5, 7));
-    if (version.atLeast(6, 0, 0)) {
-        add(48);
-        add(49);
-        add(50);
+        fr.addBit(F.CloseApplications);
+        fr.addBit(F.RestartApplications);
+        fr.addBit(F.AllowNetworkDrive);
+    } else {
+        preset += 2 ** F.AllowNetworkDrive;
     }
-    add(51, version.atLeast(6, 3, 0));
-    options |= fr.finalize();
-    return options;
+    if (version.atLeast(5, 5, 7)) fr.addBit(F.ForceCloseApplications);
+    if (version.atLeast(6, 0, 0)) {
+        fr.addBit(F.AppNameHasConsts);
+        fr.addBit(F.UsePreviousPrivileges);
+        fr.addBit(F.WizardResizable);
+    }
+    if (version.atLeast(6, 3, 0)) fr.addBit(F.UninstallLogging);
+
+    return preset + fr.finalize();
 }
 
 export function loadHeader(r: BinaryReader, version: InnoVersion, codepage: number): InnoHeader {
@@ -210,8 +317,7 @@ export function loadHeader(r: BinaryReader, version: InnoVersion, codepage: numb
     if (version.atLeast(5, 2, 1) && version.value < INNO_VERSION_EXT(5, 3, 10, 0)) r.encodedString(cp);
     if (version.atLeast(5, 2, 5)) compiledCode = r.encodedString(cp);
     if (version.atLeast(2, 0, 6) && !version.isUnicode()) {
-        r.readBytes(32);
-        if (bits === 32) r.u8();
+        r.readBytes(32); // LeadBytes: Delphi `set of AnsiChar` — 256 bits, exactly 32 bytes
     }
     const languageCount = version.atLeast(4, 0, 0) ? r.u32() : version.atLeast(2, 0, 1) ? 1 : 0;
     const messageCount = version.atLeast(4, 2, 1) ? r.u32() : 0;
@@ -275,11 +381,19 @@ export function loadHeader(r: BinaryReader, version: InnoVersion, codepage: numb
         r.storedEnum([0, 1, 2], 0);
         r.storedEnum([0, 1, 2], 0);
     }
-    let compression: number = CompressionMethod.LZMA2;
-    if (version.atLeast(5, 3, 9)) compression = r.storedEnum([0, 1, 2, 3, 4, 5], 0);
-    else if (version.atLeast(4, 2, 6)) compression = r.storedEnum([0, 1, 2, 3, 4], 0);
-    else if (version.atLeast(4, 2, 5)) compression = r.storedEnum([0, 1, 2, 3], 0);
-    else if (version.atLeast(4, 1, 5)) compression = r.storedEnum([0, 1, 2, 3], 0);
+    // header.cpp stored_compression_method_{0..3} — a stored index means a DIFFERENT
+    // method per version ladder; only the 4.2.6+ maps happen to be the identity.
+    const M = CompressionMethod;
+    let compression: number = M.LZMA2;
+    if (version.atLeast(5, 3, 9)) {
+        compression = r.storedEnum([M.Stored, M.Zlib, M.BZip2, M.LZMA1, M.LZMA2], M.Unknown);
+    } else if (version.atLeast(4, 2, 6)) {
+        compression = r.storedEnum([M.Stored, M.Zlib, M.BZip2, M.LZMA1], M.Unknown);
+    } else if (version.atLeast(4, 2, 5)) {
+        compression = r.storedEnum([M.Stored, M.BZip2, M.LZMA1], M.Unknown);
+    } else if (version.atLeast(4, 1, 5)) {
+        compression = r.storedEnum([M.Zlib, M.BZip2, M.LZMA1], M.Unknown);
+    }
     if (version.atLeast(6, 3, 0)) {
         /* expr */
     } else if (version.atLeast(5, 6, 0)) {
@@ -367,5 +481,5 @@ export function loadHeader(r: BinaryReader, version: InnoVersion, codepage: numb
 }
 
 export function encryptionUsed(options: number): boolean {
-    return (options & (1 << 37)) !== 0; // header.hpp: EncryptionUsed
+    return hasHeaderOption(options, HeaderOption.EncryptionUsed);
 }

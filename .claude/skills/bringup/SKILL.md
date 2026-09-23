@@ -23,6 +23,12 @@ Launches/attaches Chrome with `--autoplay-policy=no-user-gesture-required` (so
 up first: `bun run dev` and `bun run dev:logs` (start the log
 server BEFORE streaming). `bun tools/harness.ts health` re-probes.
 
+In a git worktree, verify `vendor/v86` is populated before starting Vite. An empty
+submodule leaves the page visible but prevents the worker from loading (`Failed to
+resolve import "v86"`). Initialize the submodule normally; if using a local checkout
+for development, keep the `vendor/v86` directory real and link its contents, excluding
+`.git`. Symlinking the submodule root makes Git reject worktree status operations.
+
 ## 2. Drive
 
 A fluent chain (`bun tools/harness.ts run <script.harness.ts>`, or in the browser

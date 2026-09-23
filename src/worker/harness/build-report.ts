@@ -34,7 +34,7 @@ export interface HarnessReport {
     backtrace: Array<{ i: number; ret: string; sym: string | null; isThunk: boolean }>;
     lastThunks: string[];
     stubs: Array<{ api: string; id: string; count: number; firstCaller: string; firstCallerSym: string | null }>;
-    silentStubs: Array<{ api: string; count: number; arity: number; lastCaller: string; lastCallerSym: string | null }>;
+    silentStubs: Array<{ api: string; count: number; arity: number; notImpl: boolean; lastCaller: string; lastCallerSym: string | null }>;
     getProcMisses: Array<{
         module: string; proc: string; count: number;
         firstCaller: string; firstCallerSym: string | null;
@@ -145,6 +145,7 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             api: s.name,
             count: s.count,
             arity: s.arity,
+            notImpl: s.notImpl,
             lastCaller: hx(s.lastCaller),
             lastCallerSym: symbolize(s.lastCaller),
         })),

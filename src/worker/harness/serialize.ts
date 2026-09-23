@@ -92,6 +92,7 @@ export function serializeThreads(): unknown {
     const currentThreadId: number | null = sched.currentThreadId ?? null;
     const runQueue: number[] = Array.isArray(sched.runQueue) ? [...sched.runQueue] : [];
     const liveCpu = cpu();
+    const suspendedFrames = proc()?.dispatcher?.callbackManager?.snapshotSuspendedFrames?.() ?? [];
     const threads: unknown[] = [];
     if (threadsMap) {
         for (const [, t] of threadsMap) {
@@ -112,12 +113,15 @@ export function serializeThreads(): unknown {
                 esp,
                 tebAddress: u32(t.tebAddress),
                 suspendCount: t.suspendCount ?? 0,
+                kernelPinCount: t.kernelPinCount ?? 0,
+                callbackFramePinCount: t.callbackFramePinCount ?? 0,
+                liveFrames: suspendedFrames.filter((frame: { threadId: number }) => frame.threadId === t.id).length,
                 priority: t.priority ?? 0,
                 running: isRunning,
             });
         }
     }
-    return { currentThreadId, runQueue, count: threads.length, threads };
+    return { currentThreadId, runQueue, count: threads.length, threads, suspendedFrames };
 }
 
 /** Enumerate all surface-like COM objects backend-agnostically (DDraw/D3D7/D3D8). */
@@ -128,6 +132,8 @@ export function serializeSurfaces(): unknown {
     try {
         primaryPtr = u32(getModule("ddraw")?.context?.surfaces?.primary);
     } catch { /* no ddraw */ }
+    // context.surfaces.primary is the surface's COM object address, not its pixel pointer.
+    const primaryState = primaryPtr ? provider?.getComObjectByAddress?.(primaryPtr)?.getState?.() : null;
     const out: unknown[] = [];
     for (const o of objs) {
         const st = o?.getState?.();
@@ -149,7 +155,7 @@ export function serializeSurfaces(): unknown {
             mipMapCount: st.mipMapCount ?? null,
             activeLeaseId: st.activeLeaseId ?? null,
             everLocked: st.everLocked ?? null,
-            isPrimary: primaryPtr !== 0 && (st.surfacePtr >>> 0) === primaryPtr,
+            isPrimary: primaryPtr !== 0 && (st === primaryState || (st.surfacePtr >>> 0) === primaryPtr),
         });
     }
     return out;

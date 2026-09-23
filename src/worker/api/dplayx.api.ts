@@ -119,7 +119,7 @@ export const IDirectPlay4A: InterfaceDescriptor = {
         makeMethod("EnumGroupPlayers", 6),          // 10: DPID, LPGUID, callback, LPVOID, DWORD
         makeMethod("EnumGroups", 5),                // 11: LPGUID, callback, LPVOID, DWORD
         makeMethod("EnumPlayers", 5),               // 12: LPGUID, callback, LPVOID, DWORD
-        makeMethod("EnumSessions", 6),              // 13: LPDPSESSIONDESC2, DWORD, callback, LPVOID, DWORD
+        makeMethod("EnumSessions", 6, { async: true }), // 13: LPDPSESSIONDESC2, DWORD, callback, LPVOID, DWORD
         makeMethod("GetCaps", 3),                   // 14: LPDPCAPS, DWORD
         makeMethod("GetGroupData", 5),              // 15: DPID, LPVOID, LPDWORD, DWORD
         makeMethod("GetGroupName", 4),              // 16: DPID, LPVOID, LPDWORD
@@ -130,7 +130,7 @@ export const IDirectPlay4A: InterfaceDescriptor = {
         makeMethod("GetPlayerName", 4),             // 21: DPID, LPVOID, LPDWORD
         makeMethod("GetSessionDesc", 3),            // 22: LPVOID, LPDWORD
         makeMethod("Initialize", 2),                // 23: LPGUID
-        makeMethod("Open", 3),                      // 24: LPDPSESSIONDESC2, DWORD
+        makeMethod("Open", 3, { async: true }),     // 24: LPDPSESSIONDESC2, DWORD
         makeMethod("Receive", 6),                   // 25: LPDPID, LPDPID, DWORD, LPVOID, LPDWORD
         makeMethod("Send", 6),                      // 26: DPID, DPID, DWORD, LPVOID, DWORD
         makeMethod("SetGroupData", 5),              // 27: DPID, LPVOID, DWORD, DWORD
@@ -146,7 +146,7 @@ export const IDirectPlay4A: InterfaceDescriptor = {
         makeMethod("EnumGroupsInGroup", 6),         // 36: DPID, LPGUID, callback, LPVOID, DWORD
         makeMethod("GetGroupConnectionSettings", 5),// 37: DWORD, DPID, LPVOID, LPDWORD
         makeMethod("InitializeConnection", 3),      // 38: LPVOID, DWORD
-        makeMethod("SecureOpen", 5),                // 39: LPCDPSESSIONDESC2, DWORD, LPCDPSECURITYDESC, LPCDPCREDENTIALS
+        makeMethod("SecureOpen", 5, { async: true }), // 39: LPCDPSESSIONDESC2, DWORD, LPCDPSECURITYDESC, LPCDPCREDENTIALS
         makeMethod("SendChatMessage", 5),           // 40: DPID, DPID, DWORD, LPDPCHAT
         makeMethod("SetGroupConnectionSettings", 4),// 41: DWORD, DPID, LPDPLCONNECTION
         makeMethod("StartSession", 3),              // 42: DWORD, DPID
@@ -249,7 +249,7 @@ export const IDirectPlay8LobbyClient: InterfaceDescriptor = {
 export const dplayxModule: ModuleDescriptor = {
     name: "dplayx",
     version: "7.0",
-    description: "DirectPlay lobby stubs",
+    description: "DirectPlay with the TCP/IP service provider over the virtual NIC",
     functions: [
         {
             name: "DirectPlayCreate",
@@ -265,6 +265,26 @@ export const dplayxModule: ModuleDescriptor = {
         {
             name: "DirectPlayEnumerateA",
             ordinal: 2,
+            params: [
+                { name: "lpEnumCallback", type: "ptr" },
+                { name: "lpContext", type: "ptr" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        {
+            name: "DirectPlayEnumerateW",
+            ordinal: 3,
+            params: [
+                { name: "lpEnumCallback", type: "ptr" },
+                { name: "lpContext", type: "ptr" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        {
+            name: "DirectPlayEnumerate",
+            ordinal: 9,
             params: [
                 { name: "lpEnumCallback", type: "ptr" },
                 { name: "lpContext", type: "ptr" },

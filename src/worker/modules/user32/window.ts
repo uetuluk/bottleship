@@ -31,7 +31,8 @@ import { registerWindowPropExports } from './window-props';
 import { GDIContext } from '../gdi32/context';
 import { ensureAnimateControlClasses, clearAnimateState, onAnimateShowWindow, isAnimateControlWindow } from './animate-control';
 import { applyScrollInfo, setScrollPos as setScrollBarPos } from './scroll-state';
-import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint } from './dialog';
+import { repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, requestGuestDialogPaint, getDefWindowProcAddress } from './dialog';
+import { predefinedControlClassName } from './dialog-template';
 import { noteDialogOverlayCandidate, eraseDialogOverlay } from './dialog-overlay';
 import { resetControlInteractionState } from './control-interaction';
 import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
@@ -39,6 +40,7 @@ import { PAINT_TRACE_ENABLED, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
 import { tryEndPaintOwnerDrawChain, tryRepaintOwnerDrawButton } from './owner-draw';
 import { beginSyncDestroyDelivery } from './destroy-sync';
+import { msgStats } from '../../harness/msg-stats';
 import {
     postInitialActivationMessages,
     activateTopLevelWindow,
@@ -54,6 +56,8 @@ import {
     isDialogInitInProgress,
     isWindowInitInProgress,
 } from './activation-messages';
+import { trySendCtlColor } from './ctl-color';
+import { defWindowProcCtlColor, WM_CTLCOLORMSGBOX, WM_CTLCOLORSTATIC } from './ctl-color-brush';
 
 export function getWindowByHandle(handle: number): WindowInfo | undefined {
     return windows.get(handle);
@@ -279,7 +283,7 @@ function applyWindowPosGeometry(
             `→ ${cx}x${cy} (was ${window.width}x${window.height})`);
     }
 
-    if ((moving || resizing) && window.visible && window.nativeClassName === '#32770') {
+    if ((moving || resizing) && window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
         eraseDialogOverlay(hWnd);
     }
     if (!(uFlags & SWP_NOMOVE_GEO)) {
@@ -421,6 +425,14 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classInfo = getWindowClassByName(className);
         }
 
+        // A predefined control class (EDIT, BUTTON, …) the app didn't register itself is
+        // the system class: its window proc is our JS class proc, reached through the
+        // DefWindowProcA thunk exactly like dialog-template children.
+        const predefinedClass = classInfo ? null : predefinedControlClassName(className);
+        if (predefinedClass) {
+            classInfo = { lpfnWndProc: getDefWindowProcAddress(), className: predefinedClass };
+        }
+
         if (!classInfo && typeof className === 'string') {
             Logger.warn(LogCategory.USER32, `CreateWindowEx: class "${className}" not found, using dummy`);
             classInfo = { lpfnWndProc: 0 };
@@ -487,8 +499,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             extraBytes: classInfo?.cbWndExtra ? new Uint32Array(Math.ceil(classInfo.cbWndExtra / 4)) : undefined,
             nativeClassName: resolvedClassName,
         };
+        if (predefinedClass) {
+            windowInfo.isSystemControl = true;
+            windowInfo.systemControlClass = predefinedClass;
+            // A child window's hMenu is its control id.
+            if (isChildWindow) windowInfo.controlId = hMenu & 0xFFFF;
+        }
 
         windows.set(windowInfo.handle, windowInfo);
+        if (predefinedClass) noteDialogOverlayCandidate(windowInfo);
 
         // Add to parent's children list
         if (hWndParent) {
@@ -521,7 +540,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         const cbtHooks = callbackManager ? getHooksOfType(WH_CBT) : [];
         const totalCbtHooks = cbtHooks.length;
 
-        if (!callbackManager || (!windowInfo.wndProc && totalCbtHooks === 0)) {
+        // The JS class proc of a system control has no WM_NCCREATE/WM_CREATE work, so
+        // without CBT hooks there is nothing to run in the guest.
+        const noGuestCreateWork = !windowInfo.wndProc || !!windowInfo.isSystemControl;
+        if (!callbackManager || (noGuestCreateWork && totalCbtHooks === 0)) {
             postInitialVisibleWindowMessages(windowInfo);
             return windowInfo.handle;
         }
@@ -773,9 +795,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         // Erase the dialog's pixels from the GDI overlay BEFORE teardown, while its
         // rect is still known — otherwise a closed dialog lingers as a ghost over the
-        // game (the overlay is a persistent screen-space canvas). Only #32770 dialogs
-        // paint into the overlay; skip for other windows (no-op rect).
-        if (windowInfo.nativeClassName === '#32770') {
+        // game (the overlay is a persistent screen-space canvas). Only dialogs and live
+        // overlay controls paint into the overlay; skip other windows (no-op rect).
+        if (windowInfo.nativeClassName === '#32770' || windowInfo.overlayOnFlipScreen) {
             eraseDialogOverlay(hWnd);
             resetControlInteractionState();
         }
@@ -838,6 +860,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return result;
         }
 
+        if (Msg >= WM_CTLCOLORMSGBOX && Msg <= WM_CTLCOLORSTATIC) {
+            return defWindowProcCtlColor(Msg, wParam >>> 0, System.getInstance().gdiContext);
+        }
+
         if (Msg === WM_CLOSE) {
             // Default: DestroyWindow(hWnd) which posts WM_DESTROY
             Logger.log(LogCategory.USER32, `DefWindowProcA: WM_CLOSE -> DestroyWindow(0x${hWnd.toString(16)})`);
@@ -883,7 +909,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             // Hiding a dialog: erase its pixels from the persistent overlay (while its
             // rect is still known) so it doesn't linger as a ghost. TS hides the
             // campaign dialog (ShowWindow(hWnd,0)) when opening a sub-dialog.
-            if (wasVisible && !window.visible && window.nativeClassName === '#32770') {
+            if (wasVisible && !window.visible && (window.nativeClassName === '#32770' || window.overlayOnFlipScreen)) {
                 eraseDialogOverlay(hWnd);
             }
 
@@ -1330,12 +1356,20 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         Logger.log(LogCategory.USER32,
             `CallWindowProcA(prev=0x${lpPrevWndFunc.toString(16)}, hwnd=0x${hWnd.toString(16)}, msg=0x${Msg.toString(16)})`);
+        if (msgStats.active) msgStats.note('callproc', hWnd, Msg);
 
-        // Sentinel WndProc: system control (Button/Static/Edit etc.) — handle in JS, don't call x86
-        if ((lpPrevWndFunc & 0xFFFF0000) === 0xFFFF0000) {
-            Logger.verbose(LogCategory.USER32,
-                `CallWindowProcA: sentinel WndProc 0x${lpPrevWndFunc.toString(16)}, returning 0`);
-            return { value: 0, stackCleanup: 5 * 4 };
+        // Sentinel WndProc = a system class proc (Button/Static/Edit …). A subclass proc
+        // forwards here for the class's default behavior (text entry, EM_*, WM_PAINT
+        // validation), so run the JS class proc rather than dropping the message.
+        if (isSentinelWndProc(lpPrevWndFunc)) {
+            const win = windows.get(hWnd);
+            if (!win?.isSystemControl) return { value: 0, stackCleanup: 5 * 4 };
+            const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
+            if (isContentChangingMessage(Msg)) {
+                repaintDialogAfterContentChange(win.parent ?? hWnd);
+            }
+            return trySendCtlColor(ctx, mem, win, result, 5 * 4, 'CallWindowProcA')
+                ?? { value: result >>> 0, stackCleanup: 5 * 4 };
         }
 
         const system = System.getInstance();

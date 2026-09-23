@@ -98,3 +98,41 @@ export function vkFromKeyboardEvent(e: KeyboardEventLike): number {
     if (keyCode === KEYCODE_COMPOSING || keyCode === 0) return 0;
     return keyCode & 0xff;
 }
+
+const SHIFTED_DIGITS = ")!@#$%^&*(";
+/** OEM punctuation VK → [unshifted, shifted] character. */
+const OEM_CHARS: Record<number, [number, number]> = {
+    0xba: [0x3b, 0x3a], 0xbb: [0x3d, 0x2b], 0xbc: [0x2c, 0x3c], 0xbd: [0x2d, 0x5f],
+    0xbe: [0x2e, 0x3e], 0xbf: [0x2f, 0x3f], 0xc0: [0x60, 0x7e],
+    0xdb: [0x5b, 0x7b], 0xdc: [0x5c, 0x7c], 0xdd: [0x5d, 0x7d], 0xde: [0x27, 0x22],
+};
+/** Ctrl chords the US layout maps to C0 control characters (besides Ctrl+letter). */
+const CTRL_OEM_CHARS: Record<number, number> = { 0xdb: 0x1b, 0xdc: 0x1c, 0xdd: 0x1d };
+
+/**
+ * The character the US layout produces for `vk` under the given modifier state
+ * (ToAscii / TranslateMessage semantics), or 0 for a key that types nothing.
+ * Ctrl+letter yields the C0 control code (Ctrl+A = 0x01), Ctrl+Enter = LF,
+ * Ctrl+Backspace = DEL; Ctrl with a digit/punctuation types nothing.
+ */
+export function vkToChar(vk: number, shift: boolean, capsLock: boolean, ctrl = false): number {
+    vk &= 0xff;
+    if (vk >= 0x41 && vk <= 0x5a) {
+        if (ctrl) return vk - 0x40;
+        return shift !== capsLock ? vk : vk + 32;
+    }
+    if (vk === VK_BACK) return ctrl ? 0x7f : 0x08;
+    if (vk === VK_RETURN) return ctrl ? 0x0a : 0x0d;
+    if (vk === VK_ESCAPE) return 0x1b;
+    if (ctrl) return CTRL_OEM_CHARS[vk] ?? (vk === VK_SPACE ? 0x20 : 0);
+    if (vk >= 0x30 && vk <= 0x39) return shift ? SHIFTED_DIGITS.charCodeAt(vk - 0x30) : vk;
+    if (vk >= 0x60 && vk <= 0x69) return 0x30 + (vk - 0x60);
+    if (vk === 0x6a) return 0x2a;
+    if (vk === 0x6b) return 0x2b;
+    if (vk === 0x6d) return 0x2d;
+    if (vk === 0x6e) return 0x2e;
+    if (vk === 0x6f) return 0x2f;
+    if (vk === VK_SPACE || vk === VK_TAB) return vk;
+    const oem = OEM_CHARS[vk];
+    return oem ? oem[shift ? 1 : 0] : 0;
+}

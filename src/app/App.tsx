@@ -13,6 +13,7 @@ import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile } from "../utils/log-client";
 import { installHarnessFacade } from "../harness/facade";
+import { installNetwork } from "../net/net-controller";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
@@ -26,6 +27,7 @@ import WebGPUErrorOverlay from "./WebGPUErrorOverlay";
 import WgbWizardModal from "../wizard/WgbWizardModal";
 import ManifestEditorModal from "../wizard/ManifestEditorModal";
 import { listAddedGames, removeAddedGame, type AddedGame } from "../wgb-library";
+import { isWgbUrl, wgbFilenameFromUrl } from "../wgb-url";
 import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
 import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
@@ -794,6 +796,10 @@ export default function App() {
       // forwarder over harness_rpc + the normalized event bus; logic lives in the
       // worker HarnessService. Coexists with the legacy window.dbg Proxy below.
       installHarnessFacade(globalWorker);
+
+      // Multiplayer: `?net=<router url>` attaches a virtual NIC to the guest and exposes
+      // window.net. Without that parameter nothing is loaded and nothing changes.
+      installNetwork(globalWorker);
 
       // Guest debugger bridge: window.dbg.<cmd>(...args) -> worker {type:"dbg"} ->
       // handleDbgCommand() -> wasm dbg_* primitives. Output flows back via console.
@@ -1936,13 +1942,12 @@ export default function App() {
     (window as any).enableHleAndLoad = async (path: string, logOnly = false, galaxyHleMixer = true) => {
       if (!globalWorker) { console.error("BottleShip: Worker not initialized"); return; }
       console.log(`BottleShip: enableHleAndLoad logOnly=${logOnly} mixer=${galaxyHleMixer} → ${path}`);
-      rotateLogFile((path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game") + "-hle");
+      rotateLogFile((wgbFilenameFromUrl(path).replace(/\.wgb$/i, "") || "game") + "-hle");
       setIsLoadingApp(true);
       setErrorMessage(null);
       setBundleDisplayName(null);
       canvasRef.current?.focus();
-      const lower = path.toLowerCase();
-      if (lower.endsWith(".wgb")) {
+      if (isWgbUrl(path)) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
         globalWorker.postMessage({ type: "load_bundle", url: path, galaxyHle: true, hleLogOnly: logOnly, galaxyHleMixer: galaxyHleMixer });
         return;
@@ -1955,7 +1960,7 @@ export default function App() {
 
     (window as any).loadApp = async (path: string) => {
       console.log(`BottleShip: Loading App from ${path}`);
-      rotateLogFile(path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game");
+      rotateLogFile(wgbFilenameFromUrl(path).replace(/\.wgb$/i, "") || "game");
       ensurePersistentStorageRequested();
       setIsLoadingApp(true);
       setErrorMessage(null); // Clear any previous errors
@@ -1968,8 +1973,7 @@ export default function App() {
         return;
       }
       canvasRef.current?.focus();
-      const lower = path.toLowerCase();
-      if (lower.endsWith(".wgb")) {
+      if (isWgbUrl(path)) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
         globalWorker.postMessage({ type: "load_bundle", url: path });
         return;

@@ -15,6 +15,9 @@ import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dial
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
 import { encodeAnsi } from '../codepage-utils';
+import { handleEditMessage, isEditControl, onEditTextSet } from './edit-control';
+import { clearWindowUpdate } from './paint-region';
+import { markCtlColorStale } from './ctl-color-brush';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -77,6 +80,10 @@ export function handleSystemControlMessage(
 ): number {
     const anim = handleAnimateMessage(child.handle, msg, wParam, lParam, mem);
     if (anim !== null) return anim;
+    if (isEditControl(child)) {
+        const edit = handleEditMessage(child, msg, wParam, lParam, mem);
+        if (edit !== null) return edit;
+    }
 
     const readAnsiOrWideString = (ptr: number): string => {
         if (!ptr) return '';
@@ -179,7 +186,12 @@ export function handleSystemControlMessage(
                     return DLGC_BUTTON;
             }
         }
-        if (cls === 'edit') return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL;
+        if (cls === 'edit') {
+            const ES_MULTILINE = 0x0004;
+            const DLGC_WANTALLKEYS = 0x0004;
+            return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL
+                | ((child.style & ES_MULTILINE) !== 0 ? DLGC_WANTALLKEYS : 0);
+        }
         if (cls === 'static') return DLGC_STATIC;
         return 0;
     };
@@ -238,6 +250,9 @@ export function handleSystemControlMessage(
             }
             return 0;
         case WM_PAINT: {
+            // The class proc's BeginPaint/EndPaint validates the update region.
+            clearWindowUpdate(child.handle);
+            markCtlColorStale(child.handle);
             const gdi = System.getInstance().gdiContext;
             const hdc = wParam || gdi.createOverlayDC();
             if (hdc) {
@@ -282,6 +297,7 @@ export function handleSystemControlMessage(
                 child.title = readAnsiOrWideString(lParam);
                 Logger.log(LogCategory.USER32, `handleSysCtrlMsg WM_SETTEXT: hwnd=0x${child.handle.toString(16)} id=${child.controlId ?? '?'} -> "${child.title}"`);
             }
+            if (isEditControl(child)) onEditTextSet(child, msg);
             return 1;
         case WM_GETTEXT:
             if (lParam && wParam > 0) {

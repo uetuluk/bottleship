@@ -144,6 +144,8 @@ export class Scheduler {
     // Thunk region boundaries for context save
     private thunkStubBase = 0;
     private thunkStubEnd = 0;
+    // A sync syscall permits preemption at its own boundary even inside a callback.
+    private kernelTransitionAtBoundary = false;
     private spinLoopBase = 0;
     private spinLoopEnd = 0;
     /** Count of times the async-park safety net fired. Non-zero → a thunk path missed markThreadAsyncParked. */
@@ -319,6 +321,10 @@ export class Scheduler {
      *  Returns true if a restore was applied (CPU state modified). */
     public onPollAsyncRestores: ((cpu: V86Cpu, source?: string) => boolean) | null = null;
     public onHasPendingAsyncRestores: (() => boolean) | null = null;
+    /** True when a thread is parked in the blocking GetMessage/WaitMessage slow path.
+     *  That park registers as ASYNC_THUNK (the thunk machinery owns the wait) even
+     *  though the thread is idling on the message queue — see shouldPumpIdleVirtualTime. */
+    public onHasMessageQueueWaiters: (() => boolean) | null = null;
     /** True when the thread owns a live suspended-thunk frame (a JS-driven pump like
      *  DialogBoxParamA). Lets the spin-loop safety net park such a thread WAITING between
      *  pump callbacks — the pump's next invokeCallback wakes it via
@@ -657,6 +663,9 @@ export class Scheduler {
      * This is the ONLY place context switches happen.
      */
     onThunkBoundary(cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number): void {
+        const kernelTransition = this.kernelTransitionAtBoundary;
+        const boundaryThreadId = this.currentThreadId;
+        this.kernelTransitionAtBoundary = false;
         if (!this.process) return;
 
         if (this.handleUnhandledFaultHalt(cpu, "onThunkBoundary")) return;
@@ -691,17 +700,10 @@ export class Scheduler {
         // 5. Perform switch if requested (but respect callback chain pin)
         if (this.switchRequested) {
             const current = this.getCurrentThread();
-            // Pin defers PREEMPTIVE switches mid callback-chain (keeps the callback's
-            // stack intact). But a thread that has voluntarily BLOCKED (WAITING) has
-            // already yielded the CPU — its peers (e.g. Storm's async-I/O worker that
-            // must SetEvent the read-completion event) MUST be allowed to run, or the
-            // wait can never complete. Without this, a blocking SFileReadFile inside a
-            // pinned WndProc deadlocks: the switch is deferred, WaitForSingleObject's
-            // RET resumes guest code on the WAITING thread, and the read returns short
-            // → D2 "File Read Error / Archive.cpp:143". Only defer while RUNNING.
-            if (current && current.kernelPinCount > 0 && current.state === ThreadState.RUNNING) {
-                // Pinned for callback chain — defer preemptive switch until chain completes.
-                // Same-thread async restores are handled at step 1 above.
+            // Blocking and sync syscalls let peers make progress even inside a callback.
+            const canPreemptCallback = kernelTransition && current?.id === boundaryThreadId
+                && current.callbackFramePinCount === current.kernelPinCount;
+            if (current && current.kernelPinCount > 0 && current.state === ThreadState.RUNNING && !canPreemptCallback) {
                 return;
             }
             if (this.shouldDeferSwitchForCriticalRuntime(cpu, kind)) {
@@ -719,6 +721,7 @@ export class Scheduler {
      * Called when entering a thunk (lazy main thread init).
      */
     onThunkEnter(): void {
+        this.kernelTransitionAtBoundary = false;
         if (!this.process) return;
         this.ensureMainThread();
     }
@@ -1593,7 +1596,7 @@ export class Scheduler {
             tlsValues: new Map(), lastError: 0,
             suspendCount: isSuspended ? 1 : 0,
             priority: 0, lastSwitchTime: 0, lastSwitchInsn: 0,
-            tebAddress, kernelPinCount: 0,
+            tebAddress, kernelPinCount: 0, callbackFramePinCount: 0,
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,
             asyncParkGeneration: 0,
@@ -1776,6 +1779,7 @@ export class Scheduler {
         callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
         alertable: boolean = false
     ): number {
+        this.kernelTransitionAtBoundary = true;
         const thread = this.getCurrentThread();
         if (!thread) return 0;
 
@@ -1902,6 +1906,7 @@ export class Scheduler {
         callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
         alertable: boolean = false
     ): number {
+        this.kernelTransitionAtBoundary = true;
         const thread = this.getCurrentThread();
         if (!thread) return WAIT_FAILED;
 
@@ -2566,6 +2571,7 @@ export class Scheduler {
     }
 
     setEvent(handle: number): boolean {
+        this.kernelTransitionAtBoundary = true;
         const ok = this.syncObjects.setEvent(handle);
         if (ok && this.waitEngine.getHandleWaiters(handle).length > 0) {
             this.wakeWaitingThreadsForHandle(handle);
@@ -2579,6 +2585,7 @@ export class Scheduler {
 
     /** PulseEvent: signal, wake waiters while signaled, then reset — single JS orchestration. */
     pulseEvent(handle: number): boolean {
+        this.kernelTransitionAtBoundary = true;
         const ok = this.syncObjects.setEvent(handle);
         if (!ok) return false;
         if (this.waitEngine.getHandleWaiters(handle).length > 0) {
@@ -2597,6 +2604,7 @@ export class Scheduler {
     }
 
     releaseSemaphore(handle: number, releaseCount: number): { ok: boolean; previousCount: number } {
+        this.kernelTransitionAtBoundary = true;
         const result = this.syncObjects.releaseSemaphore(handle, releaseCount);
         if (result.ok) this.wakeWaitingThreadsForHandle(handle);
         return result;
@@ -2608,6 +2616,7 @@ export class Scheduler {
     }
 
     releaseMutex(handle: number): boolean {
+        this.kernelTransitionAtBoundary = true;
         const thread = this.getCurrentThread();
         if (!thread) return false;
         const ok = this.syncObjects.releaseMutex(handle, thread.id);
@@ -2930,6 +2939,20 @@ export class Scheduler {
     getLastError(): number {
         const t = this.getCurrentThread();
         return t ? t.lastError >>> 0 : (this.process?.lastError ?? 0);
+    }
+
+    pinCallbackFrame(threadId: number): void {
+        const thread = this.threads.get(threadId);
+        if (!thread) return;
+        thread.callbackFramePinCount++;
+        thread.kernelPinCount++;
+    }
+
+    unpinCallbackFrame(threadId: number): void {
+        const thread = this.threads.get(threadId);
+        if (!thread || thread.callbackFramePinCount === 0) return;
+        thread.callbackFramePinCount--;
+        if (thread.kernelPinCount > 0) thread.kernelPinCount--;
     }
 
     pinCurrentThread(): void {
@@ -3417,7 +3440,15 @@ export class Scheduler {
         // activeCount>0 to break it, so the hang would be silent. Pump wall-clock virtual
         // time so the wheel fires at native cadence — faithful, since these pumps are
         // wall-clock-paced on real Windows.
-        if (anyNonAsyncWaiter && this.timerWheel.activeCount > 0) {
+        // A thread parked in the ASYNC GetMessage slow path is skipped by the loop
+        // above (its wait reason is ASYNC_THUNK, set by the thunk machinery) yet it is
+        // idling on the message queue exactly like WaitMessage: the only thing that can
+        // wake it is a message, and a WM_TIMER only arrives once the wheel comes due.
+        // A game whose whole main loop hangs off SetTimer — AoE2's menu is a 50ms tick —
+        // would otherwise freeze forever: virtual time stops, the timer never fires, and
+        // nothing ever posts the message the waiter is blocked on.
+        const messageQueueIdle = this.onHasMessageQueueWaiters?.() ?? false;
+        if ((anyNonAsyncWaiter || messageQueueIdle) && this.timerWheel.activeCount > 0) {
             needsIdlePump = true;
         }
         return needsIdlePump;
@@ -4124,7 +4155,7 @@ export class Scheduler {
             suspendCount: 0, priority: 0,
             lastSwitchTime: performance.now(),
             lastSwitchInsn: (cpu?.instruction_counter?.[0] ?? 0) >>> 0,
-            tebAddress, kernelPinCount: 0,
+            tebAddress, kernelPinCount: 0, callbackFramePinCount: 0,
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,
             asyncParkGeneration: 0,

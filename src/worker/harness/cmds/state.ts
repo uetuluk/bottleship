@@ -63,6 +63,23 @@ export function registerStateCommands(svc: HarnessService): void {
      * the worker services between scheduler quanta, so it works even while v86 is running
      * (unlike a worker-target CDP eval, which starves on a busy worker).
      */
+    /**
+     * allocHistory(addr, radius=0x20000) — lifecycle of the large (>=64KB) blocks whose
+     * range meets [addr-radius, addr+radius], time-ordered, each with the guest backtrace
+     * of whoever asked for it. `state(['memory'])` only shows the bucket-level region map,
+     * so it cannot answer "who is sitting in the VA this guest arena wants to grow into" —
+     * which is what a failed contiguous VirtualAlloc(MEM_RESERVE) makes you ask.
+     */
+    svc.register("allocHistory", (args) => {
+        const addr = ((args[0] as number) ?? 0) >>> 0;
+        const radius = ((args[1] as number) ?? 0x20000) >>> 0;
+        const mm: any = proc()?.memory;
+        if (typeof mm?.getLargeAllocHistory !== "function") {
+            throw new HarnessError("no MemoryManager (no process loaded?)", HarnessErrorCode.BAD_ARGS);
+        }
+        return { addr: "0x" + addr.toString(16), radius, entries: mm.getLargeAllocHistory(addr, radius) };
+    });
+
     /** writeBytes(addr, hex) — poke guest memory (e.g. flip a game global to steer a bring-up). */
     svc.register("writeBytes", (args) => {
         const addr = ((args[0] as number) ?? 0) >>> 0;
@@ -327,7 +344,7 @@ export function registerStateCommands(svc: HarnessService): void {
     /** silentStubs() — shorthand for apiCensus(true): only the called methods flagged
      *  as likely silent stubs (the "pretend to work" handlers). */
     svc.register("silentStubs", () => apiCensus.suspectStubs().map((s) => ({
-        api: s.name, count: s.count, arity: s.arity,
+        api: s.name, count: s.count, arity: s.arity, notImpl: s.notImpl,
         lastCaller: "0x" + s.lastCaller.toString(16), lastCallerSym: symbolize(s.lastCaller),
     })));
 

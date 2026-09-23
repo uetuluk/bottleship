@@ -1464,6 +1464,12 @@ export class GDIContext {
         return cssToColorImpl(css);
     }
 
+    /** BRUSH object for a stock or created brush handle, or null. */
+    getBrushObject(hbr: number): GDIObject | null {
+        const obj = this.isStockObject(hbr) ? this.getStockObject(hbr) : (this.objects.get(hbr) ?? null);
+        return obj?.type === 'BRUSH' ? obj : null;
+    }
+
     /** Stock-object resolution by stock ID. */
     private getStockObject(objectId: number): GDIObject | null {
         return getStockObjectImpl(objectId);

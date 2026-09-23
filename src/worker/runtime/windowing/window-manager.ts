@@ -1,4 +1,5 @@
 
+import { msgStats } from '../../harness/msg-stats';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { MessageQueue } from './message-queue';
@@ -654,6 +655,7 @@ export class WindowManager {
         if (targetThreadId === 0 && hwnd > 0) {
             targetThreadId = this.getWindowOwnerThread(hwnd);
         }
+        if (msgStats.active) msgStats.note('post', hwnd, msg);
         const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked);
         if (discrete) {
             // Eagerly update shared flag so WASM PeekMessage sees new messages immediately.

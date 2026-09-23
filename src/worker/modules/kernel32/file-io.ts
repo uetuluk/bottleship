@@ -288,17 +288,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     interface FileMappingObject {
         kind: 'file_mapping';
         size: number;
-        fileHandle: number | null;
+        /**
+         * The FILE OBJECT, not the guest handle. A section holds its own reference to
+         * the file, so the standard Win32 idiom — CreateFileMapping, CloseHandle(hFile),
+         * MapViewOfFile — keeps working after the guest's handle is gone. Looking the
+         * handle up again at map time instead yields nothing and a silently zero-filled
+         * view (AoE2 maps its .drs archives exactly this way).
+         */
+        file: FileHandleWrapper | null;
         protect: number;
     }
 
     const namedFileMappings: Map<string, number> = new Map();
     // Tracks live mapped views so UnmapViewOfFile/FlushViewOfFile can write dirty
-    // bytes back to the backing VFS file. offset/fileHandle/writable are required
+    // bytes back to the backing VFS file. offset/file/writable are required
     // for the write-back: without them a mapped view is effectively read-only and
     // any data the guest writes through the view is silently lost (some titles save
     // profiles via CreateFileMapping+MapViewOfFile, no WriteFile).
-    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; fileHandle: number | null; writable: boolean }> = new Map();
+    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; file: FileHandleWrapper | null; writable: boolean }> = new Map();
 
     // MapViewOfFile dwDesiredAccess flags
     const FILE_MAP_COPY = 0x0001;
@@ -310,15 +317,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // Write a mapped view's current guest-memory contents back to its backing VFS
     // file at the mapped offset. No-op for anonymous (pagefile-backed), read-only,
     // or copy-on-write views.
-    const flushMappedView = async (base: number, view: { size: number; offset: number; fileHandle: number | null; writable: boolean }): Promise<void> => {
-        if (!view.writable || view.fileHandle === null) return;
-        const resourceProvider = System.getInstance().resourceProvider;
-        const fileObj = resourceProvider.getFileHandle(view.fileHandle);
-        if (!fileObj || isConsoleDeviceHandle(fileObj)) return;
+    const flushMappedView = async (base: number, view: { size: number; offset: number; file: FileHandleWrapper | null; writable: boolean }): Promise<void> => {
+        if (!view.writable || view.file === null) return;
+        const fileObj = view.file;
+        if (isConsoleDeviceHandle(fileObj)) return;
         const data = Mem.readBytes(base, view.size);
         if (!data) return;
         const vfs = System.getInstance().fileSystem;
-        const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
+        const vfsHandle = fileObj.vfsHandle;
         const originalPos = vfsHandle.position;
         vfs.setPosition(vfsHandle, view.offset, 0);
         let off = 0;
@@ -944,7 +950,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let file: FileHandleWrapper | null = null;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -953,7 +959,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            file = fileObj as FileHandleWrapper;
             if (size === 0) {
                 const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
                 const vfs = System.getInstance().fileSystem;
@@ -968,7 +974,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file,
             protect: flProtect,
         };
 
@@ -996,7 +1002,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let file: FileHandleWrapper | null = null;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -1005,7 +1011,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            file = fileObj as FileHandleWrapper;
             if (size === 0) {
                 const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
                 const vfs = System.getInstance().fileSystem;
@@ -1020,7 +1026,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file,
             protect: flProtect,
         };
 
@@ -1087,12 +1093,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             Mem.writeBytes(base + wrote, zeroChunk.subarray(0, chunkSize));
         }
 
-        if (mapping.fileHandle !== null) {
-            const resourceProvider = System.getInstance().resourceProvider;
-            const fileObj = resourceProvider.getFileHandle(mapping.fileHandle);
-            if (fileObj && !isConsoleDeviceHandle(fileObj)) {
+        if (mapping.file !== null) {
+            const fileObj = mapping.file;
+            if (!isConsoleDeviceHandle(fileObj)) {
                 const vfs = System.getInstance().fileSystem;
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
+                const vfsHandle = fileObj.vfsHandle;
+                // The section and the guest's own handle share one VFS handle, so the
+                // read position is restored — a real section has its own file object.
                 const originalPos = vfsHandle.position;
                 vfs.setPosition(vfsHandle, offset, 0);
 
@@ -1119,9 +1126,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mappingWritable = (mapping.protect & PAGE_WRITE_MASK) !== 0;
         const accessWrite = (dwDesiredAccess & (FILE_MAP_WRITE | FILE_MAP_ALL_ACCESS)) !== 0;
         const isCopy = (dwDesiredAccess & FILE_MAP_COPY) !== 0 && !accessWrite;
-        const writable = mapping.fileHandle !== null && mappingWritable && accessWrite && !isCopy;
+        const writable = mapping.file !== null && mappingWritable && accessWrite && !isCopy;
 
-        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, fileHandle: mapping.fileHandle, writable });
+        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, file: mapping.file, writable });
         return base;
     };
 
@@ -1681,13 +1688,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
     };
 
-    // _lread - old file read wrapper.
-    exports['_lread'] = (ctx, mem, args) => {
-        const hFile = args[0];
-        const lpBuffer = args[1];
-        const uBytes = args[2] >>> 0;
-
-        if (!lpBuffer || lpBuffer + uBytes > mem.length) {
+    // _lread / _hread — the 16-bit-compat read pair. Identical behaviour; they
+    // differ only in the declared count type (UINT vs LONG), so both are the
+    // same body and _hread is what lets a >64 KB read through.
+    const hfileRead = (mem: Uint8Array, hFile: number, lpBuffer: number, count: number): number => {
+        if (!lpBuffer || lpBuffer + count > mem.length) {
             System.getInstance().scheduler.setLastError(ERROR_NOACCESS);
             return HFILE_ERROR;
         }
@@ -1700,7 +1705,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         try {
             const wrapper = fileHandle as FileHandleWrapper;
-            const bytesRead = wrapper.readIntoSync(mem, lpBuffer, uBytes);
+            const bytesRead = wrapper.readIntoSync(mem, lpBuffer, count);
             if (bytesRead === null) {
                 // Fallback path when sync read is unavailable.
                 return 0;
@@ -1711,6 +1716,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return HFILE_ERROR;
         }
     };
+
+    exports['_lread'] = (ctx, mem, args) => hfileRead(mem, args[0], args[1], args[2] >>> 0);
+    exports['_hread'] = (ctx, mem, args) => hfileRead(mem, args[0], args[1], args[2] >>> 0);
 
     exports['GetFileSize'] = (ctx, mem, args) => {
         const hFile = args[0];
@@ -1816,6 +1824,53 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     };
+
+    /**
+     * BOOL GetFileAttributesEx{A,W}(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId,
+     *                               LPVOID lpFileInformation)
+     *
+     * GetFileExInfoStandard (0) is the only level Windows defines; anything else is
+     * ERROR_INVALID_PARAMETER. Fills WIN32_FILE_ATTRIBUTE_DATA (36 bytes):
+     *   +0 dwFileAttributes  +4 ftCreationTime  +12 ftLastAccessTime
+     *   +20 ftLastWriteTime  +28 nFileSizeHigh  +32 nFileSizeLow
+     */
+    const getFileAttributesEx = (mem: Uint8Array, args: number[], wide: boolean) => {
+        const lpFileName = args[0] >>> 0;
+        const fInfoLevelId = args[1] >>> 0;
+        const lpFileInformation = args[2] >>> 0;
+        const suffix = wide ? 'W' : 'A';
+        const filename = lpFileName ? (wide ? readStringW(mem, lpFileName) : readStringA(mem, lpFileName)) : '';
+
+        if (fInfoLevelId !== 0 || !lpFileInformation || lpFileInformation + 36 > mem.length) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+
+        const vfs = System.getInstance().fileSystem;
+        const resolved = vfs.resolvePath(filename);
+        const isDir = vfs.directoryExists(resolved);
+        if (!isDir && !vfs.fileExists(resolved)) {
+            Logger.verbose(LogCategory.KERNEL32, `GetFileAttributesEx${suffix}: not found "${filename}"`);
+            System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0; // FALSE
+        }
+
+        const size = isDir ? 0 : vfs.getFileSize(resolved);
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        view.setUint32(lpFileInformation + 0, isDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE, true);
+        const fakeTime = 132224352000000000n; // 2020-01-01, same epoch the find/stat paths report
+        view.setBigUint64(lpFileInformation + 4, fakeTime, true);
+        view.setBigUint64(lpFileInformation + 12, fakeTime, true);
+        view.setBigUint64(lpFileInformation + 20, fakeTime, true);
+        view.setUint32(lpFileInformation + 28, Math.floor(size / 0x100000000) >>> 0, true);
+        view.setUint32(lpFileInformation + 32, size >>> 0, true);
+
+        Logger.verbose(LogCategory.KERNEL32, `GetFileAttributesEx${suffix}("${filename}") size=${size} dir=${isDir}`);
+        return 1; // TRUE
+    };
+
+    exports['GetFileAttributesExA'] = (ctx, mem, args) => getFileAttributesEx(mem, args, false);
+    exports['GetFileAttributesExW'] = (ctx, mem, args) => getFileAttributesEx(mem, args, true);
 
     exports['SetFileAttributesA'] = (ctx, mem, args) => {
         const lpFileName = args[0];

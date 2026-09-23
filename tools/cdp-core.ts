@@ -1,7 +1,7 @@
 /**
  * cdp-core.ts — the shared Chrome DevTools Protocol transport for BottleShip
  * tooling. Until now ~35 `cdp-*.ts` scripts each copy-pasted the same
- * ~30 lines: target discovery via http://localhost:9333/json/list (filter
+ * ~30 lines: target discovery via the CDP port's /json/list (filter
  * url.includes("game=dev")), a WebSocket to webSocketDebuggerUrl, an id/pending
  * Map request loop, and the Target.setAutoAttach worker-session dance. This file
  * extracts all of it once.
@@ -14,8 +14,17 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
-export const DEFAULT_CDP_PORT = 9333;
-export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
+// Per-worktree overrides: several checkouts each drive their own Chrome + dev stack
+// side by side, so the transport's defaults must be env-settable. BS_TAB (below)
+// isolates tabs inside ONE Chrome; these isolate the servers. vite.config.ts and
+// tools/log-server read the same port variables. BS_DEV_URL overrides the whole URL
+// when the dev server isn't on localhost at the default port.
+export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT ?? 9333);
+export const DEFAULT_VITE_PORT = Number(process.env.BS_VITE_PORT ?? 5174);
+export const DEFAULT_LOG_PORT = Number(process.env.BS_LOG_PORT ?? 3001);
+export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? `http://localhost:${DEFAULT_VITE_PORT}/?game=dev`;
+/** Origin of the Vite dev server backing DEFAULT_DEV_URL — what health() probes. */
+export const DEV_ORIGIN = new URL(DEFAULT_DEV_URL).origin;
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
 const IS_LINUX = process.platform === "linux";
@@ -28,9 +37,10 @@ const CHROME_PATH = process.env.BS_CHROME
             ? `${process.env.PLAYWRIGHT_BROWSERS_PATH ?? "/opt/pw-browsers"}/chromium`
             : "C:/Program Files/Google/Chrome/Application/chrome.exe");
 // Keep the profile outside the repo: Vite's watcher trips on Chrome's SingletonSocket.
+const PROFILE_SUFFIX = DEFAULT_CDP_PORT === 9333 ? "" : `-${DEFAULT_CDP_PORT}`;
 const DEFAULT_PROFILE = IS_MAC || IS_LINUX
-    ? `${process.env.HOME}/.bottleship-cdp-profile`
-    : `${process.cwd()}/tmp/cdp-profile`;
+    ? `${process.env.HOME}/.bottleship-cdp-profile${PROFILE_SUFFIX}`
+    : `${process.cwd()}/tmp/cdp-profile${PROFILE_SUFFIX}`;
 
 export interface CdpTarget {
     id: string;
@@ -152,6 +162,30 @@ export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: numb
         if (r.ok) return r.json();
     }
     throw new Error(`failed to open tab ${url} (PUT and GET both rejected)`);
+}
+
+/**
+ * Open `url` as a page in its OWN browser window. Two emulator tabs sharing one window
+ * throttle whichever is in the background, so a multi-instance (net room) session needs a
+ * window per instance for both guests to keep real-time pace.
+ */
+export async function openTabInNewWindow(url = DEFAULT_DEV_URL, opts: { port?: number } = {}): Promise<CdpTarget> {
+    const port = opts.port ?? DEFAULT_CDP_PORT;
+    const version = await fetchJson(port, "/json/version");
+    const browser = await CdpSession.connect(version.webSocketDebuggerUrl);
+    try {
+        const r = await browser.send("Target.createTarget", { url, newWindow: true });
+        const targetId = r.result?.targetId as string;
+        for (let i = 0; i < 20; i++) {
+            const list: CdpTarget[] = await fetchJson(port, "/json/list");
+            const hit = list.find((t) => t.id === targetId);
+            if (hit) return hit;
+            await Bun.sleep(250);
+        }
+        throw new Error(`new window target ${targetId} never appeared in /json/list`);
+    } finally {
+        browser.close();
+    }
 }
 
 /** A live CDP WebSocket session with id-correlated requests + event fan-out. */
@@ -409,9 +443,9 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
     const probe = async (url: string, init?: RequestInit) => {
         try { return (await fetch(url, init)).ok; } catch { return false; }
     };
-    const vite = (await probe("http://localhost:5174/health")) || (await probe(DEFAULT_DEV_URL));
+    const vite = (await probe(`${DEV_ORIGIN}/health`)) || (await probe(DEFAULT_DEV_URL));
     const logServer = await (async () => {
-        try { return (await (await fetch("http://localhost:3001/health")).text()).trim() === "OK"; } catch { return false; }
+        try { return (await (await fetch(`http://localhost:${DEFAULT_LOG_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
     })();
     let chrome = false, devTab = false;
     try {

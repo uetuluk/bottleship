@@ -19,6 +19,7 @@ inno/         Inno Setup installer reader        → unpack (+ pako)
 freearc/      FreeArc .arc / repack reader       → unpack
 iso/          ISO9660 / BIN+CUE disc images      → unpack
 installshield/ InstallShield 5/6 cabinets        → unpack
+cfb/          OLE compound files (read + write)  (no deps)
 ```
 
 Every reader depends only on `unpack` (the core) and, for `inno`, the `pako` npm package.

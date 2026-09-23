@@ -61,6 +61,11 @@ export class HarnessChain {
     logLevel(category: string, level: string): this { return this.push("logLevel", [category, level]); }
     /** Grow the worker log ring (default 50 lines) so logsSince can cover a whole boot. */
     logRing(size: number): this { return this.push("logRing", [size]); }
+    /** Capture matching log lines in a capped worker-side ring (no page hop). Pair with logCaptureRead(). */
+    logCapture(pattern: string, limit?: number): this { return this.push("logCapture", [pattern, limit]); }
+    /** Drain worker-side log captures — the firehose-safe alternative to streamLogs()+logs(). */
+    logCaptureRead(id?: number, keep?: boolean): this { return this.push("logCaptureRead", [id, keep]); }
+    logCaptureStop(id?: number): this { return this.push("logCaptureStop", [id]); }
     markLog(label: string): this { return this.push("markLog", [label]); }
     logsSince(label: string, opts?: { filter?: string; count?: number }): this { return this.push("logsSince", [label, opts]); }
     watchLog(pattern: string, opts?: { once?: boolean }): this { return this.push("watchLog", [pattern, opts]); }
@@ -78,6 +83,15 @@ export class HarnessChain {
 
     // ── input ──
     click(target: string | number): this { return this.push("click", [target]); }
+    /** Move into a control before holding the mouse for guests that poll input state. */
+    clickHold(x: number, y: number, holdMs = 350, opts?: { approach?: boolean; button?: number }): this {
+        if (opts?.approach) {
+            this.move(Math.max(0, x - 90), Math.max(0, y - 70)).sleep(220)
+                .move(Math.max(0, x - 40), Math.max(0, y - 30)).sleep(220)
+                .move(x, y).sleep(350);
+        }
+        return this.push("clickHold", [x, y, holdMs, opts?.button ?? 0]).sleep(holdMs);
+    }
     key(vk: number | string, opts?: { down?: boolean; up?: boolean }): this { return this.push("key", [vk, opts]); }
     /** Press + hold a key across real frames, release on a timer — the keyboard twin of
      *  clickHold. A synchronous key tap is invisible to low-fps state-polling guests
@@ -98,6 +112,10 @@ export class HarnessChain {
     stubs(): this { return this.push("stubs", []); }
     /** One-shot incident report: cpu + backtrace + last thunks + stubs + faults + threads. The go-to for ANY anomaly (freeze/crash/exit/black frame). */
     report(esp?: number): this { return this.push("report", [esp]); }
+    /** Suspended callback frames + per-thread kernel pins. The go-to for a 0-FPS freeze
+     *  with NO fault: self-judging verdict distinguishes ORPHANED_FRAMES (guest unwound
+     *  past a frame) from PIN_STARVATION (a pinned WndProc starving a sibling thread). */
+    callbackFrames(): this { return this.push("callbackFrames", []); }
     /** Read guest memory as hex. */
     readBytes(addr: number, len?: number): this { return this.push("readBytes", [addr, len]); }
     /** Poke guest memory with a hex string (a game global, a flag) to steer a bring-up. */
@@ -119,6 +137,8 @@ export class HarnessChain {
     perfStats(): this { return this.push("perfStats", []); }
     /** Named-bucket sub-phase timings (avg/total/max/count). filter by substring; maxMs = worst single call. */
     profilerStats(opts?: { filter?: string; top?: number; sort?: "max" | "total" | "avg" }): this { return this.push("profilerStats", [opts]); }
+    /** Window-message histogram: 'start' arms, 'read' ranks (path, hwnd, msg) by count, 'stop' disarms. */
+    msgStats(opts?: { action?: "start" | "stop" | "read"; top?: number }): this { return this.push("msgStats", [opts]); }
 
     // ── time ──
     time(action: "freeze" | "advance" | "realtime", ms?: number): this { return this.push("time", [action, ms]); }

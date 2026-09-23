@@ -469,6 +469,16 @@ export function handleSystemControlMouseAtScreen(
             return false;
         }
 
+        case 'edit': {
+            // Focus only — the press still reaches the edit's own (possibly subclassed) proc.
+            if (message === WM_LBUTTONDOWN) {
+                const system = System.getInstance();
+                system.windowManager.setFocus(control.handle);
+                system.scheduler.wakeMessageWaiters();
+            }
+            return false;
+        }
+
         case 'listbox': {
             if (message !== WM_LBUTTONDOWN) return message === WM_LBUTTONUP; // eat the matching UP
             const state = getOrCreateListState(control.handle);

@@ -7,6 +7,7 @@ import { Marshaler } from "../core/memory/marshaler";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Process } from "../core/process";
 import { System } from "../core/system";
+import { makeNetSocketExports, netLinkUp, netOwns, netPump, netReadiness, netLocalAddrBytes } from "./wsa-net";
 
 /**
  * Faithful `inet_addr` (winsock 1.1 / 2). Parses a dotted-address string into an in_addr.s_addr
@@ -169,10 +170,19 @@ export interface DnsStubs {
  */
 export function createDnsStubs(process: Process, setLastError: (code: number) => void): DnsStubs {
     let hostentAddr = 0;
+    let hostentAddrBytesAddr = 0;
     let inetNtoaBufAddr = 0;
 
+    /** Our own address once a network provider is attached, loopback otherwise. */
+    const currentAddrBytes = (): Uint8Array => netLocalAddrBytes() ?? LOOPBACK_ADDR_BYTES;
+
     const ensureLoopbackHostent = (): number => {
-        if (hostentAddr) return hostentAddr;
+        if (hostentAddr) {
+            // The link can come up long after the first lookup, and games resolve their own
+            // name to decide what address to advertise to peers — so refresh it every time.
+            if (hostentAddrBytesAddr) Mem.writeBytes(hostentAddrBytesAddr, currentAddrBytes());
+            return hostentAddr;
+        }
 
         // hostent:
         //  +0 h_name      (char*)
@@ -193,10 +203,12 @@ export function createDnsStubs(process: Process, setLastError: (code: number) =>
         const nameBytes = new TextEncoder().encode(`${LOOPBACK_HOST_NAME}\0`);
         if (Mem.writeBytes(hNameAddr, nameBytes) !== nameBytes.length) { setLastError(WSAENETDOWN); return 0; }
         if (!Mem.writeUint32(hAliasesAddr, 0)) { setLastError(WSAENETDOWN); return 0; }
-        if (Mem.writeBytes(hAddrBytesAddr, LOOPBACK_ADDR_BYTES) !== LOOPBACK_ADDR_BYTES.length) {
+        const addrBytes = currentAddrBytes();
+        if (Mem.writeBytes(hAddrBytesAddr, addrBytes) !== addrBytes.length) {
             setLastError(WSAENETDOWN);
             return 0;
         }
+        hostentAddrBytesAddr = hAddrBytesAddr >>> 0;
         if (!Mem.writeUint32(hAddrListAddr, hAddrBytesAddr) || !Mem.writeUint32(hAddrListAddr + 4, 0)) {
             setLastError(WSAENETDOWN);
             return 0;
@@ -461,10 +473,13 @@ function writeFdSetSockets(mem: Uint8Array, ptr: number, sockets: number[]): boo
 
 /**
  * select(nfds, readfds, writefds, exceptfds, timeout) — nfds is ignored (BSD source
- * compatibility only, per Winsock docs). This offline stub never has inbound data or OOB
- * data pending (mirrors recv/recvfrom always failing — see WsaSocketTable), but a connected
- * socket is always ready to write (mirrors connect() completing synchronously). A socket
+ * compatibility only, per Winsock docs). Sockets owned by the live stack report real
+ * readiness; offline stub sockets never have inbound or OOB data pending but are always
+ * ready to write once connected (mirroring connect() completing synchronously). A socket
  * that isn't valid in any supplied set is a WSAENOTSOCK error for the whole call, per spec.
+ *
+ * The timeout argument is not honoured: select returns immediately with whatever is ready.
+ * Sleeping here would stall the x86 execution loop and with it every other guest thread.
  */
 export function makeSelect(table: WsaSocketTable, setLastError: (code: number) => void): ThunkImplementation {
     return (_ctx, mem, args) => {
@@ -476,24 +491,28 @@ export function makeSelect(table: WsaSocketTable, setLastError: (code: number) =
         const writeSockets = parseFdSet(mem, writefdsPtr);
         const exceptSockets = parseFdSet(mem, exceptfdsPtr);
 
+        netPump();
+
         for (const s of [...readSockets, ...writeSockets, ...exceptSockets]) {
-            if (!table.isValid(s)) {
+            if (!table.isValid(s) && !netOwns(s)) {
                 setLastError(WSAENOTSOCK);
                 return SOCKET_ERROR;
             }
         }
 
-        const readyWrite = writeSockets.filter((s) => table.isConnected(s));
+        const readyRead = readSockets.filter((s) => netReadiness(s)?.read ?? false);
+        const readyWrite = writeSockets.filter((s) => netReadiness(s)?.write ?? table.isConnected(s));
+        const readyExcept = exceptSockets.filter((s) => netReadiness(s)?.except ?? false);
 
-        if (!writeFdSetSockets(mem, readfdsPtr, []) ||
+        if (!writeFdSetSockets(mem, readfdsPtr, readyRead) ||
             !writeFdSetSockets(mem, writefdsPtr, readyWrite) ||
-            !writeFdSetSockets(mem, exceptfdsPtr, [])) {
+            !writeFdSetSockets(mem, exceptfdsPtr, readyExcept)) {
             setLastError(WSAEFAULT);
             return SOCKET_ERROR;
         }
 
         setLastError(0);
-        return readyWrite.length;
+        return readyRead.length + readyWrite.length + readyExcept.length;
     };
 }
 
@@ -882,6 +901,15 @@ export class WsaSocketTable {
     }
 }
 
+/**
+ * The Berkeley socket exports, in two layers.
+ *
+ * With no network provider attached these are the offline stubs they have always been: a game
+ * starts, creates sockets, finds nobody and carries on single-player. With a provider attached
+ * and the link up, socket() hands out an id from the live stack (wsa-net.ts) instead, and every
+ * later call follows the id — so a session that starts offline and a session that starts online
+ * never share state, and attaching a network mid-run cannot strand an existing socket.
+ */
 export function makeSocketExports(
     table: WsaSocketTable,
     setLastError: (code: number) => void,
@@ -894,7 +922,7 @@ export function makeSocketExports(
         return true;
     };
 
-    return {
+    const stubs: Record<string, ThunkImplementation> = {
         socket: () => {
             const id = table.socket();
             setLastError(0);
@@ -1097,7 +1125,31 @@ export function makeSocketExports(
             setLastError(0);
             return id;
         },
+        // Offline sockets never become ready, so there is nothing to notify.
+        WSAAsyncSelect: (_ctx, _mem, args) => {
+            if (!requireSocket(args[0] >>> 0)) return SOCKET_ERROR;
+            setLastError(0);
+            return 0;
+        },
     };
+
+    const live = makeNetSocketExports(setLastError);
+    /** Only socket creation consults the link; everything else follows the socket's owner. */
+    const createsSocket = new Set(["socket", "WSASocketA", "WSASocketW"]);
+
+    const exports: Record<string, ThunkImplementation> = {};
+    for (const [name, stub] of Object.entries(stubs)) {
+        const liveImpl = live[name];
+        if (!liveImpl) {
+            exports[name] = stub;
+            continue;
+        }
+        exports[name] = (ctx, mem, args) =>
+            (createsSocket.has(name) ? netLinkUp() : netOwns(args[0] >>> 0))
+                ? liveImpl(ctx, mem, args)
+                : stub(ctx, mem, args);
+    }
+    return exports;
 }
 
 export function makeWsaStartup(

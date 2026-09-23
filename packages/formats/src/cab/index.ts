@@ -9,13 +9,17 @@
  * (`../installshield`) then consumes — so a PFTW `.exe` chains
  * MSCF → InstallShield → game files.
  *
- * Compression support: NONE (0) and MSZIP (1) — the two PFTW/InstallShield-web
- * emit. MSZIP is per-block: each CFDATA block is `'CK'` + a raw-DEFLATE stream
- * whose preset dictionary is the previous block's last 32 KiB of output. That
- * cross-block dictionary is why decoding needs a dictionary-capable inflater
- * (injected via `inflateBlock`; the platform `DecompressionStream` alone cannot
- * preset a dictionary). QUANTUM (2) and LZX (3) are rejected — not used by this
- * installer family.
+ * Compression support: NONE (0), MSZIP (1) and LZX (3).
+ *   MSZIP is per-block: each CFDATA block is `'CK'` + a raw-DEFLATE stream whose
+ *   preset dictionary is the previous block's last 32 KiB of output. That
+ *   cross-block dictionary is why decoding needs a dictionary-capable inflater
+ *   (injected via `inflateBlock`; the platform `DecompressionStream` alone cannot
+ *   preset a dictionary).
+ *   LZX (`./lzx`) is the opposite: ONE continuous bitstream spanning every CFDATA
+ *   block of the folder, so the payloads are concatenated first and decoded as a
+ *   unit. Game installers that ship a single huge cabinet (Microsoft "Pandora"
+ *   setup bootstrappers, makecab /D CompressionType=LZX) use it.
+ * QUANTUM (2) is rejected — no installer we read emits it.
  *
  * Layout reference (Microsoft `[MS-CAB]` / cabinet.h):
  *   CFHEADER  sig"MSCF" res1 u32, cbCabinet u32, res2 u32, coffFiles u32, res3 u32,
@@ -27,6 +31,8 @@
  *             attribs u16, szName (NUL-terminated; UTF-8 when attrib 0x80 set)
  *   CFDATA    csum u32, cbData u16, cbUncomp u16 [, abReserve …], ab[cbData]
  */
+
+import { lzxDecompress } from "./lzx";
 
 const CAB_SIGNATURE = 0x4643534d; // "MSCF" little-endian
 
@@ -42,6 +48,9 @@ export const COMPRESS_QUANTUM = 2;
 export const COMPRESS_LZX = 3;
 
 const MSZIP_WINDOW = 32768;
+
+/** CFFOLDER.typeCompress high byte holds the LZX window size in bits. */
+const LZX_WINDOW_SHIFT = 8;
 
 export interface CabFolder {
     /** Absolute offset (from cab start) of this folder's first CFDATA block. */
@@ -87,6 +96,8 @@ export interface CabExtractOptions {
     inflateBlock?: CabInflateBlock;
     /** Called per extracted file (progress reporting). */
     onProgress?: (done: number, total: number, name: string) => void;
+    /** Called while a single folder decompresses — LZX folders can be hundreds of MB. */
+    onFolderProgress?: (done: number, total: number) => void;
 }
 
 /**
@@ -190,11 +201,33 @@ async function decompressFolder(
 ): Promise<Uint8Array> {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const method = folder.typeCompress & 0x0f;
-    if (method !== COMPRESS_NONE && method !== COMPRESS_MSZIP) {
-        throw new Error(`unsupported cabinet compression type ${method} (only NONE/MSZIP)`);
+    if (method !== COMPRESS_NONE && method !== COMPRESS_MSZIP && method !== COMPRESS_LZX) {
+        throw new Error(`unsupported cabinet compression type ${method} (only NONE/MSZIP/LZX)`);
     }
     if (method === COMPRESS_MSZIP && !opts.inflateBlock) {
         throw new Error("MSZIP cabinet needs a dictionary-capable inflater (opts.inflateBlock)");
+    }
+
+    // LZX spans blocks, so gather the payloads first and decode once.
+    if (method === COMPRESS_LZX) {
+        const chunks: Uint8Array[] = [];
+        let compressed = 0;
+        let uncompressed = 0;
+        let lp = info.cabOffset + folder.coffCabStart;
+        for (let b = 0; b < folder.cCFData; b++) {
+            const cbData = dv.getUint16(lp + 4, true);
+            uncompressed += dv.getUint16(lp + 6, true);
+            const dataStart = lp + 8 + info.dataReserve;
+            chunks.push(buf.subarray(dataStart, dataStart + cbData));
+            compressed += cbData;
+            lp = dataStart + cbData;
+        }
+        const stream = new Uint8Array(compressed);
+        let so = 0;
+        for (const c of chunks) { stream.set(c, so); so += c.length; }
+        return lzxDecompress(stream, uncompressed, folder.typeCompress >> LZX_WINDOW_SHIFT, {
+            onProgress: opts.onFolderProgress,
+        });
     }
 
     const parts: Uint8Array[] = [];

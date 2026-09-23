@@ -47,8 +47,9 @@ export interface RenderActive {
      * present loop calls this every animation frame while a low-fps 3D renderer owns
      * the screen, so the WebGPU canvas keeps showing the last frame at the display
      * refresh rate instead of going black between the renderer's sparse presents.
+     * Returning false means nothing was drawn (no frame yet), so the caller composites.
      */
-    repaintLastFrame?(): void;
+    repaintLastFrame?(): boolean | void;
 }
 
 export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl";

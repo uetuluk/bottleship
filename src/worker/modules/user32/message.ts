@@ -21,6 +21,9 @@ import { handleSystemControlMouseAtScreen, handleSystemControlWheel } from './co
 import { encodeAnsi } from '../codepage-utils';
 import { PAINT_TRACE_ENABLED, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
+import { msgStats } from '../../harness/msg-stats';
+import { translateKeyMessage } from './keyboard-translate';
+import { trySendCtlColor } from './ctl-color';
 
 const WM_TIMER = 0x0113;
 const WM_PAINT = 0x000F;
@@ -742,7 +745,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         maybeLogTimerDiag();
 
         const callerThreadId = system.scheduler.getCurrentThreadId();
-        const msg = system.windowManager.peekMessage(wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
+        const msg = system.windowManager.peekMessage((wRemoveMsg & PM_REMOVE) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
+        if (msg && msgStats.active && (wRemoveMsg & PM_REMOVE) === 0) msgStats.note('peekKeep', msg.hwnd, msg.message);
         const now = performance.now();
         peekCalls++;
         if (msg) peekHits++;
@@ -757,12 +761,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & PM_REMOVE) !== 0);
             // Queue empty — synthesize WM_QUIT if per-thread flag is set
             if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
                 if (quitState && quitState.posted) {
-                    if (wRemoveMsg !== 0) {
+                    if ((wRemoveMsg & PM_REMOVE) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
                     }
                     Logger.log(LogCategory.USER32, `PeekMessageW: synthesizing WM_QUIT exitCode=${quitState.exitCode} for thread=${callerThreadId}`);
@@ -792,7 +796,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (isKeyboardHookMessage(msg.message)) {
             const suspended = dispatchKeyboardHookChain(
-                ctx, msg, wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId,
+                ctx, msg, (wRemoveMsg & PM_REMOVE) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId,
                 lpMsg, 20, (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_KEYBOARD',
             );
             // Keyboard chain applies WH_GETMESSAGE internally on delivery.
@@ -802,7 +806,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // WH_GETMESSAGE fires on any message about to be returned unless the keyboard
         // chain already handled it above.
         const gm = dispatchGetMessageHook(
-            ctx, msg, wRemoveMsg !== 0, callerThreadId, lpMsg, 20,
+            ctx, msg, (wRemoveMsg & PM_REMOVE) !== 0, callerThreadId, lpMsg, 20,
             (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_GETMESSAGE',
         );
         if (gm) return gm;
@@ -825,6 +829,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const time = view.getUint32(lpMsg + 16, true);
 
             Logger.log(LogCategory.USER32, `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
+            if (msgStats.active) msgStats.note('dispatch', hwnd, message);
             if (PAINT_TRACE_ENABLED && message === WM_PAINT) {
                 logPaintTrace('DispatchMessageW', `enter hwnd=0x${hwnd.toString(16)} thread=${System.getInstance().scheduler.getCurrentThreadId()}`);
             }
@@ -977,8 +982,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 if (isContentChangingMessage(message)) {
                     repaintDialogAfterContentChange(window.parent ?? hwnd);
                 }
-                if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
-                return { value: result >>> 0, stackCleanup: 4 };
+                if (message === WM_NCDESTROY) {
+                    finalizeWindowDestroy(hwnd);
+                    return { value: result >>> 0, stackCleanup: 4 };
+                }
+                return trySendCtlColor(ctx, mem, window, result, 4, 'DispatchMessageW')
+                    ?? { value: result >>> 0, stackCleanup: 4 };
             }
             if (window && window.wndProc) {
                 // Sentinel WndProc: system control, handle in JS — do NOT call into x86
@@ -1018,90 +1027,20 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     exports['DispatchMessageA'] = exports['DispatchMessageW'];
 
-    // VK-to-character mapping for TranslateMessage (US keyboard layout)
-    const VK_SHIFT = 0x10;
-    const VK_CAPITAL = 0x14;
-
-    function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): number {
-        const upper = shiftDown !== capsLock; // XOR: shift or caps, not both
-
-        // Letters A-Z (VK 0x41-0x5A)
-        if (vk >= 0x41 && vk <= 0x5A) {
-            return upper ? vk : (vk + 32); // 'A'=65, 'a'=97
-        }
-
-        // Digits 0-9 (VK 0x30-0x39)
-        if (vk >= 0x30 && vk <= 0x39) {
-            if (shiftDown) {
-                const shiftDigits = ')!@#$%^&*(';
-                return shiftDigits.charCodeAt(vk - 0x30);
-            }
-            return vk; // '0'=0x30 .. '9'=0x39
-        }
-
-        // Numpad 0-9 (VK 0x60-0x69)
-        if (vk >= 0x60 && vk <= 0x69) return 0x30 + (vk - 0x60);
-
-        // Numpad operators
-        if (vk === 0x6A) return 0x2A; // *
-        if (vk === 0x6B) return 0x2B; // +
-        if (vk === 0x6D) return 0x2D; // -
-        if (vk === 0x6E) return 0x2E; // .
-        if (vk === 0x6F) return 0x2F; // /
-
-        // Common keys
-        if (vk === 0x20) return 0x20; // Space
-        if (vk === 0x0D) return 0x0D; // Enter
-        if (vk === 0x08) return 0x08; // Backspace
-        if (vk === 0x09) return 0x09; // Tab
-        if (vk === 0x1B) return 0x1B; // Escape
-
-        // OEM keys (US layout)
-        const oemMap: Record<number, [number, number]> = {
-            0xBA: [0x3B, 0x3A], // ;  :
-            0xBB: [0x3D, 0x2B], // =  +
-            0xBC: [0x2C, 0x3C], // ,  <
-            0xBD: [0x2D, 0x5F], // -  _
-            0xBE: [0x2E, 0x3E], // .  >
-            0xBF: [0x2F, 0x3F], // /  ?
-            0xC0: [0x60, 0x7E], // `  ~
-            0xDB: [0x5B, 0x7B], // [  {
-            0xDC: [0x5C, 0x7C], // \  |
-            0xDD: [0x5D, 0x7D], // ]  }
-            0xDE: [0x27, 0x22], // '  "
-        };
-        const oem = oemMap[vk];
-        if (oem) return shiftDown ? oem[1] : oem[0];
-
-        return 0; // No character for this VK (arrows, F-keys, etc.)
-    }
-
     exports['TranslateMessage'] = (ctx, mem, args) => {
         const lpMsg = args[0];
         if (!lpMsg) return 0;
-
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const message = view.getUint32(lpMsg + 4, true);
-
-        // Only translate WM_KEYDOWN (0x0100) and WM_SYSKEYDOWN (0x0104)
-        if (message !== 0x0100 && message !== 0x0104) return 0;
-
-        const hwnd = view.getUint32(lpMsg, true);
-        const vk = view.getUint32(lpMsg + 8, true) & 0xFF;
-
-        // Modifier state as the message queue sees it (GetKeyState: synchronous, with the
-        // CapsLock toggle bit) — not the live async level, which may already have moved on
-        // by the time the app pumps the queued WM_KEYDOWN.
-        const inputManager = System.getInstance().inputManager;
-        const shiftDown = (inputManager.getKeyState(VK_SHIFT) & 0x8000) !== 0;
-        const capsLock = (inputManager.getKeyState(VK_CAPITAL) & 0x0001) !== 0;
-        const charCode = vkToChar(vk, shiftDown, capsLock);
-        if (charCode === 0) return 0;
-
-        // Post WM_CHAR (or WM_SYSCHAR for SYSKEYDOWN)
-        const charMsg = message === 0x0104 ? 0x0106 : 0x0102; // WM_SYSCHAR : WM_CHAR
-        System.getInstance().windowManager.postMessage(hwnd, charMsg, charCode, view.getUint32(lpMsg + 12, true));
-        return 1; // TRUE - message was translated
+        translateKeyMessage(
+            view.getUint32(lpMsg, true),
+            message,
+            view.getUint32(lpMsg + 8, true),
+            view.getUint32(lpMsg + 12, true),
+        );
+        // Nonzero for any WM_(SYS)KEYDOWN/UP, whether or not it produced a character.
+        const isKeyMessage = message === 0x0100 || message === 0x0101 || message === 0x0104 || message === 0x0105;
+        return isKeyMessage ? 1 : 0;
     };
 
     exports['PostQuitMessage'] = (ctx, mem, args) => {
@@ -1201,6 +1140,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const wParam = args[2];
         const lParam = args[3];
         Logger.verbose(LogCategory.USER32, `SendMessageW(hwnd=0x${hWnd.toString(16)}, msg=0x${msg.toString(16)}, wParam=0x${wParam.toString(16)}, lParam=0x${lParam.toString(16)})`);
+        if (msgStats.active) msgStats.note('send', hWnd, msg);
 
         const targetWindow = getWindowByHandle(hWnd);
 
@@ -1246,7 +1186,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 if (isContentChangingMessage(msg)) {
                     repaintDialogAfterContentChange(targetWindow.parent ?? hWnd);
                 }
-                return result;
+                if (!allowGuestDispatch) return result;
+                return trySendCtlColor(ctx, mem, targetWindow, result, 16, 'SendMessageW') ?? result;
             }
 
             // Non-system windows: handle common messages in JS
@@ -1409,6 +1350,27 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
     exports['SendMessageTimeoutW'] = exports['SendMessageTimeoutA'];
 
+    // BOOL SendMessageCallbackA(HWND, UINT, WPARAM, LPARAM, SENDASYNCPROC, ULONG_PTR)
+    // Asynchronous send: the message is queued to the target's thread and the call
+    // returns TRUE immediately. Like the EnumWindows family we do not re-enter the
+    // guest SENDASYNCPROC — the observable effect on the TARGET (it receives the
+    // message through its own loop) is what the API is for; the result callback
+    // would need a second guest re-entry from inside a thunk.
+    exports['SendMessageCallbackA'] = (ctx, mem, args) => {
+        const hWnd = args[0];
+        const msg = args[1];
+        const wParam = args[2];
+        const lParam = args[3];
+        const lpResultCallBack = args[4];
+        Logger.verbose(
+            LogCategory.USER32,
+            `SendMessageCallbackA(hwnd=0x${hWnd.toString(16)}, msg=0x${msg.toString(16)}, cb=0x${lpResultCallBack.toString(16)})`,
+        );
+        System.getInstance().windowManager.postMessage(hWnd, msg, wParam, lParam);
+        return 1; // TRUE — message queued
+    };
+    exports['SendMessageCallbackW'] = exports['SendMessageCallbackA'];
+
     exports['SendNotifyMessageA'] = (ctx, mem, args) => {
         const hWnd = args[0];
         const msg = args[1];
@@ -1518,6 +1480,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         const wMsgFilterMin = dataView.getUint32(esp + 12, true);
         const wMsgFilterMax = dataView.getUint32(esp + 16, true);
         const wRemoveMsg = dataView.getUint32(esp + 20, true);
+        const PM_REMOVE = 0x0001;
 
         const system = System.getInstance();
 
@@ -1541,7 +1504,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
             }
         }
 
-        const msg = system.windowManager.peekMessage(wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
+        const msg = system.windowManager.peekMessage((wRemoveMsg & PM_REMOVE) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
 
         // dbg.peekstats() diagnostic: histogram of dequeued message ids + empty-return count
         if ((globalThis as any).__peekDiagEnabled === true) {
@@ -1554,12 +1517,12 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & PM_REMOVE) !== 0);
             // Queue empty — check per-thread quit flag before returning FALSE
             if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
                 if (quitState && quitState.posted) {
-                    if (wRemoveMsg !== 0) {
+                    if ((wRemoveMsg & PM_REMOVE) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
                     }
                     // Write synthesized WM_QUIT MSG

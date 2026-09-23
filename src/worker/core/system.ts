@@ -308,6 +308,9 @@ export class System {
         this.scheduler.onHasPendingAsyncRestores = () => {
             return dispatcher.hasPendingAsyncRestores();
         };
+        this.scheduler.onHasMessageQueueWaiters = () => {
+            return this.windowManager.hasWaiters();
+        };
         this.scheduler.onThreadOwnsSuspendedFrame = (threadId) => {
             return dispatcher.threadOwnsSuspendedFrame(threadId);
         };

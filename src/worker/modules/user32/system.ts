@@ -16,6 +16,7 @@ import { encodeAnsi, getCodePageDecoder, decodeAnsiString, writeAnsiToGuest, enc
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
+import { vkToChar } from '../../runtime/input/us-keyboard-layout';
 import {
     clipboardDataByFormat,
     isClipboardOpen,
@@ -28,20 +29,8 @@ import {
     noteLoadStringForDialog,
     windows,
     getAbsoluteWindowPosition,
+    sysColors,
 } from './shared-state';
-
-// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
-const sysColors = new Map<number, number>([
-    [0,  0xC0C0C0],  // COLOR_SCROLLBAR
-    [1,  0xC0DCC0],  // COLOR_BACKGROUND / COLOR_DESKTOP
-    [5,  0xFFFFFF],  // COLOR_WINDOW
-    [8,  0x000000],  // COLOR_WINDOWTEXT
-    [15, 0xC0C0C0],  // COLOR_BTNFACE
-    [16, 0x808080],  // COLOR_BTNSHADOW
-    [17, 0xFFFFFF],  // COLOR_GRAYTEXT (disabled text)
-    [18, 0x000080],  // COLOR_HIGHLIGHT
-    [19, 0xFFFFFF],  // COLOR_HIGHLIGHTTEXT
-]);
 
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -875,9 +864,13 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             };
             return scanToVk[uCode] ?? 0;
         } else if (uMapType === 2) {
-            // Virtual key to unshifted character
+            // MAPVK_VK_TO_CHAR: the character ON THE KEY, i.e. UPPERCASE for letters —
+            // "unshifted" refers to the layout's shift state, not to letter case. Games
+            // build their own VK→char translation on this and range-check the result
+            // against 'A'..'Z'; returning lowercase makes every letter fail that check
+            // and silently drop out of text entry.
             if (uCode >= 0x30 && uCode <= 0x39) return uCode; // 0-9
-            if (uCode >= 0x41 && uCode <= 0x5A) return uCode + 32; // a-z (lowercase)
+            if (uCode >= 0x41 && uCode <= 0x5A) return uCode; // A-Z
             if (uCode === 0x20) return 0x20; // Space
             const oemChar: Record<number, number> = {
                 0xBA: 0x3B, 0xBB: 0x3D, 0xBC: 0x2C, 0xBD: 0x2D,
@@ -906,46 +899,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
         if (!lpChar) return 0;
 
-        // Check shift state from keyboard state array
         const shiftDown = lpKeyState ? (mem[lpKeyState + 0x10] & 0x80) !== 0 : false;
+        const ctrlDown = lpKeyState ? (mem[lpKeyState + 0x11] & 0x80) !== 0 : false;
         const capsLock = lpKeyState ? (mem[lpKeyState + 0x14] & 0x01) !== 0 : false;
-
-        let ch = 0;
-        // Letters
-        if (uVirtKey >= 0x41 && uVirtKey <= 0x5A) {
-            const upper = shiftDown !== capsLock; // XOR
-            ch = upper ? uVirtKey : uVirtKey + 32;
-        }
-        // Digits 0-9
-        else if (uVirtKey >= 0x30 && uVirtKey <= 0x39) {
-            if (shiftDown) {
-                const shifted = ')!@#$%^&*(';
-                ch = shifted.charCodeAt(uVirtKey - 0x30);
-            } else {
-                ch = uVirtKey;
-            }
-        }
-        // Space, Enter, Tab, Escape
-        else if (uVirtKey === 0x20) ch = 0x20;
-        else if (uVirtKey === 0x0D) ch = 0x0D;
-        else if (uVirtKey === 0x09) ch = 0x09;
-        else if (uVirtKey === 0x1B) ch = 0x1B;
-        else if (uVirtKey === 0x08) ch = 0x08;
-        // OEM keys (US layout)
-        else {
-            const oemUnshifted: Record<number, number> = {
-                0xBA: 0x3B, 0xBB: 0x3D, 0xBC: 0x2C, 0xBD: 0x2D,
-                0xBE: 0x2E, 0xBF: 0x2F, 0xC0: 0x60,
-                0xDB: 0x5B, 0xDC: 0x5C, 0xDD: 0x5D, 0xDE: 0x27,
-            };
-            const oemShifted: Record<number, number> = {
-                0xBA: 0x3A, 0xBB: 0x2B, 0xBC: 0x3C, 0xBD: 0x5F,
-                0xBE: 0x3E, 0xBF: 0x3F, 0xC0: 0x7E,
-                0xDB: 0x7B, 0xDC: 0x7C, 0xDD: 0x7D, 0xDE: 0x22,
-            };
-            ch = shiftDown ? (oemShifted[uVirtKey] ?? 0) : (oemUnshifted[uVirtKey] ?? 0);
-        }
-
+        const ch = vkToChar(uVirtKey, shiftDown, capsLock, ctrlDown);
         if (ch === 0) return 0;
 
         mem[lpChar] = ch & 0xFF;

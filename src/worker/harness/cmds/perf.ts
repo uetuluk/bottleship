@@ -9,6 +9,8 @@
  *                                    category breakdown + hottest thunks — the
  *                                    POJO equivalent of the Worst-Frames UI.
  *  - perfStats()                     latest + average frame sample + spike count.
+ *  - msgStats({action?, top?})       window-message histogram (dispatch/send/
+ *                                    callproc × hwnd × msg) — names a message storm.
  *
  * Self-improvement: replaces ad-hoc PRESENT-DIAG/READBACK-DIAG log probes for
  * "what is the 185ms Flip/Blt spending its time on".
@@ -17,6 +19,8 @@
 import type { HarnessService } from "../service";
 import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../core/frame-profiler";
 import { profiler } from "../../core/profiler";
+import { msgStats } from "../msg-stats";
+import { windows } from "../../modules/user32/shared-state";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -85,6 +89,25 @@ export function registerPerfCommands(svc: HarnessService): void {
             .sort((a, b) => (sortKey === "total" ? b.totalMs - a.totalMs : sortKey === "avg" ? b.avgMs - a.avgMs : b.maxMs - a.maxMs))
             .slice(0, top);
         return { enabled: profiler.isEnabled(), bucketCount: Object.keys(raw).length, rows };
+    });
+
+    /** msgStats({action?='read', top?=15}) — 'start' clears + arms the counters (post rows carry a sampled 'postedFrom' stack),
+     *  'stop' disarms, 'read' returns the ranked rows (with each hwnd's class). */
+    svc.register("msgStats", (args) => {
+        const opts = (args[0] ?? {}) as { action?: "start" | "stop" | "read"; top?: number };
+        if (opts.action === "start") msgStats.start();
+        else if (opts.action === "stop") msgStats.stop();
+        const snap = msgStats.snapshot(opts.top ?? 15);
+        return {
+            active: msgStats.active,
+            elapsedMs: snap.elapsedMs,
+            total: snap.total,
+            rows: snap.rows.map((r) => ({
+                ...r,
+                msgHex: `0x${r.msg.toString(16)}`,
+                cls: windows.get(r.hwnd)?.systemControlClass ?? windows.get(r.hwnd)?.nativeClassName ?? windows.get(r.hwnd)?.title ?? null,
+            })),
+        };
     });
 
     /** perfSpikes({top?=8, minMs?=0}) — worst frames with category + hot-thunk breakdown. */

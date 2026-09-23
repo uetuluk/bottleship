@@ -47,6 +47,19 @@ const SYSTEM_CLASS_ATOMS: Record<number, string> = {
     0x0085: 'ComboBox',
 };
 
+/**
+ * Canonical name of a predefined USER32 control class (by name or class atom), or
+ * null for any other class. These classes exist without RegisterClass.
+ */
+export function predefinedControlClassName(className: string | number): string | null {
+    if (typeof className === 'number') return SYSTEM_CLASS_ATOMS[className] ?? null;
+    const lower = className.toLowerCase();
+    for (const name of Object.values(SYSTEM_CLASS_ATOMS)) {
+        if (name.toLowerCase() === lower) return name;
+    }
+    return null;
+}
+
 /** DWORD-align an offset */
 function dwordAlign(offset: number): number {
     return (offset + 3) & ~3;

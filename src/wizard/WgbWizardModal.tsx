@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cx } from "../ui/cx";
+import { isWgbUrl } from "../wgb-url";
 import s from "./WgbWizardModal.module.css";
 import os from "../ui/Overlay/Overlay.module.css";
 import bm from "../ui/Button/Button.module.css";
@@ -593,7 +594,7 @@ export default function WgbWizardModal({
   const submitUrl = useCallback(() => {
     const v = urlInput.trim();
     if (!v) return;
-    if (!/\.wgb(\?|#|$)/i.test(v)) {
+    if (!isWgbUrl(v)) {
       setError("URL loading expects a direct link to a .wgb bundle.");
       return;
     }
