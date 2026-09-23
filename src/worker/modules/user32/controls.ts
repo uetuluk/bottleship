@@ -84,7 +84,7 @@ const OPAQUE = 2;
 // Font used for control labels
 const CONTROL_FONT = "11px 'Liberation Sans', sans-serif";
 
-function getWindowFont(win: WindowInfo): string {
+export function getWindowFont(win: WindowInfo): string {
     const parent = win.parent !== undefined ? windows.get(win.parent) : undefined;
     const hFont = win.fontHandle || parent?.fontHandle || 0;
     if (!hFont) return CONTROL_FONT;
