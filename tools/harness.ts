@@ -5,6 +5,9 @@
  *   bun tools/harness.ts up                 cold-to-ready: launch/attach Chrome
  *                                           (+ --autoplay-policy), open ?game=dev,
  *                                           arm log streaming, probe all 3 services
+ *                                           (--window: open a missing BS_TAB tab in its own window)
+ *   bun tools/harness.ts front              raise the BS_TAB tab so it is not throttled
+ *   bun tools/harness.ts clearStorage       wipe the dev origin's storage (clean install)
  *   bun tools/harness.ts run <script.ts>    run a *.harness.ts fluent script
  *   bun tools/harness.ts repl               interactive: eval lines in the page
  *   bun tools/harness.ts health             probe Vite/log-server/Chrome
@@ -23,6 +26,8 @@
 import {
     launchOrAttachChrome,
     findOrCreateTab,
+    findTab,
+    openTabInNewWindow,
     connect,
     pageEval,
     workerEval,
@@ -147,10 +152,13 @@ export function harness(): HarnessChain {
 
 /* ─────────────────────────────── CLI commands ─────────────────────────────── */
 
-async function cmdUp(): Promise<void> {
+async function cmdUp(flags: string[] = []): Promise<void> {
     console.log("[harness up] probing services…");
     await launchOrAttachChrome({ autoplay: true });
-    const tab = await findOrCreateTab(DEFAULT_DEV_URL);
+    // --window: a missing BS_TAB tab opens in its own window (net-room peers must not throttle each other).
+    const tab = flags.includes("--window")
+        ? await findTab().catch(() => openTabInNewWindow(DEFAULT_DEV_URL))
+        : await findOrCreateTab(DEFAULT_DEV_URL);
     const session = await CdpSession.connect(tab.webSocketDebuggerUrl);
     _session = session;
     await waitForHarnessReady(session);
@@ -302,6 +310,24 @@ async function cmdReload(): Promise<void> {
     console.log("page reloaded (harness ready)");
 }
 
+/** front — raise the BS_TAB tab (and its window) so the browser stops throttling it. */
+async function cmdFront(): Promise<void> {
+    const session = await ensureSession();
+    await session.send("Page.bringToFront");
+    console.log("brought to front");
+}
+
+/**
+ * clearStorage — wipe the dev origin's storage (OPFS overlay, IndexedDB, caches) so a run
+ * starts from a clean install. Every tab on the origin shares it, so do this before loading.
+ */
+async function cmdClearStorage(): Promise<void> {
+    const session = await ensureSession();
+    const origin = new URL(DEFAULT_DEV_URL).origin;
+    await session.send("Storage.clearDataForOrigin", { origin, storageTypes: "all" });
+    console.log(`cleared storage for ${origin}`);
+}
+
 /** Run a single harness cmd and pretty-print its result (report/stubs/backtrace).
  *  Numeric args (e.g. an esp) are parsed; everything else passes through. */
 async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
@@ -318,7 +344,9 @@ async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
 async function main(): Promise<void> {
     const [, , cmd, ...rest] = process.argv;
     switch (cmd) {
-        case "up": await cmdUp(); break;
+        case "up": await cmdUp(rest); break;
+        case "front": await cmdFront(); break;
+        case "clearStorage": case "clear-storage": await cmdClearStorage(); break;
         case "run": await cmdRun(rest[0]); break;
         case "repl": await cmdRepl(); break;
         case "health": await cmdHealth(); break;
@@ -329,7 +357,7 @@ async function main(): Promise<void> {
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
         case "reload": await cmdReload(); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|shot [out.png]|gridShot [out.png] [step]|reload|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up [--window]|front|clearStorage|run <script>|repl|health|eval <expr>|worker-eval <expr>|shot [out.png]|gridShot [out.png] [step]|reload|<any-harness-command> [args...]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,

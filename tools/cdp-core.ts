@@ -164,6 +164,30 @@ export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: numb
     throw new Error(`failed to open tab ${url} (PUT and GET both rejected)`);
 }
 
+/**
+ * Open `url` as a page in its OWN browser window. Two emulator tabs sharing one window
+ * throttle whichever is in the background, so a multi-instance (net room) session needs a
+ * window per instance for both guests to keep real-time pace.
+ */
+export async function openTabInNewWindow(url = DEFAULT_DEV_URL, opts: { port?: number } = {}): Promise<CdpTarget> {
+    const port = opts.port ?? DEFAULT_CDP_PORT;
+    const version = await fetchJson(port, "/json/version");
+    const browser = await CdpSession.connect(version.webSocketDebuggerUrl);
+    try {
+        const r = await browser.send("Target.createTarget", { url, newWindow: true });
+        const targetId = r.result?.targetId as string;
+        for (let i = 0; i < 20; i++) {
+            const list: CdpTarget[] = await fetchJson(port, "/json/list");
+            const hit = list.find((t) => t.id === targetId);
+            if (hit) return hit;
+            await Bun.sleep(250);
+        }
+        throw new Error(`new window target ${targetId} never appeared in /json/list`);
+    } finally {
+        browser.close();
+    }
+}
+
 /** A live CDP WebSocket session with id-correlated requests + event fan-out. */
 export class CdpSession {
     private ws: WebSocket;
