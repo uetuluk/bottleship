@@ -23,6 +23,7 @@ import { PAINT_TRACE_ENABLED, logPaintMsgDelivered, logPaintPendingBlocked, logP
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
 import { msgStats } from '../../harness/msg-stats';
 import { translateKeyMessage } from './keyboard-translate';
+import { trySendCtlColor } from './ctl-color';
 
 const WM_TIMER = 0x0113;
 const WM_PAINT = 0x000F;
@@ -981,8 +982,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 if (isContentChangingMessage(message)) {
                     repaintDialogAfterContentChange(window.parent ?? hwnd);
                 }
-                if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
-                return { value: result >>> 0, stackCleanup: 4 };
+                if (message === WM_NCDESTROY) {
+                    finalizeWindowDestroy(hwnd);
+                    return { value: result >>> 0, stackCleanup: 4 };
+                }
+                return trySendCtlColor(ctx, mem, window, result, 4, 'DispatchMessageW')
+                    ?? { value: result >>> 0, stackCleanup: 4 };
             }
             if (window && window.wndProc) {
                 // Sentinel WndProc: system control, handle in JS — do NOT call into x86
@@ -1181,7 +1186,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 if (isContentChangingMessage(msg)) {
                     repaintDialogAfterContentChange(targetWindow.parent ?? hWnd);
                 }
-                return result;
+                if (!allowGuestDispatch) return result;
+                return trySendCtlColor(ctx, mem, targetWindow, result, 16, 'SendMessageW') ?? result;
             }
 
             // Non-system windows: handle common messages in JS

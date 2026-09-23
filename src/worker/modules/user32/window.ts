@@ -56,6 +56,8 @@ import {
     isDialogInitInProgress,
     isWindowInitInProgress,
 } from './activation-messages';
+import { trySendCtlColor } from './ctl-color';
+import { defWindowProcCtlColor, WM_CTLCOLORMSGBOX, WM_CTLCOLORSTATIC } from './ctl-color-brush';
 
 export function getWindowByHandle(handle: number): WindowInfo | undefined {
     return windows.get(handle);
@@ -857,6 +859,10 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             return result;
         }
 
+        if (Msg >= WM_CTLCOLORMSGBOX && Msg <= WM_CTLCOLORSTATIC) {
+            return defWindowProcCtlColor(Msg, wParam >>> 0, System.getInstance().gdiContext);
+        }
+
         if (Msg === WM_CLOSE) {
             // Default: DestroyWindow(hWnd) which posts WM_DESTROY
             Logger.log(LogCategory.USER32, `DefWindowProcA: WM_CLOSE -> DestroyWindow(0x${hWnd.toString(16)})`);
@@ -1361,7 +1367,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (isContentChangingMessage(Msg)) {
                 repaintDialogAfterContentChange(win.parent ?? hWnd);
             }
-            return { value: result >>> 0, stackCleanup: 5 * 4 };
+            return trySendCtlColor(ctx, mem, win, result, 5 * 4, 'CallWindowProcA')
+                ?? { value: result >>> 0, stackCleanup: 5 * 4 };
         }
 
         const system = System.getInstance();

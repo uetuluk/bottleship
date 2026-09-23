@@ -112,6 +112,8 @@ export function purgeControlState(hwnd: number): void {
     buttonCheckStates.delete(h);
     listControlStates.delete(h);
     editControlStates.delete(h);
+    ctlColorAnswers.delete(h);
+    ctlColorStale.delete(h);
     trackbarStates.delete(h);
     controlImageHandles.delete(h);
 }
@@ -334,6 +336,34 @@ export interface EditControlState {
     modified: boolean;
     passwordChar: number;
 }
+// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
+export const sysColors = new Map<number, number>([
+    [0,  0xC0C0C0],  // COLOR_SCROLLBAR
+    [1,  0xC0DCC0],  // COLOR_BACKGROUND / COLOR_DESKTOP
+    [5,  0xFFFFFF],  // COLOR_WINDOW
+    [8,  0x000000],  // COLOR_WINDOWTEXT
+    [15, 0xC0C0C0],  // COLOR_BTNFACE
+    [16, 0x808080],  // COLOR_BTNSHADOW
+    [17, 0xFFFFFF],  // COLOR_GRAYTEXT (disabled text)
+    [18, 0x000080],  // COLOR_HIGHLIGHT
+    [19, 0xFFFFFF],  // COLOR_HIGHLIGHTTEXT
+]);
+
+
+/** Parent answer to WM_CTLCOLOR* for a control (last query; reused by paints that cannot call back). */
+export interface CtlColorAnswer {
+    textColor: number;
+    bkColor: number;
+    bkMode: number;
+    brush: number;
+}
+/** hwnd → answer; an entry with brush 0 means the parent chose the class defaults. */
+export const ctlColorAnswers: Map<number, CtlColorAnswer> = new Map();
+/** Controls whose next class-proc run must re-ask the parent (a repaint happened). */
+export const ctlColorStale: Set<number> = new Set();
+/** Controls with a WM_CTLCOLOR* query in flight. */
+export const ctlColorInFlight: Set<number> = new Set();
+
 export const editControlStates: Map<number, EditControlState> = new Map();
 
 export function getOrCreateEditState(hwnd: number, passwordChar: number): EditControlState {
@@ -425,11 +455,14 @@ export function resetUser32SharedState(): void {
     buttonCheckStates.clear();
     listControlStates.clear();
     editControlStates.clear();
+    ctlColorAnswers.clear();
     trackbarStates.clear();
     controlImageHandles.clear();
     clipboardDataByFormat.clear();
     clipboardOpenOwner = null;
     resetOwnerDrawScratch();
+    ctlColorStale.clear();
+    ctlColorInFlight.clear();
     resetHooks();
     Logger.log(LogCategory.USER32, 'User32 shared state reset');
 }

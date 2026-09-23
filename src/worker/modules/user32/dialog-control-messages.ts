@@ -17,6 +17,7 @@ import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bit
 import { encodeAnsi } from '../codepage-utils';
 import { handleEditMessage, isEditControl, onEditTextSet } from './edit-control';
 import { clearWindowUpdate } from './paint-region';
+import { markCtlColorStale } from './ctl-color-brush';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -251,6 +252,7 @@ export function handleSystemControlMessage(
         case WM_PAINT: {
             // The class proc's BeginPaint/EndPaint validates the update region.
             clearWindowUpdate(child.handle);
+            markCtlColorStale(child.handle);
             const gdi = System.getInstance().gdiContext;
             const hdc = wParam || gdi.createOverlayDC();
             if (hdc) {
