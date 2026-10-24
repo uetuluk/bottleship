@@ -178,6 +178,10 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         }).unref();
     } else if (IS_LINUX) {
         const headless = !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+        // Default to the bundled SwiftShader Vulkan ICD: it is the only path that is
+        // reliable headless, and on this workstation the native Vulkan path can wedge
+        // Chrome during device init. BS_GPU=hardware opts into the real adapter.
+        const useHardwareGpu = !headless && process.env.BS_GPU === "hardware";
         // Without a Vulkan device the GPU process has no shared-image backing for a
         // WebGPU swap chain: the device is lost on the first canvas present. Chrome
         // ships a SwiftShader Vulkan ICD next to its binary; point the loader at it.
@@ -187,11 +191,11 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         if (!env.VK_ICD_FILENAMES && existsSync(swiftshaderIcd)) env.VK_ICD_FILENAMES = swiftshaderIcd;
         const linuxArgs = [
             ...(headless ? ["--headless=new", "--hide-scrollbars"] : []),
+            ...(!useHardwareGpu
+                ? ["--enable-features=Vulkan", "--use-angle=swiftshader", "--use-vulkan=swiftshader"]
+                : ["--enable-features=Vulkan"]),
             "--no-sandbox",
             "--enable-unsafe-webgpu",
-            "--use-angle=swiftshader",
-            "--enable-features=Vulkan",
-            "--use-vulkan=swiftshader",
             ...args,
         ];
         mkdirSync(CHROME_STDIO_DIR, { recursive: true });

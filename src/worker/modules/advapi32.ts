@@ -18,6 +18,8 @@ const HKEY_PERFORMANCE_DATA = 0x80000004;
 const HKEY_CURRENT_CONFIG = 0x80000005;
 const HKEY_DYN_DATA = 0x80000006;
 const ERROR_INVALID_HANDLE = 6;
+/** StartServiceCtrlDispatcher/RegisterServiceCtrlHandler outside an SCM child. */
+const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_ACCESS_DENIED = 5;
 const ERROR_INSUFFICIENT_BUFFER = 122;
@@ -1642,11 +1644,18 @@ export class Advapi32 implements IModule {
             return { value: 1, stackCleanup: 8 };
         };
 
+        // BOOL StartServiceCtrlDispatcherA(const SERVICE_TABLE_ENTRYA*)
+        //
+        // We are never started by the Service Control Manager, so the faithful answer is
+        // FALSE + ERROR_FAILED_SERVICE_CONTROLLER_CONNECT. Returning success is the worst
+        // possible lie: a game that probes "am I a service?" (Diablo II's Blizzard
+        // service/background path does exactly this) then takes its service branch,
+        // registers a handler and exits cleanly — before it ever creates a window.
         this.exports["StartServiceCtrlDispatcherA"] = (ctx, mem, args) => {
             const lpServiceStartTable = args[0] >>> 0;
-            Logger.verbose(LogCategory.SYSTEM, `StartServiceCtrlDispatcherA(table=0x${lpServiceStartTable.toString(16)})`);
-            system.scheduler.setLastError(0);
-            return { value: 1, stackCleanup: 4 };
+            Logger.verbose(LogCategory.SYSTEM, `StartServiceCtrlDispatcherA(table=0x${lpServiceStartTable.toString(16)}) -> FALSE (not an SCM child)`);
+            system.scheduler.setLastError(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT);
+            return { value: 0, stackCleanup: 4 };
         };
 
         this.exports["RegisterServiceCtrlHandlerA"] = (ctx, mem, args) => {
@@ -1654,14 +1663,11 @@ export class Advapi32 implements IModule {
             const lpHandlerProc = args[1] >>> 0;
             const serviceName = lpServiceName ? Marshaler.readString(mem, lpServiceName) : "";
 
-            const handle = process.resourceProvider.registerKernelObject({
-                kind: "service_status",
-                serviceName,
-                handler: lpHandlerProc,
-            });
-
-            system.scheduler.setLastError(0);
-            return { value: handle >>> 0, stackCleanup: 8 };
+            // Only an SCM-launched service has a status handle; outside one this fails.
+            Logger.verbose(LogCategory.SYSTEM,
+                `RegisterServiceCtrlHandlerA("${serviceName}", handler=0x${lpHandlerProc.toString(16)}) -> NULL (not an SCM child)`);
+            system.scheduler.setLastError(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT);
+            return { value: 0, stackCleanup: 8 };
         };
 
         this.exports["SetServiceStatus"] = (ctx, mem, args) => {

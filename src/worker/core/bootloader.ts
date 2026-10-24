@@ -264,9 +264,9 @@ export function createBootloader(
         hInt80Off
     );
     finalBuffer.set(
-        createRecoverableHandlerBytes(0xdead0000),
+        createRecoverableFaultHandler(0xdead0000, true),
         hDeOff
-    ); // #DE - recoverable via IRET
+    ); // #DE - recoverable via IRET, frame shape uniform with #UD/#PF
     // A trap pushes no error code, so both share the #UD frame shape (dummy pushed).
     finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.bp, true), hBpOff);
     finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.of, true), hOfOff);
@@ -342,19 +342,6 @@ function createHaltHandlerBytes(
  *
  * Handler: MOV EAX, thunkId; MOV EDX, 0xB077; OUT DX, EAX; IRET (12 bytes)
  */
-function createRecoverableHandlerBytes(thunkId: number): Uint8Array {
-    return new Uint8Array([
-        0xb8,                           // MOV EAX, imm32
-        thunkId & 0xff,
-        (thunkId >> 8) & 0xff,
-        (thunkId >> 16) & 0xff,
-        (thunkId >> 24) & 0xff,
-        0xba, 0x77, 0xb0, 0x00, 0x00,  // MOV EDX, 0xB077
-        0xef,                           // OUT DX, EAX
-        0xcf,                           // IRET
-    ]);
-}
-
 /**
  * Creates a recoverable #UD/#GP handler: save EAX/EDX, OUT to JS, restore,
  * pop the error code, IRET. Same frame shape as the #PF handler during the OUT:

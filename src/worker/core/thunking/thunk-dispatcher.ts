@@ -7755,12 +7755,17 @@ export class ThunkDispatcher {
         const esp = cpu.reg32[4] >>> 0;
         const view = this.cachedDataView!;
 
-        if (esp + 12 > this.memLength) {
+        // The #DE stub pushes a dummy error code and saves EAX/EDX, so its interrupt
+        // frame is uniform with #UD/#PF: [ESP]=saved EDX, [ESP+4]=saved EAX,
+        // [ESP+8]=error code, [ESP+12]=EIP, [ESP+16]=CS, [ESP+20]=EFLAGS.
+        if (esp + 24 > this.memLength) {
             Logger.error(LogCategory.SYSTEM, `#DE: Cannot recover - ESP=0x${esp.toString(16)} out of range`);
             return;
         }
 
-        const faultingEip = view.getUint32(esp, true) >>> 0;
+        const savedEdx = view.getUint32(esp, true) >>> 0;
+        const savedEax = view.getUint32(esp + 4, true) >>> 0;
+        const faultingEip = view.getUint32(esp + 12, true) >>> 0;
 
         // Parse the faulting DIV/IDIV instruction to determine its length
         const instrLen = this._getDivInstructionLength(mem, faultingEip);
@@ -7773,12 +7778,25 @@ export class ThunkDispatcher {
 
         const newEip = (faultingEip + instrLen) >>> 0;
 
-        // Advance EIP on the interrupt frame so IRET resumes past the faulting instruction
-        view.setUint32(esp, newEip, true);
+        // Windows delivers #DE to the SEH chain as STATUS_INTEGER_DIVIDE_BY_ZERO
+        // (0xC0000094) — it does NOT skip the instruction. A guest handler may fix
+        // a register in the CONTEXT and return ContinueExecution, and the hardware
+        // then RETRIES the division. Diablo II's startup does exactly this: its
+        // handler rewrites ECX (the divisor) from 0 to 6 and the idiv must re-run.
+        // Skipping here would corrupt the decrypted code block it is building.
+        if (!this._sehFaultDispatchGuard(esp, faultingEip, 0, view)) return;
+        if (this._tryDispatchAccessViolation(
+            cpu, 0, faultingEip, false, esp, savedEax, savedEdx, view, 0xC0000094,
+        )) return;
 
-        // Set EAX=0 (quotient), EDX=0 (remainder) � safe "result" for division by zero
-        cpu.reg32[0] = 0;
-        cpu.reg32[2] = 0;
+        // No guest handler caught it: keep the historical recovery — report a zero
+        // quotient/remainder and resume past the instruction. The stub restores the
+        // saved EAX/EDX slots AFTER the OUT, so the values it will restore are
+        // rewritten here, not cpu.reg32.
+        view.setUint32(esp, 0, true);      // EDX = 0 (remainder)
+        view.setUint32(esp + 4, 0, true);  // EAX = 0 (quotient)
+        // Advance EIP on the interrupt frame so IRET resumes past the faulting instruction
+        view.setUint32(esp + 12, newEip, true);
 
         // Log with module info
         const moduleRegistry = System.getInstance().process?.moduleRegistry;
@@ -7807,9 +7825,9 @@ export class ThunkDispatcher {
 
         // Full register dump
         const regDump =
-            `EAX=0x${(cpu.reg32[0] >>> 0).toString(16).padStart(8, '0')} ` +
+            `EAX=0x${savedEax.toString(16).padStart(8, '0')} ` +
             `ECX=0x${(cpu.reg32[1] >>> 0).toString(16).padStart(8, '0')} ` +
-            `EDX=0x${(cpu.reg32[2] >>> 0).toString(16).padStart(8, '0')} ` +
+            `EDX=0x${savedEdx.toString(16).padStart(8, '0')} ` +
             `EBX=0x${(cpu.reg32[3] >>> 0).toString(16).padStart(8, '0')}\n` +
             `  ESP=0x${(cpu.reg32[4] >>> 0).toString(16).padStart(8, '0')} ` +
             `EBP=0x${(cpu.reg32[5] >>> 0).toString(16).padStart(8, '0')} ` +
