@@ -1,207 +1,113 @@
-// io-worker.ts
-//
-// Dedicated I/O worker: owns the network transport for a streamed WGB bundle and
-// serves the guest worker's synchronous reads over the SAB protocol
-// (sab-io-protocol.ts). Its event loop is NEVER blocked, so unlike the guest it
-// can fetch many ranges in parallel and prefetch ahead of the guest's cursor —
-// turning the guest's serial, latency-bound cold reads into a bandwidth-bound
-// pipeline. Cold reads the guest asks for are usually already resident here
-// (prefetched), so the guest wakes after ~a SAB round-trip, not a network one.
-//
-// Cache granularity is a large CHUNK (not the guest's 256 KiB block) so each
-// network fetch is a big, few-round-trip transfer, and a guest readahead run is
-// satisfied by fetching its covering chunks IN PARALLEL (Promise.all).
+import { HttpRangeSource, type ReadHint } from "@bottleship/formats/zip";
+import * as P from "./sab-io-protocol";
+import { SparseWgbCache } from "./sparse-wgb-cache";
+import { StreamIoRuntime } from "./stream-io-runtime";
 
-import { HttpRangeSource } from "@bottleship/formats/zip";
-import type { ZipSource } from "@bottleship/formats/zip";
-import {
-    CTL_STATE, CTL_RESP_LEN, CTL_ERRNO, CTL_WORDS,
-    CTL_IO_NET_FETCHES, CTL_IO_PREFETCHES, CTL_IO_CACHE_SERVES, CTL_REQS,
-    META_OFFSET_BYTES, META_REQ_OFF, META_REQ_LEN, META_WORDS,
-    DATA_OFFSET_BYTES, DATA_BYTES,
-    ST_DONE, ST_ERR,
-} from "./sab-io-protocol";
+let ctl: Int32Array;
+let meta: Float64Array;
+let data: Uint8Array;
+let runtime: StreamIoRuntime | null = null;
+let shuttingDown = false;
+let lastDiskError: string | null = null;
 
-/** Network fetch granularity. A guest readahead run (≤ 8 MiB) is fetched as its
- *  covering chunks IN PARALLEL, so the chunk size trades per-fetch overhead
- *  against within-request parallelism: too small (e.g. 1 MiB → 8 fetches/run)
- *  and fixed per-fetch cost dominates when the data is warm; 2 MiB keeps a run to
- *  ~4 concurrent fetches while roughly halving the fetch count. */
-let CHUNK = 2 << 20;
-/** Resident chunk-cache budget in the I/O worker (LRU). Sized to comfortably hold
- *  a boot working set plus the prefetch window without thrash. Tunable via init. */
-let MAX_CACHE_BYTES = 256 * 1024 * 1024;
-/** How far ahead of the last request offset to keep prefetched, in chunks. 0 =
- *  off (pure parallel cold fetch). Kept SMALL: a boot streams most of the bundle
- *  in SCATTERED order (measured — most requests jump to a new file), so a wide
- *  linear-ahead window mostly fetches chunks the guest never asks for, wasting
- *  bandwidth the critical cold fetches need and evicting live data. A small
- *  window still catches the immediate-continuation case cheaply. Tunable via init. */
-let PREFETCH_AHEAD_CHUNKS = 4;
-/** Max concurrent network fetches (cold + prefetch). Kept a couple below the
- *  browser's per-origin connection cap so a cold guest request is never queued
- *  behind a wall of prefetches. Tunable via init. */
-let MAX_INFLIGHT = 6;
-
-let ctl: Int32Array | null = null;
-let meta: Float64Array | null = null;
-let data: Uint8Array | null = null;
-let source: ZipSource | null = null;
-
-const chunks = new Map<number, Uint8Array>();
-const inflight = new Map<number, Promise<Uint8Array>>();
-const lru: number[] = [];
-let residentBytes = 0;
-
-let netFetches = 0;   // cold, on the guest's critical path
-let prefetches = 0;   // speculative, ahead of the cursor
-let cacheServes = 0;  // requests answered with zero cold fetch
-let requests = 0;
-
-function touch(ci: number): void {
-    const i = lru.indexOf(ci);
-    if (i >= 0) lru.splice(i, 1);
-    lru.push(ci);
-}
-
-function evictIfNeeded(): void {
-    while (residentBytes > MAX_CACHE_BYTES && lru.length > 1) {
-        const victim = lru.shift()!;
-        const b = chunks.get(victim);
-        if (b) { residentBytes -= b.byteLength; chunks.delete(victim); }
-    }
-}
-
-/** Fetch chunk `ci` (coalesced). `prefetch` flags a speculative fetch for stats. */
-function getChunk(ci: number, prefetch: boolean): Promise<Uint8Array> {
-    const have = chunks.get(ci);
-    if (have) { touch(ci); return Promise.resolve(have); }
-    const pending = inflight.get(ci);
-    if (pending) return pending;
-
-    const src = source!;
-    const start = ci * CHUNK;
-    const end = Math.min(src.size, start + CHUNK);
-    if (prefetch) prefetches++; else netFetches++;
-    const p = src.readRange(start, end)
-        .then((buf) => {
-            if (!chunks.has(ci)) {
-                chunks.set(ci, buf);
-                lru.push(ci);
-                residentBytes += buf.byteLength;
-                evictIfNeeded();
-            } else {
-                touch(ci);
-            }
-            inflight.delete(ci);
-            return chunks.get(ci)!;
-        })
-        .catch((err) => { inflight.delete(ci); throw err; });
-    inflight.set(ci, p);
-    return p;
-}
-
-/** Assemble [off, off+len) from covering chunks, fetching missing ones in PARALLEL. */
-async function serve(off: number, len: number): Promise<Uint8Array> {
-    const src = source!;
-    const e = Math.min(src.size, off + len);
-    const first = Math.floor(off / CHUNK);
-    const last = Math.floor((e - 1) / CHUNK);
-    const allResident = (() => { for (let c = first; c <= last; c++) if (!chunks.has(c)) return false; return true; })();
-    if (allResident) cacheServes++;
-
-    const need: Array<Promise<Uint8Array>> = [];
-    for (let c = first; c <= last; c++) need.push(getChunk(c, false));
-    const parts = await Promise.all(need);
-
-    const out = new Uint8Array(e - off);
-    for (let c = first; c <= last; c++) {
-        const b = parts[c - first];
-        const cs = c * CHUNK;
-        const copyS = Math.max(off, cs);
-        const copyE = Math.min(e, cs + b.byteLength);
-        if (copyE > copyS) out.set(b.subarray(copyS - cs, copyE - cs), copyS - off);
-    }
-    return out;
-}
-
-/** Speculatively pull chunks ahead of the just-served range, in parallel, bounded
- *  by MAX_INFLIGHT — anchored to the actual request offset so it follows the
- *  guest's real cursor (and re-anchors on a seek to a new file) rather than
- *  blindly linear-scanning a multi-GB archive. */
-function prefetchAhead(fromOff: number): void {
-    const src = source!;
-    const startChunk = Math.floor(fromOff / CHUNK);
-    for (let i = 0; i < PREFETCH_AHEAD_CHUNKS; i++) {
-        const ci = startChunk + i;
-        if (ci * CHUNK >= src.size) break;
-        if (chunks.has(ci) || inflight.has(ci)) continue;
-        if (inflight.size >= MAX_INFLIGHT) break;
-        void getChunk(ci, true).catch(() => { /* re-fetched on demand */ });
-    }
-}
+const post = (message: unknown, transfer: Transferable[] = []) => (self as unknown as Worker).postMessage(message, transfer);
 
 function publishStats(): void {
-    if (!ctl) return;
-    Atomics.store(ctl, CTL_IO_NET_FETCHES, netFetches | 0);
-    Atomics.store(ctl, CTL_IO_PREFETCHES, prefetches | 0);
-    Atomics.store(ctl, CTL_IO_CACHE_SERVES, cacheServes | 0);
-    Atomics.store(ctl, CTL_REQS, requests | 0);
+    if (!runtime) return;
+    const s = runtime.stats;
+    if (runtime.diskError && runtime.diskError !== lastDiskError) {
+        lastDiskError = runtime.diskError;
+        post({ type: "log", msg: `disk cache warning: ${runtime.diskError}` });
+    }
+    const values: Array<[number, number]> = [
+        [P.CTL_IO_DISK_COMPLETE, runtime.disk?.promoted ? 1 : 0], [P.CTL_IO_NET_FETCHES, s.netFetches], [P.CTL_IO_PREFETCHES, s.prefetches],
+        [P.CTL_REQS, s.requests], [P.CTL_IO_CHUNKS_NEEDED, s.chunksNeeded],
+        [P.CTL_IO_CHUNKS_RESIDENT_HIT, s.chunksResidentHit], [P.CTL_IO_CHUNKS_DISK_HIT, s.chunksDiskHit],
+        [P.CTL_IO_CHUNKS_JOINED_INFLIGHT, s.chunksJoinedInflight], [P.CTL_IO_CHUNKS_FETCHED_COLD, s.chunksFetchedCold],
+        [P.CTL_IO_CHUNKS_REFETCHED_AFTER_EVICT, s.chunksRefetchedAfterEvict],
+        [P.CTL_IO_REQS_ALL_RESIDENT, s.requestsAllResident], [P.CTL_IO_REQS_NO_NEW_FETCH, s.requestsNoNewFetch],
+        [P.CTL_IO_EVICTIONS, s.evictions], [P.CTL_IO_RESIDENT_KB, s.residentBytes / 1024],
+        [P.CTL_IO_NET_KB, s.netBytes / 1024], [P.CTL_IO_PREFETCH_EVICTED_UNREAD_KB, s.prefetchEvictedUnreadBytes / 1024],
+        [P.CTL_IO_ASYNC_REQS, s.asyncRequests], [P.CTL_IO_FILL_FETCHES, s.fillFetches],
+        [P.CTL_IO_FILL_KB, s.fillBytes / 1024], [P.CTL_IO_DISK_WRITE_FAILURES, s.diskWriteFailures], [P.CTL_IO_DISK_CHUNKS, runtime.disk?.downloadedChunks ?? 0],
+    ];
+    for (const [index, value] of values) Atomics.store(ctl, index, value | 0);
 }
 
-async function handleRequest(): Promise<void> {
-    const c = ctl!, m = meta!, d = data!;
-    const off = m[META_REQ_OFF];
-    const len = m[META_REQ_LEN];
-    requests++;
+async function initialize(msg: any): Promise<void> {
+    const mismatch = P.layoutMismatch(msg.layout);
+    if (mismatch) throw new Error(`SAB layout mismatch (${mismatch})`);
+    ctl = new Int32Array(msg.sab, 0, P.CTL_WORDS);
+    meta = new Float64Array(msg.sab, P.META_OFFSET_BYTES, P.META_WORDS);
+    data = new Uint8Array(msg.sab, P.DATA_OFFSET_BYTES, P.DATA_BYTES);
+    const tune = msg.tune ?? {};
+    const chunkBytes = Math.max(64, tune.chunkKB ?? 1024) * 1024;
+    const maxInflight = Math.max(1, tune.maxInflight ?? 6);
+    const cacheBytes = (tune.cacheMB ? Math.max(16, tune.cacheMB) * 1024 * 1024 : maxInflight * chunkBytes * 8);
+    const prefetchChunks = Math.max(0, tune.prefetchChunks ?? 2);
+    const source = await HttpRangeSource.create(msg.url);
+    if (!source.etag) { source.close(); throw new Error("WGB streaming requires a strong ETag"); }
+    if (msg.expected && (source.etag !== msg.expected.etag || source.size !== msg.expected.size)) {
+        source.close();
+        throw new Error("WGB version changed while restarting I/O worker");
+    }
+    const residencySab = new SharedArrayBuffer(Math.ceil(Math.ceil(source.size / chunkBytes) / 32) * 4);
+    const residency = new Int32Array(residencySab);
+    const disk = tune.disk === false ? null : await SparseWgbCache.open({ url: msg.url, size: source.size, etag: source.etag ?? "" }, chunkBytes, residency);
+    if (disk && disk.downloadedChunks === disk.chunkCount) {
+        try { await disk.promote(); } catch (error) { post({ type: "log", msg: `promotion failed: ${error}` }); }
+    }
+    runtime = new StreamIoRuntime(source, { chunkBytes, maxInflight, cacheBytes, prefetchChunks }, disk, publishStats);
+    Atomics.store(ctl, P.CTL_IO_CFG_CHUNK_KB, chunkBytes / 1024);
+    Atomics.store(ctl, P.CTL_IO_CFG_CACHE_MB, cacheBytes / (1024 * 1024));
+    Atomics.store(ctl, P.CTL_IO_CFG_PREFETCH_CHUNKS, prefetchChunks);
+    Atomics.store(ctl, P.CTL_IO_CFG_MAX_INFLIGHT, maxInflight);
+    Atomics.store(ctl, P.CTL_IO_DISK_ARMED, disk ? 1 : 0);
+    Atomics.store(ctl, P.CTL_IO_ARMED, 1);
+    publishStats();
+    Atomics.store(ctl, P.CTL_IO_HEARTBEAT, Date.now() | 0);
+    setInterval(() => Atomics.store(ctl, P.CTL_IO_HEARTBEAT, Date.now() | 0), 250);
+    post({ type: "ready", size: source.size, chunkBytes, residencySab, etag: source.etag });
+}
+
+async function request(hint?: ReadHint): Promise<void> {
+    const off = meta[P.META_REQ_OFF], len = meta[P.META_REQ_LEN], seq = meta[P.META_REQ_SEQ];
     try {
-        const buf = await serve(off, len);
-        const n = Math.min(buf.byteLength, DATA_BYTES);
-        d.set(buf.subarray(0, n), 0);
-        Atomics.store(c, CTL_RESP_LEN, n);
-        Atomics.store(c, CTL_ERRNO, 0);
-        publishStats();
-        Atomics.store(c, CTL_STATE, ST_DONE);
-        Atomics.notify(c, CTL_STATE, 1);
-        // Keep the pipeline full ahead of where the guest just read.
-        prefetchAhead(off + len);
-    } catch (err) {
-        Atomics.store(c, CTL_ERRNO, 1);
-        publishStats();
-        Atomics.store(c, CTL_STATE, ST_ERR);
-        Atomics.notify(c, CTL_STATE, 1);
-        (self as unknown as Worker).postMessage({ type: "log", msg: `io-worker read failed off=${off} len=${len}: ${err}` });
+        const buf = await runtime!.read(off, len, hint);
+        P.publishResponse(ctl, data, seq, Atomics.load(ctl, P.CTL_REQ_SEQ), buf);
+    } catch (error) {
+        P.publishResponse(ctl, data, seq, Atomics.load(ctl, P.CTL_REQ_SEQ), null);
+        post({ type: "log", msg: `read failed off=${off} len=${len}: ${error}` });
     }
 }
 
-self.onmessage = (e: MessageEvent) => {
-    const msg = e.data;
-    if (msg?.type === "init") {
-        ctl = new Int32Array(msg.sab, 0, CTL_WORDS);
-        meta = new Float64Array(msg.sab, META_OFFSET_BYTES, META_WORDS);
-        data = new Uint8Array(msg.sab, DATA_OFFSET_BYTES, DATA_BYTES);
-        const tune = msg.tune as { prefetchChunks?: number; maxInflight?: number; cacheMB?: number; chunkKB?: number } | undefined;
-        if (tune) {
-            if (typeof tune.chunkKB === "number") CHUNK = Math.max(64, tune.chunkKB | 0) * 1024;
-            if (typeof tune.prefetchChunks === "number") PREFETCH_AHEAD_CHUNKS = Math.max(0, tune.prefetchChunks | 0);
-            if (typeof tune.maxInflight === "number") MAX_INFLIGHT = Math.max(1, tune.maxInflight | 0);
-            if (typeof tune.cacheMB === "number") MAX_CACHE_BYTES = Math.max(16, tune.cacheMB | 0) * 1024 * 1024;
-        }
-        HttpRangeSource.create(msg.url)
-            .then((s) => {
-                source = s;
-                (self as unknown as Worker).postMessage({ type: "ready", size: s.size });
-            })
-            .catch((err) => {
-                (self as unknown as Worker).postMessage({ type: "error", message: String(err) });
-            });
-        return;
+async function asyncRequest(msg: any): Promise<void> {
+    try {
+        const buf = await runtime!.read(msg.off, msg.len, msg.hint, true);
+        post({ type: "aresp", id: msg.id, ok: true, buf: buf.buffer }, [buf.buffer as ArrayBuffer]);
+    } catch (error) {
+        post({ type: "aresp", id: msg.id, ok: false, message: String(error) });
     }
-    if (msg?.type === "req") {
-        // Fire-and-forget: the guest is parked on Atomics.wait; handleRequest
-        // always publishes a terminal STATE + notifies, even on error, so the
-        // guest can never hang on a missed wakeup.
-        void handleRequest();
-        return;
+}
+
+self.onmessage = (event: MessageEvent) => {
+    const msg = event.data;
+    if (shuttingDown) return;
+    if (msg?.type === "init") {
+        void initialize(msg).catch(error => post({ type: "error", message: String(error) }));
+    } else if (msg?.type === "req") {
+        void request(msg.hint);
+    } else if (msg?.type === "areq") {
+        void asyncRequest(msg);
+    } else if (msg?.type === "fill") {
+        runtime?.startFill(msg.order);
+    } else if (msg?.type === "close") {
+        shuttingDown = true;
+        runtime?.close();
+        void (async () => {
+            await runtime?.disk?.close();
+            post({ type: "closed" });
+            self.close();
+        })();
     }
 };

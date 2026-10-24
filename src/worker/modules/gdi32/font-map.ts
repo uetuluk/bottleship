@@ -1,14 +1,20 @@
 /**
  * Windows → bundled-font name mapping for GDI text rendering. Maps common
  * Windows face names games request to the metric-compatible Liberation fonts
- * we ship (WINDOWS_FONT_MAP).
+ * we ship (WINDOWS_FONT_MAP), unless the face itself is installed.
  */
+import { isInstalledFontName } from './font-resource';
 
 const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'arial':                'Liberation Sans',
     'helvetica':            'Liberation Sans',
     'ms sans serif':        'Liberation Sans',
     'microsoft sans serif': 'Liberation Sans',
+    // NT5 resolves the dialog-manager alias to Microsoft Sans Serif. Keeping the
+    // alias unresolved lets Canvas choose a platform UI font (often Segoe UI),
+    // whose heavier stems and wider metrics do not match classic Win32 dialogs.
+    'ms shell dlg':         'Microsoft Sans Serif',
+    'ms shell dlg 2':       'Microsoft Sans Serif',
     'tahoma':               'Liberation Sans',
     'verdana':              'Liberation Sans',
     'courier new':          'Liberation Mono',
@@ -19,9 +25,18 @@ const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'impact':               'Liberation Sans',
 };
 
-/** Map a requested Windows face name to a bundled font; unknown names pass through. */
+/** Map a requested Windows face name to a bundled font; installed and unknown names pass through. */
 export function resolveWindowsFontName(faceName: string): string {
     if (!faceName) return 'Liberation Sans';
+    if (isInstalledFontName(faceName)) return faceName;
     const mapped = WINDOWS_FONT_MAP[faceName.toLowerCase()];
     return mapped ?? faceName;
+}
+
+/** Realised families; the dialog-manager substitution names are not physical families. */
+export function bundledFontFamilies(): string[] {
+    return [...new Set([
+        ...Object.keys(WINDOWS_FONT_MAP).filter(name => !name.startsWith('ms shell dlg')),
+        ...Object.values(WINDOWS_FONT_MAP),
+    ])];
 }

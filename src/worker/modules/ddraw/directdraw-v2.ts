@@ -10,15 +10,19 @@ import { System } from "../../core/system";
 import { DDrawContext } from "./context";
 import { isValidAddress } from "../../core/memory/address-guard";
 import {
-    DD_OK, E_POINTER, DEFAULT_DEVICE_ID_FAKE, DEFAULT_VENDOR_ID_AMD, DEFAULT_DRIVER_VERSION,
-    DDDEVICEIDENTIFIER_SIZE, DDDEVICEIDENTIFIER2_OFFSETS, DDDEVICEIDENTIFIER2_STRING_SIZE,
+    DD_OK, E_POINTER,
+    DDDEVICEIDENTIFIER_SIZE,
     IID_IDirectDrawSurface,
 } from "./constants";
+import {
+    writeAdapterIdentifier6,
+} from "../../backends/webgpu/shared/dx-adapter-identifier";
 
 interface DirectDraw2Deps {
     commonQueryInterface: (thisPtr: number, riidPtr: number, ppvObject: number, mem: Uint8Array) => number;
     internalCreateSurface: (...a: any[]) => any;
     enumDisplayModesImpl: (...a: any[]) => any;
+    enumSurfacesImpl: (...a: any[]) => any;
 }
 
 export function registerDirectDraw2Exports(
@@ -26,7 +30,7 @@ export function registerDirectDraw2Exports(
     context: DDrawContext,
     deps: DirectDraw2Deps,
 ): void {
-    const { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl } = deps;
+    const { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl, enumSurfacesImpl } = deps;
     // ===== IDirectDraw2 methods =====
     // IDirectDraw2 = IDirectDraw + GetAvailableVidMem (24 methods total)
     // Must have its own vtable — IDirectDraw vtable has 23 slots,
@@ -36,12 +40,12 @@ export function registerDirectDraw2Exports(
 
     exports["IDirectDraw2_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw2_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw2_SetCooperativeLevel"] = (ctx, mem, args) => {
@@ -50,6 +54,11 @@ export function registerDirectDraw2Exports(
 
     exports["IDirectDraw2_EnumDisplayModes"] = (ctx, mem, args) => {
         return enumDisplayModesImpl(ctx, mem, args, true);
+    };
+
+    // v1/v2 hand the callback a DDSURFACEDESC (108 bytes); only v4/v7 use DDSURFACEDESC2.
+    exports["IDirectDraw2_EnumSurfaces"] = (ctx, mem, args) => {
+        return enumSurfacesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw2_SetDisplayMode"] = (ctx, mem, args) => {
@@ -71,7 +80,8 @@ export function registerDirectDraw2Exports(
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface", {
             threadId,
             enableDiagnostics: true,
-            surfaceIid: IID_IDirectDrawSurface
+            surfaceIid: IID_IDirectDrawSurface,
+            ownerAddr: args[0]
         });
     };
 
@@ -116,40 +126,14 @@ export function registerDirectDraw2Exports(
         const thisPtr = args[0];
         const lpdddi = args[1]; // Pointer to DDDEVICEIDENTIFIER (DX6, 1064 bytes, no WHQL)
         const dwFlags = args[2];
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
         Logger.log(LogCategory.SYSTEM, `IDirectDraw4_GetDeviceIdentifier: this=0x${thisPtr.toString(16)}, lpdddi=0x${lpdddi.toString(16)}, flags=0x${dwFlags.toString(16)}`);
 
-        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER_SIZE)) {
+        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER_SIZE, 'rw')) {
             Logger.warn(LogCategory.SYSTEM, `IDirectDraw4_GetDeviceIdentifier: Invalid lpdddi pointer 0x${lpdddi.toString(16)}`);
             return E_POINTER;
         }
 
-        // Zero DDDEVICEIDENTIFIER (DX6, 1064 bytes — no dwWHQLLevel)
-        mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER_SIZE);
-
-        // szDriver at offset 0
-        const driverBytes = new TextEncoder().encode("display");
-        const driverLen = Math.min(driverBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
-        for (let i = 0; i < driverLen; i++) mem[lpdddi + i] = driverBytes[i];
-
-        // szDescription at offset 512
-        const descBytes = new TextEncoder().encode("BottleShip Display Driver");
-        const descLen = Math.min(descBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
-        for (let i = 0; i < descLen; i++) mem[lpdddi + 512 + i] = descBytes[i];
-
-        // liDriverVersion at offset 1024
-        view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
-        // dwVendorId at offset 1032
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID_AMD, true);
-        // dwDeviceId at offset 1036
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID_FAKE, true);
-        // dwSubSysId at offset 1040, dwRevision at 1044 — left zero by fill above
-        // guidDeviceIdentifier at offset 1048 (16 bytes)
-        for (let i = 0; i < 16; i++) mem[lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.guidDeviceIdentifier + i] = i;
-        // NO dwWHQLLevel write — field does not exist in DX6 DDDEVICEIDENTIFIER
-
-        return DD_OK;
+        return writeAdapterIdentifier6(mem, lpdddi) ? DD_OK : E_POINTER;
     };
 
     // IDirectDraw4 stub methods - delegate to v7 where possible

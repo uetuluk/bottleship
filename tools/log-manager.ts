@@ -7,9 +7,8 @@
  * Handles log cleanup, analysis, and optimization.
  */
 
-import { readdir, stat, unlink, writeFile, mkdir } from "node:fs/promises";
+import { readdir, lstat, unlink, writeFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { existsSync } from "node:fs";
 
 const LOG_DIR = "logs";
 
@@ -23,8 +22,37 @@ interface LogStats {
 }
 
 class LogManager {
+  constructor(private readonly root = LOG_DIR) {}
+
+  private async listFiles(): Promise<Array<{ path: string; size: number; mtimeMs: number }>> {
+    const files: Array<{ path: string; size: number; mtimeMs: number }> = [];
+    const pending = [this.root];
+    while (pending.length) {
+      const dir = pending.pop()!;
+      let entries: string[];
+      try { entries = await readdir(dir); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const name of entries) {
+        const path = join(dir, name);
+        try {
+          const info = await lstat(path);
+          if (info.isSymbolicLink()) continue;
+          if (info.isDirectory()) pending.push(path);
+          else if (info.isFile()) files.push({ path, size: info.size, mtimeMs: info.mtimeMs });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    }
+    return files;
+  }
+
   async getStats(): Promise<LogStats> {
-    if (!existsSync(LOG_DIR)) {
+    const stats = await this.listFiles();
+    if (stats.length === 0) {
       return {
         totalFiles: 0,
         totalSize: 0,
@@ -35,40 +63,21 @@ class LogManager {
       };
     }
 
-    const files = (await readdir(LOG_DIR))
-      .filter(f => f.endsWith('.log') || f.endsWith('.jsonl') || f.endsWith('.md'))
-      .map(f => join(LOG_DIR, f));
-
-    if (files.length === 0) {
-      return {
-        totalFiles: 0,
-        totalSize: 0,
-        oldestFile: null,
-        newestFile: null,
-        averageSize: 0,
-        sizeDistribution: {},
-      };
-    }
-
-    const stats = await Promise.all(
-      files.map(async path => ({ path, stat: await stat(path) }))
-    );
-
-    const totalSize = stats.reduce((sum, s) => sum + s.stat.size, 0);
-    const sortedByTime = stats.sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
+    const totalSize = stats.reduce((sum, s) => sum + s.size, 0);
+    const sortedByTime = stats.sort((a, b) => a.mtimeMs - b.mtimeMs);
 
     const sizeDistribution: { [key: string]: number } = {};
     stats.forEach(s => {
-      const sizeRange = this.getSizeRange(s.stat.size);
+      const sizeRange = this.getSizeRange(s.size);
       sizeDistribution[sizeRange] = (sizeDistribution[sizeRange] || 0) + 1;
     });
 
     return {
-      totalFiles: files.length,
+      totalFiles: stats.length,
       totalSize,
       oldestFile: sortedByTime[0]?.path || null,
       newestFile: sortedByTime[sortedByTime.length - 1]?.path || null,
-      averageSize: totalSize / files.length,
+      averageSize: totalSize / stats.length,
       sizeDistribution,
     };
   }
@@ -95,47 +104,50 @@ class LogManager {
       dryRun = false
     } = options;
 
-    if (!existsSync(LOG_DIR)) {
-      return { deleted: [], totalFreed: 0 };
+    for (const value of [maxAgeDays, maxTotalSizeMB, keepRecent]) {
+      if (!Number.isFinite(value) || value < 0) throw new Error("Cleanup limits must be nonnegative finite numbers");
     }
-
-    const files = (await readdir(LOG_DIR))
-      .filter(f => f.endsWith('.log') || f.endsWith('.jsonl') || f.endsWith('.md'))
-      .map(f => join(LOG_DIR, f));
-
-    const stats = await Promise.all(
-      files.map(async path => ({ path, stat: await stat(path) }))
-    );
+    const stats = await this.listFiles();
 
     const now = Date.now();
     const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
     const maxTotalBytes = maxTotalSizeMB * 1024 * 1024;
 
     // Sort by modification time (newest first)
-    stats.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+    stats.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-    let totalSize = stats.reduce((sum, s) => sum + s.stat.size, 0);
+    let totalSize = stats.reduce((sum, s) => sum + s.size, 0);
     const toDelete: string[] = [];
     let freedBytes = 0;
 
-    // Always keep the most recent files
-    const keepFiles = new Set(stats.slice(0, keepRecent).map(s => s.path));
+    const candidates = stats.filter(f => /\.(?:log|jsonl|png|heapsnapshot|json\.gz|harness\.ts)$/i.test(f.path));
+    const keepFiles = new Set<string>();
+    const perDirectory = new Map<string, number>();
+    for (const file of candidates) {
+      const dir = dirname(file.path), count = perDirectory.get(dir) ?? 0;
+      if (count < keepRecent) keepFiles.add(file.path);
+      perDirectory.set(dir, count + 1);
+    }
 
-    for (const file of stats) {
+    for (const file of candidates.toReversed()) {
       const shouldDelete =
-        // Too old
-        (now - file.stat.mtimeMs > maxAgeMs) ||
-        // Exceeds total size limit (but don't delete recent files)
-        (!keepFiles.has(file.path) && totalSize > maxTotalBytes);
+        !keepFiles.has(file.path) && ((now - file.mtimeMs > maxAgeMs) || totalSize > maxTotalBytes);
 
       if (shouldDelete) {
-        toDelete.push(file.path);
-        freedBytes += file.stat.size;
-        totalSize -= file.stat.size;
-
         if (!dryRun) {
-          await unlink(file.path).catch(() => {}); // Ignore errors
+          try {
+            const current = await lstat(file.path);
+            // A live writer may have appended since the census.
+            if (!current.isFile() || current.size !== file.size || current.mtimeMs !== file.mtimeMs) continue;
+            await unlink(file.path);
+          } catch (error) {
+            if (["ENOENT", "EBUSY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+            throw error;
+          }
         }
+        toDelete.push(file.path);
+        freedBytes += file.size;
+        totalSize -= file.size;
       }
     }
 
@@ -160,15 +172,14 @@ class LogManager {
     await mkdir(dirname(archivePath), { recursive: true });
 
     // Create a simple text archive (tar.gz would require external tools)
-    const files = existsSync(LOG_DIR) ?
-      (await readdir(LOG_DIR)).filter(f => f.endsWith('.log') || f.endsWith('.jsonl') || f.endsWith('.md')) : [];
+    const files = (await this.listFiles()).filter(f => /\.(?:log|jsonl|md)$/i.test(f.path));
 
     let archiveContent = `BottleShip Log Archive - ${new Date().toISOString()}\n`;
     archiveContent += `Files archived: ${files.length}\n\n`;
 
     for (const file of files) {
-      const content = await Bun.file(join(LOG_DIR, file)).text();
-      archiveContent += `=== ${file} ===\n${content}\n\n`;
+      const content = await Bun.file(file.path).text();
+      archiveContent += `=== ${file.path} ===\n${content}\n\n`;
     }
 
     await writeFile(archivePath, archiveContent);
@@ -249,7 +260,7 @@ async function main() {
 }
 
 if (import.meta.main) {
-  main().catch(console.error);
+  main().catch(error => { console.error(error); process.exitCode = 1; });
 }
 
 export { LogManager };

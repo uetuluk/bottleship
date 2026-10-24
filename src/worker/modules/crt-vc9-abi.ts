@@ -89,8 +89,6 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
     exports["??_V@YAXPAX@Z"] = (_ctx, _mem, args) => host.free(args[0] ?? 0);
 
-    // _except_handler4_common — registered by crt-vc9-seh.ts (semantic)
-
     exports["_CIatan"] = () => {
         try {
             const x = fpuGetST(host.process.v86, 0);
@@ -137,6 +135,19 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
         return n;
     };
 
+    exports["strspn"] = (_ctx, _mem, args) => {
+        const s = args[0] ?? 0;
+        const accept = args[1] ?? 0;
+        if (!s || !accept) return 0;
+        const str = host.readCString(s, 0x10000);
+        const accSet = new Set(host.readCString(accept, 256).split(""));
+        let n = 0;
+        for (; n < str.length; n++) {
+            if (!accSet.has(str[n]!)) break;
+        }
+        return n;
+    };
+
     exports["_ismbblead"] = (_ctx, _mem, args) => {
         const c = args[0] ?? 0;
         return c >= 0x80 && c <= 0xff ? 1 : 0;
@@ -151,13 +162,47 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
 
     exports["strncpy_s"] = (_ctx, _mem, args) => {
-        const dest = args[0] ?? 0;
-        const destSize = args[1] ?? 0;
-        const src = args[2] ?? 0;
-        const count = args[3] ?? 0;
-        if (!dest || destSize === 0) { invalidParam(); return 22; }
-        if (count >= destSize) { invalidParam(); return 22; }
-        return host.strncpy(dest, src, count);
+        const dest = (args[0] ?? 0) >>> 0;
+        const destSize = (args[1] ?? 0) >>> 0;
+        const src = (args[2] ?? 0) >>> 0;
+        const count = (args[3] ?? 0) >>> 0;
+        const fail = (code: number, clear: boolean) => {
+            if (clear) Mem.writeUint8(dest, 0);
+            host.setErrno(code);
+            invalidParam();
+            return code;
+        };
+        if (count === 0 && dest === 0 && destSize === 0) return 0;
+        if (!dest || destSize === 0) return fail(22, false);
+        if (count === 0) { Mem.writeUint8(dest, 0); return 0; }
+        if (!src) return fail(22, true);
+
+        const truncate = count === 0xffffffff;
+        const limit = Math.min(count, destSize - 1);
+        let length = 0;
+        while (length < limit) {
+            const byte = Mem.readUint8(src + length);
+            if (byte === null) return fail(22, true);
+            if (byte === 0) break;
+            length++;
+        }
+        let truncated = false;
+        if (length === limit && (truncate || count > limit)) {
+            const byte = Mem.readUint8(src + length);
+            if (byte === null) return fail(22, true);
+            if (byte !== 0) {
+                if (!truncate) return fail(34, true);
+                truncated = true;
+            }
+        }
+        // The secure form always terminates and never pads the unused tail like strncpy.
+        if (length > 0) {
+            const bytes = Mem.readBytes(src, length);
+            if (!bytes) return fail(22, true);
+            Mem.writeBytes(dest, bytes);
+        }
+        Mem.writeUint8(dest + length, 0);
+        return truncated ? 80 : 0;
     };
 
     exports["strncat_s"] = (_ctx, _mem, args) => {
@@ -215,18 +260,10 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
             host.setErrno(2);
             return 0;
         }
-        const result = host.getcwd(buffer, maxLen);
-        if (!buffer || !result) return result;
-        const path = host.readCString(result, maxLen);
-        if (!path.match(/^[A-Za-z]:/)) {
-            const prefixed = `C:\\${path.replace(/^\\+/, "")}`;
-            if (prefixed.length >= maxLen) {
-                host.setErrno(34);
-                return 0;
-            }
-            host.writeCString(buffer, prefixed);
-        }
-        return buffer >>> 0;
+        // Drive qualification and the buffer==NULL allocation size both live in getcwd, so
+        // the two forms cannot diverge (they did while the fix-up lived here: it could only
+        // reach the caller-supplied-buffer form).
+        return host.getcwd(buffer, maxLen);
     };
 
     // C++ exception / type_info — minimal no-op stubs (Stage A)

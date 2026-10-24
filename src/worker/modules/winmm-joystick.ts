@@ -1,141 +1,375 @@
 /**
- * winmm joystick API (joyGetNumDevs / joyGetDevCaps / joyGetPos / joyGetPosEx /
- * joyGetThreshold / joySetThreshold) over the host gamepad, laid out the way the
- * Xbox-class driver reports it: X/Y = left stick, Z = triggers, R = right stick Y,
- * U = right stick X, POV = D-pad, 0..65535 per axis.
+ * winmm joystick handlers (joyGetNumDevs / joyGetDevCaps / joyGetPos / joyGetPosEx /
+ * joyGetThreshold / joySetThreshold / joySetCapture / joyReleaseCapture).
+ *
+ * The driver always reports the two standard analog ports (like the Win9x/NT
+ * joystick driver does with nothing attached); whether a stick is actually there
+ * is answered by the position calls — JOYERR_UNPLUGGED until the host gamepad
+ * appears, and always for port 1, which has no device behind it. Axes are reported
+ * over the full 0..65535 range declared in JOYCAPS.
+ *
+ * joySetCapture is a real capture: a timer-wheel poll posts MM_JOY*MOVE /
+ * MM_JOY*BUTTONDOWN / MM_JOY*BUTTONUP to the captured window, which is the only
+ * way message-driven (non-polling) games see the stick at all.
  */
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { System } from '../core/system';
-import { encodeAnsi } from './codepage-utils';
-import { povFromDpad, DIPOV_CENTERED } from './dinput/joystick-state';
+import { TimerKind } from '../core/scheduler/types';
+import { TimeService } from '../runtime/time';
+import { GAMEPAD_AXES, GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from './dinput/emulated-gamepad';
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_INVALPARAM = 11;
+const JOYERR_NOERROR = 0;
 const JOYERR_PARMS = 165;
 const JOYERR_UNPLUGGED = 167;
-const JOY_POVCENTERED = 0xffff;
 
-/** Windows exposes 16 joystick ids; only the first is ever backed by the browser pad. */
-const JOY_DEVICE_COUNT = 16;
+const MM_JOY1MOVE = 0x3A0;
+const MM_JOY1ZMOVE = 0x3A2;
+const MM_JOY1BUTTONDOWN = 0x3B5;
+const MM_JOY1BUTTONUP = 0x3B7;
+/** MM_JOY2* sit one slot above their MM_JOY1* counterpart. */
+const MM_JOY2_OFFSET = 1;
+
+/** Ports the driver exposes; only these two have MM_JOY* messages. */
+const JOY_PORTS = 2;
+const AXIS_MIN = 0;
+const AXIS_MAX = 0xFFFF;
+/** Windows' default movement threshold for a fresh port. */
+const DEFAULT_THRESHOLD = (AXIS_MAX - AXIS_MIN) >> 7;
+const PERIOD_MIN = 10;
+const PERIOD_MAX = 1000;
+/** MAXPNAMELEN — szPname and szRegKey are both this many characters. */
+const JOYCAPS_NAME_CHARS = 32;
+// sizeof(JOYCAPSA) / sizeof(JOYCAPSW). The three string members (szPname, szRegKey,
+// szOEMVxD = 32 + 32 + 260 chars) double in the wide struct, which also shifts every
+// UINT field after szPname by 32 bytes — the two layouts share nothing but the leading
+// wMid/wPid, so one writer must never serve both.
 const JOYCAPSA_SIZE = 404;
 const JOYCAPSW_SIZE = 728;
-const JOYCAPS_HASZ = 0x0001, JOYCAPS_HASR = 0x0002, JOYCAPS_HASU = 0x0004, JOYCAPS_HASPOV = 0x0010, JOYCAPS_POV4DIR = 0x0020;
+/** Below wMid+wPid there is nothing a caller could even receive. */
+const JOYCAPS_MIN_SIZE = 4;
 const JOYINFO_SIZE = 16;
 const JOYINFOEX_SIZE = 52;
 
-const AXIS_MAX = 65535;
-const toAxis = (v: number): number => Math.max(0, Math.min(AXIS_MAX, ((v | 0) + 32767) * 2));
-/** Combined trigger axis: idle centre, left trigger up, right trigger down. */
-const triggerAxis = (lt: number, rt: number): number => toAxis(lt - rt);
-const popcount = (v: number): number => { let n = 0; for (let x = v >>> 0; x; x &= x - 1) n++; return n; };
+/** wParam button bits carried by MM_JOY* messages (JOY_BUTTON1..4 + their CHG flags).
+ *  JOYINFO.wButtons is the same four bits; JOYINFOEX.dwButtons is the wider set. */
+const JOY_BUTTON_MASK = 0x0F;
+const JOY_BUTTON1CHG = 0x0100;
+/** JOYCAPS.wNumButtons/wNumAxes — nothing above them may appear in dwButtons or be
+ *  claimed in JOYCAPS. Both come from the shared pad description, so this driver and
+ *  DirectInput cannot end up describing the same physical device differently. */
+const JOY_NUM_BUTTONS = GAMEPAD_BUTTONS;
+const JOY_NUM_AXES = GAMEPAD_AXES;
+const JOY_BUTTON_MASK_EX = ((1 << JOY_NUM_BUTTONS) - 1) >>> 0;
+
+// JOYCAPS.wCaps bits (mmsystem.h) and JOYINFOEX's "hat centred" value.
+const JOYCAPS_HASZ = 0x0001;
+const JOYCAPS_HASR = 0x0002;
+const JOYCAPS_HASPOV = 0x0010;
+const JOYCAPS_POV4DIR = 0x0020;
+const JOY_POVCENTERED = 0xFFFF;
+
+interface JoyCapture {
+    hwnd: number;
+    /** Only post a message when the axis moved past the threshold. */
+    changedOnly: boolean;
+    timerId: number;
+    x: number;
+    y: number;
+    z: number;
+    buttons: number;
+    /** Nothing has been posted yet — the first poll always reports. */
+    primed: boolean;
+}
+
+const thresholds: number[] = new Array(JOY_PORTS).fill(DEFAULT_THRESHOLD);
+const captures: Array<JoyCapture | null> = new Array(JOY_PORTS).fill(null);
+
+/** Signed host axis (-32768..32767) → the 0..65535 range JOYCAPS declares. */
+function toAxis(v: number): number {
+    return Math.max(AXIS_MIN, Math.min(AXIS_MAX, (v | 0) + 0x8000));
+}
+
+function popcount(v: number): number {
+    let n = 0;
+    for (let b = v >>> 0; b; b >>>= 1) n += b & 1;
+    return n;
+}
+
+interface JoyPos {
+    connected: boolean;
+    x: number; y: number; z: number; r: number;
+    buttons: number;
+}
+
+const DISCONNECTED: JoyPos = { connected: false, x: 0, y: 0, z: 0, r: 0, buttons: 0 };
+
+/**
+ * Read a PORT. The host input layer models exactly one pad, so only port 0 has a
+ * device behind it; port 1 must answer JOYERR_UNPLUGGED rather than mirror port 0 —
+ * two identical CONNECTED sticks make a two-player title bind both players to the one
+ * pad and a "highest connected port" scan pick the phantom.
+ *
+ * `guestRead` stamps the usage telemetry the host's control-layout auto-select keys off
+ * ("this title steers with a pad"). Only a call the GUEST made may set it; the
+ * joySetCapture pump is ours and takes the peek path.
+ */
+function readJoystick(joyId: number, guestRead: boolean): JoyPos {
+    if (joyId !== 0) return DISCONNECTED;
+    const inputManager = System.getInstance().inputManager;
+    if (guestRead) inputManager.noteGuestGamepadRead();
+    const input = guestRead
+        ? inputManager.getGamepadState()
+        : inputManager.peekGamepadStateWithoutUsage();
+    const [ax0, ax1, ax2, ax3] = input.axes;
+    return {
+        connected: input.connected,
+        x: toAxis(ax0), y: toAxis(ax1), z: toAxis(ax2), r: toAxis(ax3),
+        buttons: (input.buttons >>> 0) & JOY_BUTTON_MASK_EX,
+    };
+}
+
+/** JOYINFOEX.dwPOV — the shared d-pad angle, in winmm's own centred encoding. */
+function joyPov(buttons: number): number {
+    const angle = gamepadPovAngle(buttons);
+    return angle === POV_CENTERED ? JOY_POVCENTERED : angle;
+}
+
+function makeLParam(lo: number, hi: number): number {
+    return (((hi & 0xFFFF) << 16) | (lo & 0xFFFF)) >>> 0;
+}
+
+/** MM_JOY2* for port 1, MM_JOY1* for port 0. */
+function joyMsg(base: number, joyId: number): number {
+    return base + (joyId === 1 ? MM_JOY2_OFFSET : 0);
+}
+
+function stopCapture(joyId: number): void {
+    const cap = captures[joyId];
+    if (!cap) return;
+    if (cap.timerId !== 0) {
+        System.getInstance().scheduler?.timerWheel.cancel(cap.timerId);
+    }
+    captures[joyId] = null;
+}
+
+/**
+ * Capture poll: diff the stick against the last posted sample and emit the
+ * MM_JOY* messages Windows would. Axis moves collapse into one MM_JOY*MOVE;
+ * each button edge gets its own DOWN/UP with the JOY_BUTTONnCHG bit set.
+ */
+function pollCapture(joyId: number): void {
+    const cap = captures[joyId];
+    if (!cap) return;
+
+    const pos = readJoystick(joyId, false);
+    if (!pos.connected) return; // unplugged → the driver goes quiet
+
+    const buttons = pos.buttons & JOY_BUTTON_MASK;
+    const moved = !cap.changedOnly
+        || Math.abs(pos.x - cap.x) > thresholds[joyId]!
+        || Math.abs(pos.y - cap.y) > thresholds[joyId]!;
+    const zMoved = !cap.changedOnly || Math.abs(pos.z - cap.z) > thresholds[joyId]!;
+    const changedButtons = buttons ^ (cap.buttons & JOY_BUTTON_MASK);
+
+    const wm = System.getInstance().windowManager;
+    const xy = makeLParam(pos.x, pos.y);
+
+    if (cap.primed || moved) {
+        wm.postMessage(cap.hwnd, joyMsg(MM_JOY1MOVE, joyId), buttons, xy);
+        cap.x = pos.x;
+        cap.y = pos.y;
+    }
+    if (cap.primed || zMoved) {
+        wm.postMessage(cap.hwnd, joyMsg(MM_JOY1ZMOVE, joyId), buttons, makeLParam(pos.z, 0));
+        cap.z = pos.z;
+    }
+    for (let bit = 0; bit < 4; bit++) {
+        const mask = 1 << bit;
+        if (!(changedButtons & mask)) continue;
+        const down = (buttons & mask) !== 0;
+        wm.postMessage(
+            cap.hwnd,
+            joyMsg(down ? MM_JOY1BUTTONDOWN : MM_JOY1BUTTONUP, joyId),
+            buttons | (JOY_BUTTON1CHG << bit),
+            xy,
+        );
+    }
+    cap.buttons = buttons;
+    cap.primed = false;
+}
 
 export function registerWinmmJoystickExports(exports: Record<string, ThunkImplementation>): void {
-    const thresholds = new Map<number, number>();
+        exports["joyGetNumDevs"] = () => {
+            return JOY_PORTS;
+        };
 
-    exports["joyGetNumDevs"] = () => JOY_DEVICE_COUNT;
+        const makeGetDevCaps = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+            const uJoyID = args[0];
+            const pjc = args[1];
+            const cbjc = args[2];
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (!pjc || cbjc < JOYCAPS_MIN_SIZE || pjc + cbjc > mem.length) {
+                return MMSYSERR_INVALPARAM;
+            }
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            // Callers pass sizeof(JOYCAPS) for their SDK version; never write past it.
+            const fill = Math.min(cbjc, wide ? JOYCAPSW_SIZE : JOYCAPSA_SIZE);
+            for (let i = 0; i < fill; i++) mem[pjc + i] = 0;
+            const put = (off: number, v: number) => { if (off + 4 <= fill) view.setUint32(pjc + off, v, true); };
 
-    const writeCaps = (mem: Uint8Array, pjc: number, cbjc: number, wide: boolean): number => {
-        const size = wide ? JOYCAPSW_SIZE : JOYCAPSA_SIZE;
-        if (!pjc || cbjc < size || pjc + size > mem.length) return MMSYSERR_INVALPARAM;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        mem.fill(0, pjc, pjc + size);
-        view.setUint16(pjc + 0, 0x045e, true);   // wMid (Microsoft)
-        view.setUint16(pjc + 2, 0x028e, true);   // wPid (Xbox-class controller)
-        const name = "Gamepad";
-        if (wide) {
-            for (let i = 0; i < name.length; i++) view.setUint16(pjc + 4 + i * 2, name.charCodeAt(i), true);
-        } else {
-            mem.set(encodeAnsi(name).subarray(0, 31), pjc + 4);
-        }
-        // Axis ranges, button/period/caps block follows szPname (32 chars: 32 or 64 bytes).
-        let p = pjc + 4 + (wide ? 64 : 32);
-        const u32 = (v: number) => { view.setUint32(p, v >>> 0, true); p += 4; };
-        u32(0); u32(AXIS_MAX);     // wXmin, wXmax
-        u32(0); u32(AXIS_MAX);     // wYmin, wYmax
-        u32(0); u32(AXIS_MAX);     // wZmin, wZmax
-        u32(17);                   // wNumButtons
-        u32(10); u32(1000);        // wPeriodMin, wPeriodMax
-        u32(0); u32(AXIS_MAX);     // wRmin, wRmax
-        u32(0); u32(AXIS_MAX);     // wUmin, wUmax
-        u32(0); u32(AXIS_MAX);     // wVmin, wVmax
-        u32(JOYCAPS_HASZ | JOYCAPS_HASR | JOYCAPS_HASU | JOYCAPS_HASPOV | JOYCAPS_POV4DIR); // wCaps
-        u32(6);                    // wMaxAxes
-        u32(5);                    // wNumAxes (X, Y, Z, R, U)
-        u32(32);                   // wMaxButtons
-        // szRegKey / szOEMVxD stay empty.
-        return MMSYSERR_NOERROR;
-    };
+            view.setUint16(pjc + 0, 0xFFFF, true); // wMid
+            view.setUint16(pjc + 2, 0x0001, true); // wPid
+            const charSize = wide ? 2 : 1;
+            const name = "Emulated Gamepad";
+            for (let i = 0; i < name.length; i++) {
+                const off = 4 + i * charSize;
+                if (off + charSize > fill) break;
+                if (wide) view.setUint16(pjc + off, name.charCodeAt(i), true);
+                else mem[pjc + off] = name.charCodeAt(i);
+            }
+            // Everything past szPname sits `JOYCAPS_NAME_CHARS * charSize` from the top.
+            const b = 4 + JOYCAPS_NAME_CHARS * charSize;
+            put(b + 0,  AXIS_MIN);   // wXmin
+            put(b + 4,  AXIS_MAX);   // wXmax
+            put(b + 8,  AXIS_MIN);   // wYmin
+            put(b + 12, AXIS_MAX);   // wYmax
+            put(b + 16, AXIS_MIN);   // wZmin
+            put(b + 20, AXIS_MAX);   // wZmax
+            put(b + 24, JOY_NUM_BUTTONS); // wNumButtons
+            put(b + 28, PERIOD_MIN); // wPeriodMin
+            put(b + 32, PERIOD_MAX); // wPeriodMax
+            put(b + 36, AXIS_MIN);   // wRmin
+            put(b + 40, AXIS_MAX);   // wRmax
+            put(b + 44, AXIS_MIN);   // wUmin
+            put(b + 48, AXIS_MAX);   // wUmax
+            put(b + 52, AXIS_MIN);   // wVmin
+            put(b + 56, AXIS_MAX);   // wVmax
+            // wCaps: HASZ | HASR (joyGetPosEx fills dwZpos/dwRpos) | HASPOV | POV4DIR
+            // (the d-pad, reported through dwPOV). A capability we DO serve and do not
+            // declare is dropped by the caller as surely as one we never had.
+            put(b + 60, JOYCAPS_HASZ | JOYCAPS_HASR | JOYCAPS_HASPOV | JOYCAPS_POV4DIR);
+            put(b + 64, JOY_NUM_AXES); // wMaxAxes
+            put(b + 68, JOY_NUM_AXES); // wNumAxes
+            put(b + 72, JOY_NUM_BUTTONS); // wMaxButtons
+            return MMSYSERR_NOERROR;
+        };
+        exports["joyGetDevCapsA"] = makeGetDevCaps(false);
+        exports["joyGetDevCapsW"] = makeGetDevCaps(true);
 
-    exports["joyGetDevCapsA"] = (ctx, mem, args) => {
-        if ((args[0] | 0) >= JOY_DEVICE_COUNT && args[0] !== 0xffffffff) return JOYERR_PARMS;
-        return writeCaps(mem, args[1], args[2], false);
-    };
-    exports["joyGetDevCapsW"] = (ctx, mem, args) => {
-        if ((args[0] | 0) >= JOY_DEVICE_COUNT && args[0] !== 0xffffffff) return JOYERR_PARMS;
-        return writeCaps(mem, args[1], args[2], true);
-    };
+        exports["joyGetPos"] = (ctx, mem, args) => {
+            const uJoyID = args[0];
+            const pji = args[1];
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (!pji || pji + JOYINFO_SIZE > mem.length) {
+                return MMSYSERR_INVALPARAM;
+            }
+            const pos = readJoystick(uJoyID, true);
+            if (!pos.connected) return JOYERR_UNPLUGGED;
 
-    const readPad = (uJoyID: number) => {
-        if (uJoyID !== 0) return null;
-        const inputManager = System.getInstance().inputManager;
-        inputManager.noteGuestGamepadRead();
-        const pad = inputManager.getGamepadState();
-        return pad.connected ? pad : null;
-    };
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(pji + 0, pos.x, true);       // wXpos
+            view.setUint32(pji + 4, pos.y, true);       // wYpos
+            view.setUint32(pji + 8, pos.z, true);       // wZpos
+            view.setUint32(pji + 12, pos.buttons & JOY_BUTTON_MASK, true); // wButtons
+            return JOYERR_NOERROR;
+        };
 
-    exports["joyGetPos"] = (ctx, mem, args) => {
-        const uJoyID = args[0];
-        const pji = args[1];
-        if (!pji || pji + JOYINFO_SIZE > mem.length) return MMSYSERR_INVALPARAM;
-        if (uJoyID >= JOY_DEVICE_COUNT) return JOYERR_PARMS;
-        const pad = readPad(uJoyID);
-        if (!pad) return JOYERR_UNPLUGGED;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        view.setUint32(pji + 0, toAxis(pad.axes[0]), true);                       // wXpos
-        view.setUint32(pji + 4, toAxis(pad.axes[1]), true);                       // wYpos
-        view.setUint32(pji + 8, triggerAxis(pad.triggers[0], pad.triggers[1]), true); // wZpos
-        view.setUint32(pji + 12, pad.buttons & 0xf, true);                        // wButtons (JOY_BUTTON1..4)
-        return MMSYSERR_NOERROR;
-    };
+        exports["joyGetPosEx"] = (ctx, mem, args) => {
+            const uJoyID = args[0];
+            const pji = args[1];
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (!pji || pji + JOYINFOEX_SIZE > mem.length) {
+                return MMSYSERR_INVALPARAM;
+            }
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const size = view.getUint32(pji, true);
+            if (size < JOYINFOEX_SIZE) {
+                return MMSYSERR_INVALPARAM;
+            }
 
-    exports["joyGetPosEx"] = (ctx, mem, args) => {
-        const uJoyID = args[0];
-        const pji = args[1];
-        if (!pji || pji + JOYINFOEX_SIZE > mem.length) return MMSYSERR_INVALPARAM;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        if (view.getUint32(pji, true) < JOYINFOEX_SIZE) return MMSYSERR_INVALPARAM;
-        if (uJoyID >= JOY_DEVICE_COUNT) return JOYERR_PARMS;
-        const pad = readPad(uJoyID);
-        if (!pad) return JOYERR_UNPLUGGED;
+            const pos = readJoystick(uJoyID, true);
+            if (!pos.connected) {
+                return JOYERR_UNPLUGGED;
+            }
 
-        const [lx, ly, rx, ry] = pad.axes;
-        const buttons = pad.buttons >>> 0;
-        const pov = povFromDpad(buttons);
-        view.setUint32(pji + 8, toAxis(lx), true);                                  // dwXpos
-        view.setUint32(pji + 12, toAxis(ly), true);                                 // dwYpos
-        view.setUint32(pji + 16, triggerAxis(pad.triggers[0], pad.triggers[1]), true); // dwZpos
-        view.setUint32(pji + 20, toAxis(ry), true);                                 // dwRpos
-        view.setUint32(pji + 24, toAxis(rx), true);                                 // dwUpos
-        view.setUint32(pji + 28, AXIS_MAX >> 1, true);                              // dwVpos (none: centre)
-        view.setUint32(pji + 32, buttons, true);                                    // dwButtons
-        view.setUint32(pji + 36, popcount(buttons), true);                          // dwButtonNumber
-        view.setUint32(pji + 40, pov === DIPOV_CENTERED ? JOY_POVCENTERED : pov, true); // dwPOV
-        view.setUint32(pji + 44, 0, true);
-        view.setUint32(pji + 48, 0, true);
-        return MMSYSERR_NOERROR;
-    };
+            view.setUint32(pji + 8, pos.x, true);  // dwXpos
+            view.setUint32(pji + 12, pos.y, true); // dwYpos
+            view.setUint32(pji + 16, pos.z, true); // dwZpos
+            view.setUint32(pji + 20, pos.r, true); // dwRpos
+            view.setUint32(pji + 24, 0, true); // dwUpos
+            view.setUint32(pji + 28, 0, true); // dwVpos
+            view.setUint32(pji + 32, pos.buttons, true); // dwButtons
+            view.setUint32(pji + 36, popcount(pos.buttons), true); // dwButtonNumber
+            view.setUint32(pji + 40, joyPov(pos.buttons), true); // dwPOV
+            view.setUint32(pji + 44, 0, true); // dwReserved1
+            view.setUint32(pji + 48, 0, true); // dwReserved2
 
-    exports["joyGetThreshold"] = (ctx, mem, args) => {
-        const uJoyID = args[0];
-        const puThreshold = args[1];
-        if (!puThreshold || puThreshold + 4 > mem.length) return MMSYSERR_INVALPARAM;
-        if (uJoyID >= JOY_DEVICE_COUNT) return JOYERR_PARMS;
-        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(puThreshold, thresholds.get(uJoyID) ?? 0, true);
-        return MMSYSERR_NOERROR;
-    };
-    exports["joySetThreshold"] = (ctx, mem, args) => {
-        if (args[0] >= JOY_DEVICE_COUNT) return JOYERR_PARMS;
-        thresholds.set(args[0], args[1] >>> 0);
-        return MMSYSERR_NOERROR;
-    };
+            return JOYERR_NOERROR;
+        };
+
+        exports["joyGetThreshold"] = (ctx, mem, args) => {
+            const uJoyID = args[0];
+            const puThreshold = args[1];
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (!puThreshold || puThreshold + 4 > mem.length) return MMSYSERR_INVALPARAM;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(puThreshold, thresholds[uJoyID]!, true);
+            return JOYERR_NOERROR;
+        };
+
+        exports["joySetThreshold"] = (ctx, mem, args) => {
+            const uJoyID = args[0];
+            const uThreshold = args[1] >>> 0;
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (uThreshold > AXIS_MAX) return MMSYSERR_INVALPARAM;
+            thresholds[uJoyID] = uThreshold;
+            return JOYERR_NOERROR;
+        };
+
+        exports["joySetCapture"] = (ctx, mem, args) => {
+            const hwnd = args[0] >>> 0;
+            const uJoyID = args[1];
+            const uPeriod = args[2] >>> 0;
+            const fChanged = args[3] !== 0;
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+
+            const system = System.getInstance();
+            if (!hwnd || !system.windowManager.getWindow(hwnd)) return MMSYSERR_INVALPARAM;
+            if (uPeriod < PERIOD_MIN || uPeriod > PERIOD_MAX) return MMSYSERR_INVALPARAM;
+            if (!readJoystick(uJoyID, false).connected) return JOYERR_UNPLUGGED;
+
+            const scheduler = system.scheduler;
+            if (!scheduler) return JOYERR_PARMS;
+
+            stopCapture(uJoyID); // re-capturing the same port replaces the old capture
+            const cap: JoyCapture = {
+                hwnd, changedOnly: fChanged, timerId: 0,
+                x: 0, y: 0, z: 0, buttons: 0, primed: true,
+            };
+            captures[uJoyID] = cap;
+            cap.timerId = scheduler.timerWheel.add(
+                uPeriod, true, TimerKind.WINMM_TIMER,
+                () => pollCapture(uJoyID),
+                TimeService.getInstance().nowMs(),
+            );
+            return JOYERR_NOERROR;
+        };
+
+        exports["joyReleaseCapture"] = (ctx, mem, args) => {
+            const uJoyID = args[0];
+            if (uJoyID >= JOY_PORTS) return MMSYSERR_INVALPARAM;
+            if (!captures[uJoyID]) return JOYERR_PARMS;
+            stopCapture(uJoyID);
+            return JOYERR_NOERROR;
+        };
+}
+
+/** Drop captures so a fresh game doesn't inherit the previous process's timers. */
+export function resetWinmmJoystick(): void {
+    for (let i = 0; i < JOY_PORTS; i++) {
+        stopCapture(i);
+        thresholds[i] = DEFAULT_THRESHOLD;
+    }
 }

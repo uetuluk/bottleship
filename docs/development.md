@@ -36,7 +36,49 @@ bun run deploy/server.ts      # static server: COOP/COEP + HTTP Range (for WGB s
 The server must send `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` (SAB) and honor HTTP `Range` requests (so large
 `.wgb` bundles stream instead of fully downloading). `deploy/server.ts` does both; any static
-host works as long as it sets those headers and supports ranges.
+host works as long as it sets those headers and supports ranges. A reverse proxy in front must
+preserve `Range`, `If-Range`, `ETag`, `Content-Range` and the 206 status. Streaming requires
+a strong ETag; otherwise the loader stages a full local copy. Serve browser traffic
+through a TLS reverse proxy with HTTP/2: the Bun server itself uses plain HTTP/1.1,
+whose browser connection limit also constrains concurrent bundle requests. Range-aware
+proxy caching is safe when its keys include the object version and byte range.
+
+Optional env, all off by default:
+
+| Variable | Effect |
+| --- | --- |
+| `BS_DIST_DIR` | serve a build from elsewhere (default `../dist`) |
+| `BS_APPS_DIR` | serve `/apps/*.wgb` off a separate mount — the self-hosted equivalent of the R2 bucket behind `functions/apps/[[path]].ts`, so multi-GB bundles stay out of `dist` |
+| `BS_AUTH_USER` + `BS_AUTH_PASS` | HTTP Basic auth over the whole site (private stands). `/healthz` stays open for container probes |
+
+### Containers
+
+`deploy/docker-compose.yml` runs the stock `oven/bun` image over a bind-mounted payload —
+`server.ts` needs no dependencies, so updating a deployment is an rsync, not an image rebuild.
+`tools/make-stand.ts` assembles that payload from a build plus a JSON config naming the games:
+
+```bash
+bun run build
+bun tools/make-stand.ts my-stand.json      # → <out>/{server.ts,docker-compose.yml,dist/,apps/}
+```
+
+The generated `dist/games-catalog.json` lists exactly the games in the config, and only their
+box art ships — useful for a private stand that should not expose the public library.
+
+A catalog entry can also set `"preload": true` (stand config: per game, or once for all of them):
+the bundle is downloaded to OPFS before the game starts instead of being streamed on demand.
+Streaming wins on a fast local origin — a big game boots after fetching only what the boot path
+reads — but it costs one round trip per read, so a game that keeps pulling files at runtime
+crawls over a high-latency link. Preloading trades a wait up front for local reads afterwards.
+The `io` field supports more selective policies and profile preload; see
+[runtime I/O policy](bundles.md#runtime-io-policy-and-access-profiles).
+
+Cloudflare Pages uses `wrangler.jsonc` for the `APPS` R2 binding in preview and
+production. Both use `bottleship-apps`; bundle delivery only reads this bucket.
+The `X-WGB-Cache` response header identifies `HIT`, `MISS` or `BYPASS` on ranges.
+Run `tools/harness/diagnostics/wgb-http-smoke.ts` with `WGB_URL` set to a deployed
+bundle and `EXPECT_EDGE_CACHE=1` to check HEAD, pinned ranges, a real cache hit,
+If-Range mismatch and unsatisfiable ranges without downloading the full archive.
 
 ## Quality gate
 

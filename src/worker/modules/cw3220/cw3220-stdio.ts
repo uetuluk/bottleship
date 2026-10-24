@@ -3,6 +3,7 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { writeGetcStub } from "../crt-slab-stubs";
+import { writeGuestCode } from "../../core/memory/guest-code";
 
 // ----------------------------------------------------------------------------
 // CW3220.DLL stdio HLE (partial override of a real DLL)
@@ -55,21 +56,23 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
     // decompression fails ("Decompression error"). Switch msvcrt to real, zeroed
     // FILE structs so the inlined macro always defers to our _fgetc.
     msvcrt.enableRealFileStructs?.();
-    const noop0: ThunkImplementation = () => 0;     // success / NULL DIR* / dropped output
+    const noop0: ThunkImplementation = () => 0;     // success / dropped output
     const fail: ThunkImplementation = () => -1;     // _fstat: report failure, caller falls back
 
     // [name, handler, argCount]. FILE*-consuming funcs MUST all be overridden so our
     // pseudo-FILE* never reaches real CW3220 code. fprintf/vfprintf are dropped (output
     // only, not needed to boot) but still overridden so they don't deref our FILE*.
+    // Borland decorates its exports with a leading underscore; msvcrt.dll does not, so the
+    // left column is CW3220's spelling and the right one is the msvcrt handler behind it.
     const table: Array<[string, ThunkImplementation | undefined, number]> = [
-        ["_fopen", m["_fopen"], 2],
-        ["_fclose", m["_fclose"], 1],
-        ["_fread", m["_fread"], 4],
-        ["_fwrite", m["_fwrite"], 4],
-        ["_fseek", m["_fseek"], 3],
-        ["_ftell", m["_ftell"], 1],
-        ["_fgets", m["_fgets"], 3],
-        ["__fgetc", m["_fgetc"], 1],   // Borland's getc spelling
+        ["_fopen", m["fopen"], 2],
+        ["_fclose", m["fclose"], 1],
+        ["_fread", m["fread"], 4],
+        ["_fwrite", m["fwrite"], 4],
+        ["_fseek", m["fseek"], 3],
+        ["_ftell", m["ftell"], 1],
+        ["_fgets", m["fgets"], 3],
+        ["__fgetc", m["fgetc"], 1],   // Borland's getc spelling
         ["_chdir", m["_chdir"], 1],
         ["_fprintf", noop0, 2],
         ["_vfprintf", noop0, 3],
@@ -77,10 +80,12 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
         ["_flushall", noop0, 0],
         ["_remove", noop0, 1],
         ["_mkdir", noop0, 1],
-        ["_opendir", noop0, 1],        // stub: no directory enumeration (not on the boot path)
-        ["_readdir", noop0, 1],
-        ["_closedir", noop0, 1],
     ];
+
+    // Directory streams stay native. CW3220's opendir/readdir/closedir/rewinddir
+    // use FindFirstFileA/FindNextFileA/FindClose directly, rather than the FILE*
+    // subsystem above. Replacing them with NULL-returning stubs hides every
+    // directory entry from callers, including save files they just wrote.
 
     const handlers: Record<string, ThunkImplementation> = {};
     const methods: Cw3220StubInfo[] = [];
@@ -107,7 +112,7 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
             Logger.error(LogCategory.SYSTEM, `[cw3220] stub write OOB at 0x${stubDll.baseAddress.toString(16)}`);
             return null;
         }
-        mem.set(stubDll.stubCode, stubDll.baseAddress);
+        writeGuestCode(mem, stubDll.stubCode, stubDll.baseAddress);
     }
 
     // Inline x86 getc fast path. The Tin3 LZSS decompressor calls __fgetc(FILE*) as a

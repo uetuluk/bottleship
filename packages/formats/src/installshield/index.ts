@@ -7,7 +7,7 @@
  * header + <name>{1,2,...}.cab data volumes, decompresses (per-chunk
  * raw-deflate), de-obfuscates, follows LINK_PREV dedup links (v6+), handles
  * volume-split files, and validates each file against its stored expanded
- * size (and MD5 when present — v5 carries a per-file MD5, v6+ as well).
+ * size and MD5 when present (early v5 descriptors omit the digest).
  *
  * No Node `fs`/`zlib`/`crypto`: operates on `Uint8Array` inputs, raw-inflate
  * via the platform `DecompressionStream("deflate-raw")` (Chromium — the wizard
@@ -22,6 +22,7 @@
 
 import { Md5 } from "../unpack/checksums";
 import { asBufferSource } from "../dom-buffer";
+import { dosDateTimeToUnix } from "../zip/dos-time";
 
 // ---- flags (cabfile.h) ----
 export const FILE_SPLIT = 1;
@@ -49,15 +50,17 @@ function isRuntimeFileGroup(name: string): boolean {
     return name.startsWith("<"); // <Support>…, <Engine>…, <Disk1>…
 }
 
+/** Destinations rooted at the install directory; the variable's case is not significant. */
+const TARGETDIR_ROOT = /^<TARGETDIR>/i;
+
 /**
  * Resolve a raw InstallShield destination string to a relative install dir:
  * strip a leading `<TARGETDIR>\` or `..\`, convert `\`→`/`, drop a leading slash.
  * `<TARGETDIR>` / `..` / "" → "" (root).
  */
 export function resolveInstallDestination(dest: string): string {
-    let s = dest;
     // strip leading <TARGETDIR> (with or without a following separator)
-    if (s.startsWith("<TARGETDIR>")) s = s.slice("<TARGETDIR>".length);
+    let s = dest.replace(TARGETDIR_ROOT, "");
     // strip any number of leading `..\` / `../` (parent-relative to install root)
     while (s.startsWith("..\\") || s.startsWith("../")) s = s.slice(3);
     if (s === "..") s = "";
@@ -81,6 +84,8 @@ export interface InstallShieldFile {
     linkPrev: number;
     linkNext: number;
     linkFlags: number;
+    /** Last-write time from the v6+ descriptor's DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent for v5 or an invalid stamp. */
+    modified?: number;
 }
 
 /**
@@ -93,6 +98,8 @@ export interface InstallShieldFileGroup {
     name: string;
     firstFile: number;
     lastFile: number;
+    /** Raw destination (`<TARGETDIR>\Data\Motion`); v6+ only, "" otherwise. */
+    destination: string;
 }
 
 /**
@@ -125,6 +132,12 @@ export interface InstallShieldInfo {
      */
     installDirByIndex: Map<number, string | null>;
     /**
+     * file-index → install dir from its FILE GROUP's `<TARGETDIR>`-rooted destination
+     * (v6+). The cabinet directory of a file is the subfolder of the group's source
+     * folder, so the install path is always `destination/cabinet dir/name`.
+     */
+    groupDirByIndex: Map<number, string>;
+    /**
      * True when the cabinet's own per-file directory table carries NO layout for
      * the game files (every installed file sits in cabinet dir ""). Only then is
      * the component→destination overlay authoritative for placement; when the
@@ -149,6 +162,9 @@ interface VolumeHeaderView {
 }
 
 export interface ExtractOptions {
+    /** Explicit recovery for cabinets whose obfuscation flag marks plaintext bytes.
+     * Size and MD5 verification still apply; normal extraction honors the flag. */
+    ignoreObfuscation?: boolean;
     /** Verify each file against its stored expanded size (default true). */
     verifySize?: boolean;
     /** Verify each file against its stored MD5 if present (default true). */
@@ -173,6 +189,8 @@ export interface ExtractOptions {
         fd: InstallShieldFile,
         outPath: string,
     ) => Promise<Uint8Array | null> | Uint8Array | null;
+    /** Receives each extracted file's last-write time (wall-clock seconds), keyed like the result. */
+    fileTimes?: Map<string, number>;
 }
 
 /** True when a 16-byte MD5 field is all-zero (i.e. "no checksum stored"). */
@@ -220,8 +238,8 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     const r = reader(hdr);
     if (r.u32(0) !== CAB_SIGNATURE) throw new Error("Not an ISc cabinet (bad signature)");
 
-    let major = decodeMajor(r.u32(4));
-    if (major < 5) major = 5; // libunshield.c clamps <5 to 5
+    const major = decodeMajor(r.u32(4));
+    if (major !== 0 && major !== 5 && major < 6) throw new Error(`Unsupported cabinet version ${major}`);
     const cdOff = r.u32(12);
     if (!cdOff) throw new Error("No CAB descriptor available");
 
@@ -246,6 +264,14 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     for (let d = 0; d < directoryCount; d++) dirs.push(r.cstr(base + fileTable[d]!));
 
     const files: InstallShieldFile[] = [];
+    // Early IS5 stores 0x2a-byte descriptors, later IS5 appends a 16-byte digest.
+    // Bound each record by the next descriptor/string, so a missing digest cannot
+    // consume the following file's metadata as a checksum (lib/file.c case 0/5).
+    const recordBoundaries = [...fileTable];
+    if (major <= 5) {
+        for (let i = 0; i < fileCount; i++) recordBoundaries.push(r.u32(base + fileTable[directoryCount + i]!));
+    }
+    recordBoundaries.sort((a, b) => a - b);
     for (let i = 0; i < fileCount; i++) {
         let fd: InstallShieldFile;
         if (major <= 5) {
@@ -256,7 +282,9 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
             //   md5[16]@0x2a (ends 0x3a). No volume/link fields.
             const p = base + fileTable[directoryCount + i]!;
             const flags = r.u16(p + 0x08);
-            const md5 = (flags & FILE_INVALID) ? null : hdr.subarray(p + 0x2a, p + 0x3a);
+            const next = recordBoundaries.find(off => base + off > p) ?? (hdr.length - base);
+            const md5 = major === 5 && !(flags & FILE_INVALID) && base + next >= p + 0x3a
+                ? hdr.subarray(p + 0x2a, p + 0x3a) : null;
             fd = {
                 index: i,
                 name: r.cstr(base + r.u32(p + 0x00)),
@@ -277,9 +305,10 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
             //   p = base + file_table_offset2 + index*0x57
             //   flags u16@0; expanded u64@2; compressed u64@0xa; data_offset u64@0x12;
             //   md5[16]@0x1a; skip 0x10; name_offset u32@0x3a; dir_index u16@0x3e;
-            //   (==0x40) skip 0xc; link_prev u32@0x4c; link_next u32@0x50;
-            //   link_flags u8@0x54; volume u16@0x55 (==0x57).
+            //   attributes u16@0x40; skip 2; dos_date u16@0x44; dos_time u16@0x46; skip 4;
+            //   link_prev u32@0x4c; link_next u32@0x50; link_flags u8@0x54; volume u16@0x55 (==0x57).
             const p = base + fileTableOffset2 + i * 0x57;
+            const modified = dosDateTimeToUnix(r.u16(p + 0x44), r.u16(p + 0x46));
             fd = {
                 index: i,
                 flags: r.u16(p + 0x00),
@@ -294,6 +323,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
                 linkFlags: r.u8(p + 0x54),
                 volume: r.u16(p + 0x55),
                 dir: "",
+                ...(modified !== undefined ? { modified } : {}),
             };
         }
         fd.dir = dirs[fd.dirIndex] ?? `?${fd.dirIndex}`;
@@ -306,7 +336,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     // cabinet dir "" but the game needs System/, Maps/, Textures/, …). Parsed
     // defensively: any absence/old-format quirk yields an empty map → callers
     // fall back to the cabinet `dir`. Never throws.
-    const { fileGroups, components, installDirByIndex } = parseComponentLayout(
+    const { fileGroups, components, installDirByIndex, groupDirByIndex } = parseComponentLayout(
         r,
         hdr,
         cdOff,
@@ -323,7 +353,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
         (f) => installDirByIndex.get(f.index) === null || !f.dir,
     );
 
-    return { major, dirs, files, fileGroups, components, installDirByIndex, cabinetIsFlat };
+    return { major, dirs, files, fileGroups, components, installDirByIndex, groupDirByIndex, cabinetIsFlat };
 }
 
 type Reader = ReturnType<typeof reader>;
@@ -338,7 +368,7 @@ type Reader = ReturnType<typeof reader>;
  *   - file_group_offsets[71] @ cdOff+0x3e, component_offsets[71] @ cdOff+0x15a.
  *   - OffsetList node: name_offset u32@0, descriptor_offset u32@4, next_offset u32@8.
  *   - FileGroup descriptor: name_offset u32@0; skip (v5: 0x48 / v6+: 0x12);
- *     first_file i32; last_file i32.
+ *     first_file i32; last_file i32; v6+: destination string_offset u32@0x3a.
  *   - Component descriptor: name_offset u32@0; **destination string_offset u32@0x1c**
  *     (the field upstream skips); then skip to file_group_count u16
  *     (v5 @ +0x6e / v6+ @ +0x6f) and file_group_table_offset u32 right after.
@@ -354,10 +384,12 @@ function parseComponentLayout(
     fileGroups: InstallShieldFileGroup[];
     components: InstallShieldComponent[];
     installDirByIndex: Map<number, string | null>;
+    groupDirByIndex: Map<number, string>;
 } {
     const fileGroups: InstallShieldFileGroup[] = [];
     const components: InstallShieldComponent[] = [];
     const installDirByIndex = new Map<number, string | null>();
+    const groupDirByIndex = new Map<number, string>();
 
     // string/buffer pointers in these tables are all relative to cdOff.
     const inBounds = (o: number) => o >= 0 && o < hdr.length;
@@ -380,8 +412,15 @@ function parseComponentLayout(
                     const skip = major <= 5 ? 0x48 : 0x12;
                     const first = (r.u32(d + 4 + skip) | 0);
                     const last = (r.u32(d + 4 + skip + 4) | 0);
-                    const fg: InstallShieldFileGroup = { name, firstFile: first, lastFile: last };
+                    const destination = major >= 6 && inBounds(d + 0x3e) ? str(r.u32(d + 0x3a)) : "";
+                    const fg: InstallShieldFileGroup = { name, firstFile: first, lastFile: last, destination };
                     fileGroups.push(fg);
+                    // Other roots (<WINSYSDIR>, <SUPPORTDIR>, …) are outside the install tree.
+                    if (TARGETDIR_ROOT.test(destination) && !isRuntimeFileGroup(name)) {
+                        const dir = resolveInstallDestination(destination);
+                        const lo = Math.max(0, first), hi = Math.min(fileCount - 1, last);
+                        for (let idx = lo; idx <= hi; idx++) if (!groupDirByIndex.has(idx)) groupDirByIndex.set(idx, dir);
+                    }
                     if (name && !fgByName.has(name)) fgByName.set(name, fg);
                 }
                 next = nextOff;
@@ -436,10 +475,10 @@ function parseComponentLayout(
         }
     } catch {
         // Old/odd header format — abandon the component layout, fall back to dirs.
-        return { fileGroups, components, installDirByIndex: new Map() };
+        return { fileGroups, components, installDirByIndex: new Map(), groupDirByIndex: new Map() };
     }
 
-    return { fileGroups, components, installDirByIndex };
+    return { fileGroups, components, installDirByIndex, groupDirByIndex };
 }
 
 /** Read a v5 (40-byte) or v6 (64-byte) volume header from a `.cab` buffer. */
@@ -526,6 +565,7 @@ function readRaw(
     compressed: boolean,
     volumes: Map<number, Uint8Array>,
     major: number,
+    ignoreObfuscation = false,
 ): Uint8Array {
     const out = new Uint8Array(size);
     let written = 0;
@@ -545,6 +585,7 @@ function readRaw(
     while (written < size) {
         const b = getVol(volumes, vol);
         const want = Math.min(size - written, volLeft);
+        if (pos < 0 || pos + want > b.length) throw new Error(`Truncated cabinet volume ${vol} (${fd.name})`);
         out.set(b.subarray(pos, pos + want), written);
         written += want;
         pos += want;
@@ -556,7 +597,7 @@ function readRaw(
         volLeft = compressed ? vh.firstFileSizeCompressed : vh.firstFileSizeExpanded;
     }
 
-    if (fd.flags & FILE_OBFUSCATED) deobfuscate(out);
+    if (!ignoreObfuscation && (fd.flags & FILE_OBFUSCATED)) deobfuscate(out);
     return out;
 }
 
@@ -573,20 +614,21 @@ async function extractFile(
     volumes: Map<number, Uint8Array>,
     major: number,
     inflate: (c: Uint8Array) => Promise<Uint8Array> | Uint8Array,
+    ignoreObfuscation: boolean,
 ): Promise<Uint8Array | null> {
     if ((fd.flags & FILE_INVALID) || fd.dataOffset === 0 || !fd.name) return null;
     if (fd.linkFlags & LINK_PREV) {
         const prev = files[fd.linkPrev];
-        return prev ? extractFile(prev, files, volumes, major, inflate) : null;
+        return prev ? extractFile(prev, files, volumes, major, inflate, ignoreObfuscation) : null;
     }
 
     if (!(fd.flags & FILE_COMPRESSED)) {
-        return readRaw(fd, fd.expanded, false, volumes, major);
+        return readRaw(fd, fd.expanded, false, volumes, major, ignoreObfuscation);
     }
 
     // compressed: stream of [u16 len][len bytes raw-deflate] chunks
     // (the default `unshield_file_save` path — applies to both v5 and v6).
-    const raw = readRaw(fd, fd.compressed, true, volumes, major);
+    const raw = readRaw(fd, fd.compressed, true, volumes, major, ignoreObfuscation);
     const rv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     const parts: Uint8Array[] = [];
     let off = 0;
@@ -596,6 +638,7 @@ async function extractFile(
         const len = rv.getUint16(off, true);
         off += 2;
         if (len === 0) throw new Error(`zero chunk len (${fd.name})`);
+        if (off + len > raw.length) throw new Error(`chunk data past end (${fd.name})`);
         const chunk = raw.subarray(off, off + len);
         off += len;
         const dec = await inflate(chunk);
@@ -623,14 +666,22 @@ export function fileRelPath(fd: InstallShieldFile): string {
 }
 
 /**
- * Resolve the install-relative output path for a file, preferring the
- * component→destination mapping over the cabinet `directory_index`.
+ * Resolve the install-relative output path (forward slashes) for a file.
  *
  * Returns `null` when the file belongs to an InstallShield runtime group
  * (`<Support>`/`<Engine>`/`<Disk1>` — isrt.dll, ikernel.exe, setup.inx, …) and
  * must be skipped.
  *
- * Policy: the component map only WINS for a FLAT cabinet — one whose per-file
+ * A v6+ file group with a `<TARGETDIR>`-rooted destination places its files at
+ * `destination/cabinet dir/name`, as the engine does: the cabinet directory is
+ * relative to the group, never to the install root. That holds even when the two
+ * repeat a name — a real HP2 install has `help/help/*` from group `<TARGETDIR>\help`
+ * with cabinet dir `help`. Installers whose cabinet dirs are install-root paths
+ * give their groups the destination `<TARGETDIR>` (Max Payne: the Levels group,
+ * so x_level*.ras stays at the root), which the composition leaves unchanged.
+ * Groups bound elsewhere (`<WINSYSDIR>`, …) and v5 headers use the component policy:
+ *
+ * The component map only WINS for a FLAT cabinet — one whose per-file
  * directory table carries no layout for the game files (`info.cabinetIsFlat`).
  * That routes flat installers (HP1 demo — every file in cabinet dir "") into
  * System/, Maps/, Textures/, … from the component destinations, while installers
@@ -645,12 +696,15 @@ export function fileRelPath(fd: InstallShieldFile): string {
 export function resolveInstallPath(fd: InstallShieldFile, info: InstallShieldInfo): string | null {
     const mapped = info.installDirByIndex.get(fd.index);
     if (mapped === null) return null; // runtime/scaffolding file → skip
+    const rel = fileRelPath(fd).replace(/\\/g, "/");
+    const groupDir = info.groupDirByIndex.get(fd.index);
+    if (groupDir !== undefined) return groupDir ? `${groupDir}/${rel}` : rel;
     if (mapped !== undefined && !fd.dir && info.cabinetIsFlat) {
         // flat cabinet (no per-file layout) + a component destination → place by destination.
         return mapped ? `${mapped}/${fd.name}` : fd.name;
     }
     // real cabinet directory present (or no component info) → cabinet layout.
-    return fileRelPath(fd);
+    return rel;
 }
 
 /**
@@ -693,7 +747,7 @@ export async function extractInstallShield(
             // External/loose media file — bytes are not in the cabinet; ask the caller.
             data = opts.resolveExternal ? await opts.resolveExternal(fd, outPath) : null;
         } else {
-            data = await extractFile(fd, info.files, volumes, info.major, inflate);
+            data = await extractFile(fd, info.files, volumes, info.major, inflate, opts.ignoreObfuscation ?? false);
         }
         if (!data) {
             // Unresolved external file (no resolveExternal hook, or not found on media):
@@ -716,6 +770,7 @@ export async function extractInstallShield(
             }
         }
         result.set(outPath, data);
+        if (fd.modified !== undefined) opts.fileTimes?.set(outPath, fd.modified);
         done++;
         opts.onProgress?.(done, live.length, outPath);
     }

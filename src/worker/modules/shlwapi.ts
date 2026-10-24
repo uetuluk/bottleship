@@ -5,6 +5,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { encodeAnsi, getCodePageDecoder } from "./codepage-utils";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { System } from "../core/system";
+import { exports as resourceExports } from "./kernel32/resource";
+import { exports as fileExports } from "./kernel32/file-io";
+import { collectDefaultSearchDirectories } from "./kernel32/file-io-path";
 
 const MAX_PATH = 260;
 const FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -14,9 +17,33 @@ export class Shlwapi implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(_process: Process): void {
+        // SHLWAPI ordinal 66 forwards to KERNEL32.FindResourceW on Windows.
+        this.exports["ord_66"] = resourceExports["FindResourceW"];
+        this.exports["ord_52"] = fileExports["CreateFileW"];
         const bindA = (name: string, fn: (args: number[]) => number, stackCleanup: number) => {
             this.exports[name] = (_ctx, _mem, args) => ({ value: fn(args), stackCleanup });
         };
+
+        bindA("StrCmpNW", (args) => {
+            const count = args[2] | 0;
+            for (let i = 0; i < count; i++) {
+                const a = Mem.readUint16(args[0] + i * 2) ?? 0;
+                const b = Mem.readUint16(args[1] + i * 2) ?? 0;
+                if (a !== b) return a - b;
+                if (a === 0) break;
+            }
+            return 0;
+        }, 12);
+        bindA("PathCreateFromUrlA", (args) => this.pathCreateFromUrl(args, false), 16);
+        bindA("PathCreateFromUrlW", (args) => this.pathCreateFromUrl(args, true), 16);
+        bindA("UrlCreateFromPathA", (args) => this.urlCreateFromPath(args, false), 16);
+        bindA("UrlCreateFromPathW", (args) => this.urlCreateFromPath(args, true), 16);
+        bindA("UrlIsA", (args) => this.urlIs(this.readAnsi(args[0]), args[1]), 8);
+        bindA("UrlIsW", (args) => this.urlIs(this.readWide(args[0]), args[1]), 8);
+        bindA("PathIsURLA", (args) => /^[a-z][a-z0-9+.-]+:/i.test(this.readAnsi(args[0] >>> 0)) ? 1 : 0, 4);
+        bindA("PathIsURLW", (args) => /^[a-z][a-z0-9+.-]+:/i.test(this.readWide(args[0] >>> 0)) ? 1 : 0, 4);
+        bindA("PathSearchAndQualifyA", (args) => this.searchAndQualify(args, false), 12);
+        bindA("PathSearchAndQualifyW", (args) => this.searchAndQualify(args, true), 12);
 
         bindA("PathFindFileNameA", (args) => this.findFileNameAnsi(args[0] >>> 0), 4);
         bindA("PathFindFileNameW", (args) => this.findFileNameWide(args[0] >>> 0), 4);
@@ -25,6 +52,9 @@ export class Shlwapi implements IModule {
 
         bindA("PathAppendA", (args) => this.pathAppendA(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
         bindA("PathAppendW", (args) => this.pathAppendW(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
+
+        bindA("PathCombineA", (args) => this.pathCombineA(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0), 12);
+        bindA("PathCombineW", (args) => this.pathCombineW(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0), 12);
 
         bindA("PathCanonicalizeA", (args) => this.pathCanonicalizeA(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
         bindA("PathCanonicalizeW", (args) => this.pathCanonicalizeW(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
@@ -80,9 +110,92 @@ export class Shlwapi implements IModule {
 
         bindA("UrlUnescapeA", (args) => this.urlUnescapeA(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0), 16);
         bindA("UrlUnescapeW", (args) => this.urlUnescapeW(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0), 16);
+
+        bindA("PathMatchSpecA", (args) => this.pathMatchSpec(this.readAnsi(args[0] >>> 0), this.readAnsi(args[1] >>> 0)) ? 1 : 0, 8);
+        bindA("PathMatchSpecW", (args) => this.pathMatchSpec(this.readWide(args[0] >>> 0), this.readWide(args[1] >>> 0)) ? 1 : 0, 8);
+
+        // HLS<->RGB use the Win32 convention: H/L/S each 0..240 (HLSMAX=240), R/G/B 0..255.
+        bindA("ColorHLSToRGB", (args) => this.colorHlsToRgb(args[0] & 0xffff, args[1] & 0xffff, args[2] & 0xffff), 12);
+        bindA("ColorRGBToHLS", (args) => { this.colorRgbToHls(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0); return 0; }, 16);
     }
 
     reset(): void {}
+
+    /** PathMatchSpec: TRUE if `name` matches `spec`. `spec` is a ';'-separated list of
+     *  wildcard patterns (`*` any run, `?` any single char), case-insensitive. `*` and
+     *  `*.*` match everything (DOS/shell semantics). */
+    private pathMatchSpec(name: string, spec: string): boolean {
+        for (const part of spec.split(";")) {
+            if (this.matchSingleSpec(name, part.trim())) return true;
+        }
+        return false;
+    }
+
+    private matchSingleSpec(name: string, spec: string): boolean {
+        if (spec === "") return false;
+        if (spec === "*" || spec === "*.*") return true;
+        let re = "^";
+        for (const ch of spec) {
+            if (ch === "*") re += ".*";
+            else if (ch === "?") re += ".";
+            else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+        }
+        re += "$";
+        try { return new RegExp(re, "i").test(name); } catch { return false; }
+    }
+
+    // HLSMAX=240, RGBMAX=255, UNDEFINED-hue = HLSMAX*2/3. Byte-exact port of the Win32
+    // ColorRGBToHLS/ColorHLSToRGB integer algorithm (same one in comctl32/Wine).
+    private colorRgbToHls(clrRGB: number, pwHue: number, pwLum: number, pwSat: number): void {
+        const HLSMAX = 240, RGBMAX = 255, UNDEFINED = (HLSMAX * 2 / 3) | 0;
+        const R = clrRGB & 0xff, G = (clrRGB >>> 8) & 0xff, B = (clrRGB >>> 16) & 0xff;
+        const cMax = Math.max(R, G, B), cMin = Math.min(R, G, B);
+        const L = (((cMax + cMin) * HLSMAX + RGBMAX) / (2 * RGBMAX)) | 0;
+        let H: number, S: number;
+        if (cMax === cMin) {
+            S = 0;
+            H = UNDEFINED;
+        } else {
+            if (L <= HLSMAX / 2) S = (((cMax - cMin) * HLSMAX + ((cMax + cMin) >> 1)) / (cMax + cMin)) | 0;
+            else S = (((cMax - cMin) * HLSMAX + ((2 * RGBMAX - cMax - cMin) >> 1)) / (2 * RGBMAX - cMax - cMin)) | 0;
+            const Rdelta = (((cMax - R) * (HLSMAX / 6) + ((cMax - cMin) >> 1)) / (cMax - cMin)) | 0;
+            const Gdelta = (((cMax - G) * (HLSMAX / 6) + ((cMax - cMin) >> 1)) / (cMax - cMin)) | 0;
+            const Bdelta = (((cMax - B) * (HLSMAX / 6) + ((cMax - cMin) >> 1)) / (cMax - cMin)) | 0;
+            if (R === cMax) H = Bdelta - Gdelta;
+            else if (G === cMax) H = ((HLSMAX / 3) | 0) + Rdelta - Bdelta;
+            else H = ((2 * HLSMAX / 3) | 0) + Gdelta - Rdelta;
+            if (H < 0) H += HLSMAX;
+            if (H > HLSMAX) H -= HLSMAX;
+        }
+        if (pwHue) Mem.writeUint16(pwHue, H & 0xffff);
+        if (pwLum) Mem.writeUint16(pwLum, L & 0xffff);
+        if (pwSat) Mem.writeUint16(pwSat, S & 0xffff);
+    }
+
+    private colorHlsToRgb(H: number, L: number, S: number): number {
+        const HLSMAX = 240, RGBMAX = 255;
+        const hueToRgb = (n1: number, n2: number, hue: number): number => {
+            if (hue < 0) hue += HLSMAX;
+            if (hue > HLSMAX) hue -= HLSMAX;
+            if (hue < HLSMAX / 6) return n1 + (((n2 - n1) * hue + (HLSMAX / 12)) / (HLSMAX / 6));
+            if (hue < HLSMAX / 2) return n2;
+            if (hue < HLSMAX * 2 / 3) return n1 + (((n2 - n1) * ((HLSMAX * 2 / 3) - hue) + (HLSMAX / 12)) / (HLSMAX / 6));
+            return n1;
+        };
+        let R: number, G: number, B: number;
+        if (S === 0) {
+            R = G = B = ((L * RGBMAX) / HLSMAX) | 0;
+        } else {
+            let Magic2: number;
+            if (L <= HLSMAX / 2) Magic2 = ((L * (HLSMAX + S) + (HLSMAX / 2)) / HLSMAX) | 0;
+            else Magic2 = L + S - (((L * S) + (HLSMAX / 2)) / HLSMAX | 0);
+            const Magic1 = 2 * L - Magic2;
+            R = Math.min(RGBMAX, ((hueToRgb(Magic1, Magic2, H + ((HLSMAX / 3) | 0)) * RGBMAX + (HLSMAX / 2)) / HLSMAX) | 0);
+            G = Math.min(RGBMAX, ((hueToRgb(Magic1, Magic2, H) * RGBMAX + (HLSMAX / 2)) / HLSMAX) | 0);
+            B = Math.min(RGBMAX, ((hueToRgb(Magic1, Magic2, H - ((HLSMAX / 3) | 0)) * RGBMAX + (HLSMAX / 2)) / HLSMAX) | 0);
+        }
+        return ((B & 0xff) << 16) | ((G & 0xff) << 8) | (R & 0xff);
+    }
 
     private readAnsi(ptr: number, maxLen: number = MAX_PATH): string {
         if (!ptr) return "";
@@ -129,6 +242,85 @@ export class Shlwapi implements IModule {
         return true;
     }
 
+    private pathCreateFromUrl(args: number[], wide: boolean): number {
+        const [source, destination, lengthPtr] = args;
+        if (!source || !lengthPtr) return 0x80070057;
+        const url = wide ? this.readWide(source, 4096) : this.readAnsi(source, 4096);
+        if (!/^file:/i.test(url)) return 0x80070057;
+        let path = url.slice(5);
+        if (path.startsWith("///")) path = path.slice(3);
+        else if (/^\/\/[a-z]:/i.test(path)) path = path.slice(2);
+        else if (/^\/\/[a-z]/i.test(path)) path = "//" + path.slice(2);
+        try { path = decodeURIComponent(path); } catch { return 0x80070057; }
+        path = path.split("/").join(String.fromCharCode(92));
+        const capacity = Mem.readUint32(lengthPtr) ?? 0;
+        const required = wide ? path.length : encodeAnsi(path).length;
+        if (!destination || capacity <= required) {
+            Mem.writeUint32(lengthPtr, required + 1);
+            return 0x80004003;
+        }
+        if (wide) this.writeWide(destination, path, capacity);
+        else this.writeAnsi(destination, path, capacity);
+        Mem.writeUint32(lengthPtr, required);
+        return 0;
+    }
+
+    private urlCreateFromPath(args: number[], wide: boolean): number {
+        const [source, destination, lengthPtr] = args;
+        if (!source || !lengthPtr) return 0x80070057;
+        const capacity = Mem.readUint32(lengthPtr) ?? 0;
+        const path = wide ? this.readWide(source) : this.readAnsi(source);
+        const alreadyUrl = /^[a-z][a-z0-9+.-]+:/i.test(path);
+        const normalized = path.split(String.fromCharCode(92)).join("/");
+        const url = alreadyUrl ? path : "file:" + (normalized.startsWith("//") ? "" : "///")
+            + encodeURI(normalized).replace(/#/g, "%23").replace(/[?]/g, "%3F");
+        const required = wide ? url.length : encodeAnsi(url).length;
+        if (!destination || capacity <= required) {
+            Mem.writeUint32(lengthPtr, required + 1);
+            return 0x80004003;
+        }
+        if (wide) this.writeWide(destination, url, capacity);
+        else this.writeAnsi(destination, url, capacity);
+        Mem.writeUint32(lengthPtr, required);
+        return alreadyUrl ? 1 : 0;
+    }
+
+    private urlIs(url: string, kind: number): number {
+        const match = /^([a-z][a-z0-9+.-]+):/i.exec(url);
+        if (!match) return 0;
+        const scheme = match[1].toLowerCase();
+        switch (kind) {
+            case 0: return 1;
+            case 1: return url.slice(match[0].length).startsWith("//") ? 0 : 1;
+            case 2: return /^(about|javascript|vbscript)$/.test(scheme) ? 1 : 0;
+            case 3: return scheme === "file" ? 1 : 0;
+            case 4: return scheme === "file" || scheme === "http" || scheme === "https" ? 1 : 0;
+            case 5: return url.split(/[?#]/)[0].endsWith("/") ? 1 : 0;
+            case 6: return url.includes("?") ? 1 : 0;
+            default: return 0;
+        }
+    }
+
+    private searchAndQualify(args: number[], wide: boolean): number {
+        const [source, destination, capacity] = args;
+        if (!source || !destination || !capacity) return 0;
+        const path = wide ? this.readWide(source) : this.readAnsi(source);
+        if (!path) return 0;
+        const vfs = System.getInstance().fileSystem;
+        let qualified = vfs.resolvePath(path);
+        if (!/[\\\\/:]/.test(path)) {
+            for (const directory of collectDefaultSearchDirectories()) {
+                const candidate = vfs.resolvePath(this.joinPath(directory, path));
+                if (vfs.fileExists(candidate) && !vfs.directoryExists(candidate)) {
+                    qualified = candidate;
+                    break;
+                }
+            }
+        }
+        return (wide ? this.writeWide(destination, qualified, capacity)
+            : this.writeAnsi(destination, qualified, capacity)) ? 1 : 0;
+    }
+
     private normalizeSlashes(path: string): string {
         return path.replace(/\//g, "\\");
     }
@@ -169,6 +361,11 @@ export class Shlwapi implements IModule {
 
     private canonicalizePath(path: string): string {
         path = this.normalizeSlashes(path);
+        // PathCanonicalize only rewrites "." and "..": it copies every other character
+        // through, so a TRAILING separator survives. Dropping it turns a caller's
+        // `PathCombine(dst, dir, L"Launcher\\")` + `strcat(dst, L"file")` into
+        // `C:\Launcherfile` — a path that exists nowhere, reported only as "file not found".
+        const trailing = path.length > 1 && path.endsWith("\\");
         const { root, rest } = this.splitRoot(path);
         const segments = rest.split("\\").filter((s) => s.length > 0);
         const stack: string[] = [];
@@ -200,6 +397,7 @@ export class Shlwapi implements IModule {
             result += "\\";
         }
 
+        if (trailing && !result.endsWith("\\")) result += "\\";
         return result;
     }
 
@@ -240,6 +438,74 @@ export class Shlwapi implements IModule {
         const result = this.joinPath(path, more);
         if (result.length >= MAX_PATH) return false;
         return this.writeWide(pathPtr, result);
+    }
+
+    /** PathIsRelative: anything that neither starts at a root nor names a drive. */
+    private isRelativePath(path: string): boolean {
+        if (!path) return true;
+        return !(path[0] === "\\" || path[1] === ":");
+    }
+
+    /**
+     * PathCombine's rules are NOT PathAppend's, and the difference is load-bearing: a `file`
+     * that names a drive replaces `dir` outright, while one that merely STARTS with a
+     * backslash keeps only `dir`'s root. `null` is the caller-visible failure — the API
+     * reports it by writing an empty destination and returning NULL.
+     */
+    private combinePath(dir: string | null, file: string | null): string | null {
+        if (dir === null && file === null) return null;
+
+        let tmp: string;
+        if ((file === null || file === "") && dir !== null) {
+            tmp = dir;
+        } else if (dir === null || dir === "" || !this.isRelativePath(file!)) {
+            if (dir === null || dir === "" || file![0] !== "\\" || this.isUncPath(file!)) {
+                tmp = file!;
+            } else {
+                const root = this.stripRootValue(dir);
+                if (root === null) return null;
+                tmp = this.appendBackslash(root);
+                if (tmp.length + file!.length - 1 >= MAX_PATH) return null;
+                tmp += file!.substring(1);
+            }
+        } else {
+            tmp = this.appendBackslash(dir);
+            if (tmp.length + file!.length >= MAX_PATH) return null;
+            tmp += file!;
+        }
+
+        return this.canonicalizePath(tmp);
+    }
+
+    /** PathAddBackslash on a value rather than a buffer. */
+    private appendBackslash(path: string): string {
+        return path === "" || path.endsWith("\\") ? path : `${path}\\`;
+    }
+
+    private pathCombineA(destPtr: number, dirPtr: number, filePtr: number): number {
+        if (!destPtr) return 0;
+        const result = this.combinePath(
+            dirPtr ? this.readAnsi(dirPtr) : null,
+            filePtr ? this.readAnsi(filePtr) : null,
+        );
+        if (result === null || !this.writeAnsi(destPtr, result)) {
+            this.writeAnsi(destPtr, "");
+            return 0;
+        }
+        return destPtr;
+    }
+
+    private pathCombineW(destPtr: number, dirPtr: number, filePtr: number): number {
+        if (!destPtr) return 0;
+        const result = this.combinePath(
+            dirPtr ? this.readWide(dirPtr) : null,
+            filePtr ? this.readWide(filePtr) : null,
+        );
+        if (result === null || !this.writeWide(destPtr, result)) {
+            this.writeWide(destPtr, "");
+            return 0;
+        }
+        return destPtr;
     }
 
     private pathCanonicalizeA(destPtr: number, srcPtr: number): boolean {

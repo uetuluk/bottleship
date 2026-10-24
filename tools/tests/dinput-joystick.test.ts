@@ -153,15 +153,16 @@ describe("winmm joystick", () => {
         const v = new DataView(mem.buffer);
         expect(v.getUint32(16 + 36, true)).toBe(0);       // wXmin
         expect(v.getUint32(16 + 40, true)).toBe(65535);   // wXmax
-        expect(v.getUint32(16 + 60, true)).toBe(17);      // wNumButtons
+        expect(v.getUint32(16 + 60, true)).toBe(16);      // wNumButtons
         expect(v.getUint32(16 + 96, true) & 0x10).toBe(0x10); // JOYCAPS_HASPOV
-        expect(v.getUint32(16 + 104, true)).toBe(5);      // wNumAxes
-        expect(v.getUint32(16 + 108, true)).toBe(32);     // wMaxButtons
-        expect(String.fromCharCode(...mem.subarray(20, 27))).toBe("Gamepad");
-        expect(exports["joyGetDevCapsA"](ctx, mem, [0, 16, 64])).toBe(11);   // MMSYSERR_INVALPARAM: too small
-        expect(exports["joyGetDevCapsA"](ctx, mem, [16, 16, 404])).toBe(165); // JOYERR_PARMS
+        expect(v.getUint32(16 + 104, true)).toBe(4);      // wNumAxes
+        expect(v.getUint32(16 + 108, true)).toBe(16);     // wMaxButtons
+        expect(String.fromCharCode(...mem.subarray(20, 36))).toBe("Emulated Gamepad");
+        expect(exports["joyGetDevCapsA"](ctx, mem, [0, 16, 64])).toBe(0);    // short SDK struct: filled as far as it goes
+        expect(exports["joyGetDevCapsA"](ctx, mem, [0, 16, 2])).toBe(11);    // MMSYSERR_INVALPARAM: no room for wMid/wPid
+        expect(exports["joyGetDevCapsA"](ctx, mem, [16, 16, 404])).toBe(11); // MMSYSERR_INVALPARAM: no such joy id
     });
-    test("joyGetNumDevs reports the 16 Windows joystick ids", () => {
-        expect(exports["joyGetNumDevs"](ctx, new Uint8Array(0), [])).toBe(16);
+    test("joyGetNumDevs reports the driver's ports, with nothing invented behind them", () => {
+        expect(exports["joyGetNumDevs"](ctx, new Uint8Array(0), [])).toBe(2);
     });
 });

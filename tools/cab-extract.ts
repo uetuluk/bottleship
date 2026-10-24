@@ -6,18 +6,19 @@
  * (`data1.hdr` + `data{N}.cab` + `Setup.exe` + `setup.inx` …) that
  * `tools/unshield-extract.ts` then turns into the real game files.
  *
- * The cabinet LAYOUT + MSZIP driver live in the browser-safe core
- * (`packages/formats/src/cab/index.ts`); this CLI adds the Node-side fs + a
- * dictionary-capable sync zlib for MSZIP's cross-block preset dictionary.
+ * The cabinet LAYOUT, the MSZIP driver and the LZX decoder live in the
+ * browser-safe core (`packages/formats/src/cab/`); this CLI adds the Node-side
+ * fs + a dictionary-capable sync zlib for MSZIP's cross-block preset dictionary.
  *
  * Usage:
  *   bun tools/cab-extract.ts <archive.exe|.cab> <out-dir> [--list] [--quiet]
  *
- * Supported compression: NONE + MSZIP. QUANTUM/LZX are rejected.
+ * Supported compression: NONE, MSZIP and LZX. QUANTUM is rejected.
  */
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { inflateRawSync } from "zlib";
-import { dirname, resolve, sep } from "path";
+import { dirname, resolve } from "path";
+import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { findCabinet, parseCabHeader, extractCabToMap, type CabInflateBlock } from "@bottleship/formats/cab";
 
 const args = process.argv.slice(2);
@@ -65,12 +66,12 @@ mkdirSync(outDir, { recursive: true });
 const outRoot = resolve(outDir);
 let bytes = 0;
 for (const [name, data] of files) {
-    const dest = resolve(outRoot, name);
-    // Reject a cabinet entry whose name escapes the output dir (`..`, absolute).
-    if (dest !== outRoot && !dest.startsWith(outRoot + sep)) {
-        console.error(`Refusing to write outside ${outRoot}: ${name}`);
+    const resolved = tryResolveArchiveExtractPath(outRoot, name);
+    if (!resolved.ok) {
+        console.error(`Refusing to write outside ${outRoot} (${resolved.reason}): ${name}`);
         process.exit(1);
     }
+    const dest = resolved.path;
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, data);
     bytes += data.length;

@@ -1,4 +1,4 @@
-import { BlobSource, BufferSource, HttpRangeSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { BlobSource, BufferSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
 import { SabIoSource } from "./sab-io-source";
@@ -17,6 +17,11 @@ import { WgbCache } from "./wgb-cache";
  *  - BufferSource / SyncAccessHandleSource: already cheap-sync (RAM / OPFS SAH) —
  *    returned untouched; caching would only duplicate already-fast bytes.
  */
+/** 256 KiB cache blocks per 1 MiB I/O-worker chunk — the unit the blocking read and
+ *  the speculative run below are both expressed in, so they follow the transport's
+ *  granularity instead of drifting from it. */
+const SAB_BLOCKS_PER_CHUNK = 4;
+
 function withBlockCache(source: ZipSource): ZipSource {
     // Cheap-sync sources (RAM BufferSource, OPFS SyncAccessHandleSource) are returned
     // untouched. BlobSource (FileReaderSync) and SyncHttpRangeSource (a sync-XHR round
@@ -27,6 +32,7 @@ function withBlockCache(source: ZipSource): ZipSource {
     // for hot reads; only cold misses then cross to the I/O worker.
     const expensiveSync = source instanceof BlobSource || source instanceof SyncHttpRangeSource || source instanceof SabIoSource;
     if (typeof source.readRangeSync === "function" && !expensiveSync) {
+        (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
         return source;
     }
     const maxBytes = computeAdaptiveMaxBytes(source.size);
@@ -45,25 +51,35 @@ function withBlockCache(source: ZipSource): ZipSource {
     // (refilled on hits, chained on completion), so the scan streams off RAM and
     // stops blocking on cold sync faults. Depth 4 = up to 4 concurrent range
     // fetches, leaving connection-pool room for the critical blocking sync read.
-    // Over a SabIoSource the I/O worker already fetches in parallel and prefetches
-    // ahead on its own free thread; a guest-side prefetch would only spam the SAB
-    // request channel and contend with real cold reads. So the guest keeps just
-    // readahead (coalesce a run into one SAB request) with prefetch OFF.
+    // Over a SabIoSource the two halves of that trade separate, because prefetch now
+    // runs on the ASYNC channel (postMessage + transferred response, no Atomics.wait)
+    // and is real background work. So the BLOCKING half is sized to the transport's
+    // own fetch granularity — one I/O-worker chunk, 1 MiB / SAB_BLOCKS_PER_CHUNK below
+    // — because a blocking read that spans more chunks than it needs waits on transfer
+    // it will not use, and a seek into a new file (a station switch) is the one read
+    // nobody can prefetch. The SPECULATIVE half stays ahead of the cursor on the async
+    // channel in runs of twice that, deep enough that one run lands while another is
+    // being consumed. This is also the layer that gets the cursor hint, so it is the
+    // only one that speculates: the I/O worker below reads ahead only inside the entry
+    // the hint names.
     const overSabIo = source instanceof SabIoSource;
-    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number } }).__wgbTune;
+    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number; blockKB?: number } }).__wgbTune;
     const cache = new CachedSource(source, {
+        syncAlignmentBytes: overSabIo ? source.chunkBytes : undefined,
+        recordProfile: overSabIo,
         maxBytes: dev?.budgetMB ? dev.budgetMB * 1024 * 1024 : maxBytes,
         name,
-        syncReadaheadBlocks: dev?.readahead ?? 32,
-        prefetchAheadBlocks: overSabIo ? 0 : 32,
-        prefetchDepthRuns: overSabIo ? 1 : (dev?.depth ?? 4),
+        blockSize: dev?.blockKB ? dev.blockKB * 1024 : undefined,
+        syncReadaheadBlocks: dev?.readahead ?? (overSabIo ? SAB_BLOCKS_PER_CHUNK : 32),
+        prefetchAheadBlocks: overSabIo ? SAB_BLOCKS_PER_CHUNK * 2 : 32,
+        prefetchDepthRuns: overSabIo ? 2 : (dev?.depth ?? 4),
     });
-    // Dev-only diagnostic handle: `worker-eval globalThis.__wgbBlockCache.stats()`
-    // exposes the getc↔streaming interplay (blockingFaults vs syncHits/prefetchRuns).
-    if (import.meta.env?.DEV) (globalThis as unknown as { __wgbBlockCache?: ZipSource }).__wgbBlockCache = cache;
+    // The harness exports ordered first touches from this cache in every build.
+    (globalThis as unknown as { __wgbBlockCache?: ZipSource }).__wgbBlockCache = cache;
     return cache;
 }
 import type { QualityConfig } from "../../core/quality-config";
+import type { GraphicsAdapterConfig } from "../../core/graphics-adapter-config";
 
 /** Presentation metadata baseline carried in the bundle (overridable by the editorial catalog / user). */
 export interface WgbMeta {
@@ -96,6 +112,8 @@ export interface WgbManifest {
     rom?: string;
     registry?: string;
     emulator?: {
+        /** Virtual adapter identity used by legacy driver databases. */
+        graphicsAdapter?: GraphicsAdapterConfig;
         osVersion?: {
             major: number;
             minor: number;
@@ -165,6 +183,7 @@ export interface WgbManifest {
          * user preference at load. See src/worker/core/quality-config.ts (QualityConfig).
          */
         quality?: Partial<QualityConfig>;
+        io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy;
         /**
          * Redirect the CD-ROM drive (D:\) to a guest path inside the bundle (typically the install
          * dir holding the CD folders). Run-from-CD games scan D:\ for their data; this aliases
@@ -173,19 +192,25 @@ export interface WgbManifest {
          */
         cdPath?: string;
         /**
+         * The volume label of the disc in D:\. A retail title checks its disc by label
+         * (GetVolumeInformation), so a bundle standing in for one must carry the real label.
+         */
+        cdLabel?: string;
+        /**
          * Case-insensitive LoadLibrary* deny-list for per-game driver toggles.
          * Supports names, paths and wildcard patterns ("opengl3z", "opengl3z.dll", "drivers/opengl3/*").
          */
         disabledDlls?: string[];
+        /**
+         * DLL names whose copy in the game directory must win over our HLE module, as
+         * Windows' search order does (application directory before System32). Needed by
+         * games that ship a wrapper/proxy DLL next to the exe — ASI loaders, Glide and
+         * ddraw wrappers — which never execute while the HLE answers first.
+         * Same rule syntax as disabledDlls ("ddraw", "ddraw.dll", wildcards).
+         */
+        appDirDlls?: string[];
         /** Glob patterns for files to eagerly prefetch during startup (e.g. ["*.dll", "data/sprites.vga"]) */
         prefetch?: string[];
-        /** Fake ShellExecuteA subprocess results: when parameters match `match`, create `createFiles` in VFS */
-        shellExecFake?: Array<{
-            match: string;
-            /** ifAbsent: only create if the target doesn't already exist (so a game-written
-             *  copy — e.g. a config with the user's resolution — survives across launches). */
-            createFiles: Array<{ path: string; content?: string; copyFrom?: string; ifAbsent?: boolean }>;
-        }>;
         /** VFS paths to delete from CoW overlay on every boot (e.g. crash-sentinel files like Running.ini) */
         deleteOnBoot?: string[];
         /**
@@ -211,6 +236,12 @@ export interface WgbManifest {
          */
         createDirs?: string[];
         /**
+         * Guest cwd at boot, when it is NOT the entrypoint's own folder — an engine module
+         * a launcher starts inherits the LAUNCHER's directory, and resolves its data paths
+         * against that. Example: "C:\\" for an exe that lives under Data\.
+         */
+        workingDir?: string;
+        /**
          * Persist/ephemeral policy (the ".gitignore" analog). Default is PERSIST: every guest
          * write survives unless its (overlay-relative, case-insensitive) path matches a global default
          * or one of these glob patterns — those are kept ephemeral (scratch / wiped, never written to
@@ -226,6 +257,18 @@ export interface WgbManifest {
         persistOnly?: boolean;
         /** Allowlist patterns when `persistOnly` is true. */
         persist?: string[];
+        /**
+         * Authored on-screen touch controls. `layout` is a preset id from
+         * src/input/controls/presets.ts or a full ControlLayout object (validated
+         * host-side by validateLayout — kept structural here so the worker carries no
+         * UI type). Host-only data: it rides `bundle_meta` and is deliberately NOT
+         * routed through EmulatorConfig.applyFromManifest, which the worker would then
+         * have to remember to clear in reset() (the cdPath precedent).
+         */
+        touch?: {
+            layout?: string | Record<string, unknown>;
+            mode?: "auto" | "direct" | "trackpad";
+        };
     };
 }
 
@@ -253,27 +296,7 @@ export class WgbLoader {
         return this.loadFromArchive(archive, onStage);
     }
 
-    static async fromUrl(url: string): Promise<WgbBundle> {
-        // DEV: stream on-demand straight from the dev server via synchronous XHR range
-        // reads — instant start, NO blocking OPFS full-copy (the slow part of opening a
-        // fresh multi-GB bundle). Gated on the server honoring Range: create() probes
-        // for 206, so a server that ignores Range throws and we fall through to staging.
-        if (import.meta.env?.DEV) {
-            // A prior background stage makes repeat dev launches OPFS-fast.
-            const staged = await WgbCache.openSyncSourceForUrl(url);
-            if (staged) {
-                Logger.log(LogCategory.SYSTEM, `WGB: dev cache hit for "${url}" — OPFS sync handle`);
-                return this.fromSource(staged);
-            }
-            try {
-                const sync = await SyncHttpRangeSource.create(url);
-                Logger.log(LogCategory.SYSTEM, `WGB: dev-streaming "${url}" via sync-XHR range (no OPFS copy)`);
-                return await this.fromSource(sync);
-            } catch (e) {
-                Logger.log(LogCategory.SYSTEM, `WGB: dev sync-stream unavailable (${(e as Error).message}) — staging to OPFS`);
-            }
-        }
-
+    static async fromUrl(url: string, options?: { preload?: boolean; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }): Promise<WgbBundle> {
         // Fastest path: a cached bundle read SYNCHRONOUSLY off disk (no RAM copy).
         const syncSource = await WgbCache.openSyncSourceForUrl(url);
         if (syncSource) return this.fromSource(syncSource);
@@ -282,9 +305,29 @@ export class WgbLoader {
         const cached = await WgbCache.get(url);
         if (cached) return this.fromSource(new BufferSource(cached));
 
-        // Cache miss: start immediately via HTTP range requests, then cache full file in background.
-        Logger.log(LogCategory.SYSTEM, `WGB: range-loading "${url}" (first run, caching in background)`);
-        return this.fromSource(await HttpRangeSource.create(url));
+        const flags = globalThis as { __noSabIo?: boolean; __wgbForceCache?: boolean };
+        if (options?.preload || options?.io?.mode === "preload-full" || flags.__noSabIo || flags.__wgbForceCache) {
+            const staged = await WgbCache.downloadToSyncSource(url, () => {});
+            return staged ? this.fromSource(staged) : this.fromBuffer(await WgbCache.downloadWithProgress(url, () => {}));
+        }
+
+        // On a miss, stream validated ranges and persist them in the I/O worker.
+        Logger.log(LogCategory.SYSTEM, `WGB: range-loading "${url}" (first run)`);
+        try {
+            const io = await SabIoSource.create(url);
+            (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = io;
+            try { return await this.fromSource(io); }
+            catch (error) {
+                (globalThis as { __wgbBlockCache?: CachedSource }).__wgbBlockCache?.close();
+                await io.closeAsync();
+                (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+                (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+                throw error;
+            }
+        } catch {
+            const staged = await WgbCache.downloadToSyncSource(url, () => {});
+            return staged ? this.fromSource(staged) : this.fromBuffer(await WgbCache.downloadWithProgress(url, () => {}));
+        }
     }
 
     static async fromBuffer(data: Uint8Array): Promise<WgbBundle> {

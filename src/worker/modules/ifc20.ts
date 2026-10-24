@@ -2,12 +2,14 @@
  * IFC20.dll — Immersion TouchSense force-feedback (stub implementation).
  *
  * HoMM3 imports CImmMouse, CImmProject, CImmDevice, CImmCompoundEffect.
+ * IFC21/IFC22 export the same classes, so this module answers for every 2.x DLL.
  * Real hardware is never present in browser, so all methods return "no device"
  * or no-op. The critical requirement is that constructors write a valid vtable
  * pointer so virtual calls don't #PF through a NULL vtable.
  */
 
 import { IModule } from '../core/module';
+import { writeGuestCode } from '../core/memory/guest-code';
 import { Process } from '../core/process';
 import { ThunkImplementation } from '../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../core/logger';
@@ -28,10 +30,13 @@ const CIMMPROJECT_SIZE = 0x10; // 16 bytes
 
 export class IFC20 implements IModule {
     name = 'ifc20';
+    aliases = ['ifc21', 'ifc22'];
     exports: Record<string, ThunkImplementation> = {};
+    private process!: Process;
     private mouseVtableAddr = 0;
 
     initialize(process: Process): void {
+        this.process = process;
         this.setupVtable(process);
         this.registerExports(process);
     }
@@ -52,7 +57,7 @@ export class IFC20 implements IModule {
         );
 
         // Write stub code to guest memory
-        mem.set(stubDll.stubCode, stubDll.baseAddress);
+        writeGuestCode(mem, stubDll.stubCode, stubDll.baseAddress);
 
         // Allocate vtable array (7 entries × 4 bytes = 28 bytes)
         this.mouseVtableAddr = tg.allocateVTableMemory(MOUSE_VTABLE_METHODS.length * 4);
@@ -174,5 +179,9 @@ export class IFC20 implements IModule {
 
     reset(): void {
         this.mouseVtableAddr = 0;
+    }
+
+    recreateVTables(): void {
+        if (this.process) this.setupVtable(this.process);
     }
 }

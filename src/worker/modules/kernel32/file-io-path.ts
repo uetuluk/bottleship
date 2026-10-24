@@ -9,12 +9,29 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { VirtualFileSystem } from '../../runtime/filesystem/vfs';
-import { encodeAnsi } from '../codepage-utils';
-import { dirOfWindowsPath } from '../../runtime/filesystem/ue1-firstrun';
-import { readStringA, readStringW, encodeUTF16LE } from './file-io-strings';
+import { readStringA, readStringW, encodeUTF16LE, encodeFileApiString } from './file-io-strings';
+import { searchPathSafeMode } from '../../core/dll-search-order';
+import { registerFileIoTempExports } from './file-io-temp';
 
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
+
+/** A drive prefix alone is relative to that drive's current directory, not its root. */
+function qualifyDriveRelativePath(path: string): string {
+    const match = /^([A-Za-z]):(?![\\/])(.*)$/.exec(path);
+    if (!match) return path;
+    const drive = match[1].toUpperCase();
+    const current = System.getInstance().fileSystem.currentDir;
+    const base = current.slice(0, 2).toUpperCase() === drive + ':' ? current : drive + ':\\';
+    return base.replace(/[\\/]+$/, '') + '\\' + match[2];
+}
+
+/** Directory portion of a Windows path, without a trailing separator. */
+const dirOfWindowsPath = (path: string): string => {
+    const normalized = path.split('/').join('\\');
+    const end = normalized.lastIndexOf('\\');
+    return end <= 0 ? '' : normalized.slice(0, end);
+};
 
 const pathHasSeparator = (path: string): boolean => path.includes('\\') || path.includes('/');
 
@@ -38,7 +55,7 @@ const joinWindowsPath = (dir: string, file: string): string => {
     return `${d}\\${f}`.replace(/\//g, '\\');
 };
 
-const collectDefaultSearchDirectories = (): string[] => {
+export const collectDefaultSearchDirectories = (): string[] => {
     const system = System.getInstance();
     const vfs = system.fileSystem;
     const dirs: string[] = [];
@@ -47,9 +64,12 @@ const collectDefaultSearchDirectories = (): string[] => {
     const appDir = dirOfWindowsPath(exePath);
     if (appDir) dirs.push(appDir);
 
-    if (vfs?.currentDir) dirs.push(vfs.currentDir);
+    // SetSearchPathMode's safe mode moves the current directory behind the system ones.
+    const safeMode = searchPathSafeMode();
+    if (vfs?.currentDir && !safeMode) dirs.push(vfs.currentDir);
 
     dirs.push('C:\\WINDOWS', 'C:\\WINDOWS\\SYSTEM', 'C:\\WINDOWS\\SYSTEM32');
+    if (vfs?.currentDir && safeMode) dirs.push(vfs.currentDir);
 
     const pathEnv = system.process?.environment.get('PATH');
     if (pathEnv) {
@@ -69,7 +89,7 @@ const writeSearchPathResultA = (
     lpBuffer: number,
     lpFilePart: number,
 ): number => {
-    const pathBytes = encodeAnsi(fullPath + '\0');
+    const pathBytes = encodeFileApiString(fullPath + '\0');
     const required = pathBytes.length;
 
     if (nBufferLength < required) {
@@ -92,7 +112,19 @@ const writeSearchPathResultA = (
     return required - 1;
 };
 
+/**
+ * The directory GetTempPath reports exists on every Windows install, and programs create
+ * files and folders in it without creating it first. Make the TMP and TEMP directories.
+ */
+export function ensureTempDirectories(environment: Map<string, string>, vfs: Pick<VirtualFileSystem, 'ensureDirTreeSync'>): void {
+    for (const name of ['TMP', 'TEMP']) {
+        const dir = environment.get(name);
+        if (dir) vfs.ensureDirTreeSync(dir);
+    }
+}
+
 export function registerFileIoPathExports(exports: Record<string, ThunkImplementation>): void {
+    registerFileIoTempExports(exports);
     exports['GetCurrentDirectoryA'] = (ctx, mem, args) => {
         const nBufferLength = args[0];
         const lpBuffer = args[1];
@@ -106,7 +138,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             currentDir += '\\';
         }
 
-        const dirBytes = encodeAnsi(currentDir + '\0');
+        const dirBytes = encodeFileApiString(currentDir + '\0');
 
         if (nBufferLength < dirBytes.length) {
             return dirBytes.length; // Required buffer size
@@ -159,7 +191,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         let fullPath: string;
         if (fileName.length >= 2 && fileName[1] === ':') {
             // Already absolute path (e.g., "C:\...")
-            fullPath = fileName;
+            fullPath = qualifyDriveRelativePath(fileName);
         } else if (fileName.startsWith('\\') || fileName.startsWith('/')) {
             // Root-relative path
             const currentDir = System.getInstance().fileSystem?.currentDir || 'C:\\';
@@ -193,7 +225,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         }
 
         Logger.verbose(LogCategory.KERNEL32, `GetFullPathNameA("${fileName}") -> "${fullPath}"`);
-        const pathBytes = encodeAnsi(fullPath + '\0');
+        const pathBytes = encodeFileApiString(fullPath + '\0');
 
         if (nBufferLength < pathBytes.length) {
             return pathBytes.length; // Required size
@@ -236,7 +268,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         let fullPath: string;
         if (fileName.length >= 2 && fileName[1] === ':') {
-            fullPath = fileName;
+            fullPath = qualifyDriveRelativePath(fileName);
         } else if (fileName.startsWith('\\') || fileName.startsWith('/')) {
             const currentDir = System.getInstance().fileSystem?.currentDir || 'C:\\';
             const drive = currentDir.substring(0, 2);
@@ -374,7 +406,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         const longPath = lpszLongPath ? readStringA(mem, lpszLongPath) : '';
         const shortPath = longPath;
-        const pathBytes = encodeAnsi(shortPath + '\0');
+        const pathBytes = encodeFileApiString(shortPath + '\0');
 
         if (cchBuffer < pathBytes.length) {
             return shortPath.length; // Required size (excluding null)
@@ -384,6 +416,34 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             Mem.writeBytes(lpszShortPath, pathBytes);
         }
         return shortPath.length;
+    };
+
+    exports['GetLongPathNameW'] = (ctx, mem, args) => {
+        const input = args[0] >>> 0, output = args[1] >>> 0, capacity = args[2] >>> 0;
+        const path = input ? readStringW(mem, input) : '';
+        const system = System.getInstance();
+        if (!path) {
+            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // VFS names already use their long form. Windows permits copying an
+        // existing name unchanged when no alternate long form is available.
+        if (!system.fileSystem.fileExists(path) && !system.fileSystem.directoryExists(path)) {
+            system.scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0;
+        }
+        const required = path.length + 1;
+        if (capacity < required) return required;
+        if (!output) {
+            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const bytes = encodeUTF16LE(path);
+        if (Mem.writeBytes(output, bytes) !== bytes.length) {
+            system.scheduler.setLastError(122);
+            return 0;
+        }
+        return path.length;
     };
 
     exports['GetLongPathNameA'] = (ctx, mem, args) => {
@@ -419,7 +479,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             if (full.length === 2 && full[1] === ':') full += '\\';
             longPath = full;
         }
-        const pathBytes = encodeAnsi(longPath + '\0');
+        const pathBytes = encodeFileApiString(longPath + '\0');
 
         Logger.verbose(LogCategory.KERNEL32, `GetLongPathNameA("${inputPath}") -> "${longPath}"`);
 
@@ -457,7 +517,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             tempPath += '\\';
         }
 
-        const pathBytes = encodeAnsi(tempPath + '\0');
+        const pathBytes = encodeFileApiString(tempPath + '\0');
 
         // Windows API behavior: if buffer is too small, return required size without writing
         if (nBufferLength < pathBytes.length) {

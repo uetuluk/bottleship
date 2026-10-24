@@ -7,7 +7,7 @@ server round-trip. It loads a game's PE executable directly and reimplements Win
 itself (Win32, COM, DirectDraw / Direct3D 3–9, DirectSound) on top of WebGPU, WebAudio
 and OPFS.
 
-[Play online](https://bottleship.pages.dev) · [Compatibility](docs/compatibility.md) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)
+[Play online](https://bottleship.pages.dev) · [Release 0.7](https://github.com/jenissimo/bottleship/releases/tag/v0.7.0) · [Compatibility](docs/compatibility.md) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md)
 
 <!-- TODO: hero.gif — a short montage (Max Payne / NFS Underground / StarCraft / Unreal) -->
 
@@ -72,7 +72,7 @@ Requirements: [Bun](https://bun.sh/), and a browser with WebGPU (Chrome / Edge 1
 SharedArrayBuffer.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/jenissimo/bottleship
 cd bottleship
 bun install
 bun run dev
@@ -132,7 +132,10 @@ BottleShip is free and open source. If it brought a game back to life for you, y
 - [Compatibility](docs/compatibility.md) — tested titles and their status
 - [Importing games](docs/bundles.md) · [GOG import](docs/gog-import.md)
 - [Development & self-hosting](docs/development.md)
+- [Release notes](docs/releases/0.7.md) · [Versioning](docs/releases/README.md)
 - [Automation harness](docs/harness.md) — driving and observing games
+- [Child processes](docs/headless-child-processes.md) — execution, display routing and diagnostics
+- [Performance measurements](docs/performance.md) — workload and correctness contracts
 - [Contributing with coding agents](docs/contributing-with-ai.md)
 
 ## License & acknowledgements

@@ -11,6 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { deflateRawSync, inflateRawSync } from "zlib";
 import { createHash } from "crypto";
+import { extractInstallerFromFiles } from '@bottleship/repack/container-extract';
 
 /** Node-backed raw inflater injected into the browser core (Bun lacks DecompressionStream). */
 const nodeInflate = (chunk: Uint8Array) => new Uint8Array(inflateRawSync(Buffer.from(chunk)));
@@ -19,6 +20,7 @@ import {
     extractInstallShield,
     detectInstallShieldStem,
     FILE_COMPRESSED,
+    FILE_OBFUSCATED,
 } from "@bottleship/formats/installshield";
 
 const CAB_SIGNATURE = 0x28635349;
@@ -47,7 +49,7 @@ function chunkStream(data: Uint8Array): Uint8Array {
  *   header (.hdr): common(20) | file_table | directories(cstr) | file_descriptors | names(cstr)
  *   cab (data1.cab): common(20) | volume_header(40) | file data blobs
  */
-function buildIs5(dirs: string[], files: SynthFile[]): { header: Uint8Array; cab: Uint8Array } {
+function buildIs5(dirs: string[], files: SynthFile[], early = false): { header: Uint8Array; cab: Uint8Array } {
     const enc = new TextEncoder();
 
     // ----- cab: lay out file data first so we know data_offsets -----
@@ -94,7 +96,7 @@ function buildIs5(dirs: string[], files: SynthFile[]): { header: Uint8Array; cab
     }
 
     // Section: file descriptors (0x3a stride each for v5)
-    const descStride = 0x3a;
+    const descStride = early ? 0x2a : 0x3a;
     const descRelOffsets: number[] = [];
     for (let i = 0; i < fileCount; i++) {
         descRelOffsets.push(cur);
@@ -149,7 +151,7 @@ function buildIs5(dirs: string[], files: SynthFile[]): { header: Uint8Array; cab
         hdv.setUint32(p + 0x0e, b.compressed, true); // compressed_size
         hdv.setUint32(p + 0x26, b.off, true); // data_offset
         const md5 = new Uint8Array(createHash("md5").update(Buffer.from(f.data)).digest());
-        header.set(md5, p + 0x2a); // md5[16]
+        if (!early) header.set(md5, p + 0x2a); // md5[16]
     }
 
     // file-name cstrings
@@ -159,6 +161,22 @@ function buildIs5(dirs: string[], files: SynthFile[]): { header: Uint8Array; cab
 }
 
 describe("InstallShield 5 parser", () => {
+    test('early descriptors omit MD5 without consuming the next record', async () => {
+        const payload = new TextEncoder().encode('cabinet payload');
+        const {header,cab} = buildIs5([''], [
+            {name:'first.bin',dirIndex:0,data:payload,compress:true},
+            {name:'last.bin',dirIndex:0,data:payload,compress:false},
+        ], true);
+        for (const version of [0x01005100,0x01000004]) {
+            new DataView(header.buffer).setUint32(4, version, true);
+            const info = parseInstallShieldHeader(header);
+            expect(info.major).toBe(version === 0x01005100 ? 5 : 0);
+            expect(info.files.map(f => f.md5)).toEqual([null,null]);
+            const out = await extractInstallShield(header,new Map([[1,cab]]),{inflateRaw:nodeInflate});
+            expect(out.get('first.bin')).toEqual(payload);
+            expect(out.get('last.bin')).toEqual(payload);
+        }
+    });
     test("parses dirs + v5 file descriptors", () => {
         const { header } = buildIs5(
             ["", "Drivers"],
@@ -182,6 +200,54 @@ describe("InstallShield 5 parser", () => {
 });
 
 describe("InstallShield 5 extraction", () => {
+    test('plaintext recovery is explicit and still verifies the digest', async () => {
+        const payload = new TextEncoder().encode('MZ-plaintext-with-a-wrong-cabinet-flag');
+        for (const compress of [false, true]) {
+            const {header, cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress}]);
+            const dv = new DataView(header.buffer);
+            const base = COMMON_HEADER_SIZE + dv.getUint32(COMMON_HEADER_SIZE + 0x0c, true);
+            const descriptor = base + dv.getUint32(base + 4, true);
+            dv.setUint16(descriptor + 8, (compress ? FILE_COMPRESSED : 0) | FILE_OBFUSCATED, true);
+            const volumes = new Map([[1, cab]]);
+            await expect(extractInstallShield(header, volumes, {inflateRaw:nodeInflate})).rejects.toThrow();
+            const restored = await extractInstallShield(header, volumes, {inflateRaw:nodeInflate,ignoreObfuscation:true});
+            expect(restored.get('game.exe')).toEqual(payload);
+            header[descriptor + 0x2a]! ^= 1;
+            await expect(extractInstallShield(header, volumes, {inflateRaw:nodeInflate,ignoreObfuscation:true})).rejects.toThrow(/MD5 mismatch/);
+        }
+    });
+
+    test('normal extraction decodes genuinely obfuscated payloads', async () => {
+        const payload = new TextEncoder().encode('MZ-genuinely-obfuscated');
+        for (const compress of [false, true]) {
+            const {header, cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress}]);
+            const dv = new DataView(header.buffer);
+            const base = COMMON_HEADER_SIZE + dv.getUint32(COMMON_HEADER_SIZE + 0x0c, true);
+            const descriptor = base + dv.getUint32(base + 4, true);
+            dv.setUint16(descriptor + 8, (compress ? FILE_COMPRESSED : 0) | FILE_OBFUSCATED, true);
+            const start = dv.getUint32(descriptor + 0x26, true);
+            const size = dv.getUint32(descriptor + 0x0e, true);
+            for (let i = 0; i < size; i++) {
+                const shifted = (cab[start + i]! + i % 0x47) & 0xff;
+                cab[start + i] = ((shifted << 2) | (shifted >>> 6)) ^ 0xd5;
+            }
+            const restored = await extractInstallShield(header, new Map([[1,cab]]), {inflateRaw:nodeInflate});
+            expect(restored.get('game.exe')).toEqual(payload);
+        }
+    });
+
+    test('container extraction accepts an IS5 descriptor embedded in data1.cab', async () => {
+        const payload = new TextEncoder().encode('MZ-test-game');
+        const {header,cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress:true}]);
+        const combined = new Uint8Array(cab.length + header.length - COMMON_HEADER_SIZE);
+        combined.set(cab); combined.set(header.subarray(COMMON_HEADER_SIZE), cab.length);
+        combined.set(header.subarray(0, COMMON_HEADER_SIZE));
+        new DataView(combined.buffer).setUint32(12, cab.length, true);
+        const result = await extractInstallerFromFiles(new Map([['Disk1/DATA1.CAB', combined]]), {inflateRaw:nodeInflate});
+        expect(result.via).toBe('installshield');
+        expect(result.gameFiles.get('game.exe')).toEqual(payload);
+        expect(result.gameFiles.size).toBe(1);
+    });
     test("round-trips uncompressed + compressed files with MD5 verify", async () => {
         const exe = new Uint8Array([0x4d, 0x5a, 0x90, 0x00, 1, 2, 3, 4, 5]);
         const big = new Uint8Array(2000);
